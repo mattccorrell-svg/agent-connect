@@ -39,7 +39,7 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup", "plusInfo"]
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
 DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
-DOCS_PLUS = "https://github.com/mattcorrell/anki-connect-plus#readme"
+DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"
 
 UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
 UNDO_BULK_UPDATE = 'AnkiConnect Plus: Bulk Update'

@@ -60,7 +60,7 @@ Rules:
                   "updateImageOcclusionNote", "queryRevlog", "createBackup", "plusInfo"]
   DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
   DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
-  DOCS_PLUS = "https://github.com/mattcorrell/anki-connect-plus#readme"  # placeholder; README.md in repo root is authoritative
+  DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"  # placeholder; README.md in repo root is authoritative
   ```
 - Public function signatures (python snake_case; JSON camelCase mapping happens in `plus.py`):
   ```python
