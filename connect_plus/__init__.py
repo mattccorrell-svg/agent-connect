@@ -1,4 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
+# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -56,13 +57,14 @@ from aqt.qt import Qt, QTimer, QMessageBox, QCheckBox
 from .web import format_exception_reply, format_success_reply
 from .edit import Edit
 from . import web, util
+from . import plus
 
 
 #
 # AnkiConnect
 #
 
-class AnkiConnect:
+class AnkiConnect(plus.PlusMixin):
     def __init__(self):
         self.log = None
         self.timer = None
@@ -84,7 +86,7 @@ class AnkiConnect:
         except:
             QMessageBox.critical(
                 self.window(),
-                'AnkiConnect',
+                'AnkiConnect Plus',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(util.setting('webBindPort'))
             )
 
@@ -423,7 +425,7 @@ class AnkiConnect:
         else:  # prompt the user
             msg = QMessageBox(None)
             msg.setWindowTitle("A website wants to access to Anki")
-            msg.setText('"{}" requests permission to use Anki through AnkiConnect. Do you want to give it access?'.format(origin))
+            msg.setText('"{}" requests permission to use Anki through AnkiConnect Plus. Do you want to give it access?'.format(origin))
             msg.setInformativeText("By granting permission, you'll allow the website to modify your collection on your behalf, including the execution of destructive actions such as deck deletion.")
             msg.setWindowIcon(self.window().windowIcon())
             msg.setIcon(QMessageBox.Icon.Question)
@@ -795,9 +797,14 @@ class AnkiConnect:
 
                 except Exception as e:
                     errorMessage = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    for field in media['fields']:
-                        if field in ankiNote:
-                            ankiNote[field] += errorMessage
+                    # Plus fix: a media object without a (list-typed) 'fields'
+                    # key must not turn a store failure into a KeyError that
+                    # aborts the whole action
+                    mediaFields = media.get('fields') if isinstance(media, dict) else None
+                    if isinstance(mediaFields, list):
+                        for field in mediaFields:
+                            if isinstance(field, str) and field in ankiNote:
+                                ankiNote[field] += errorMessage
 
 
     @util.api()

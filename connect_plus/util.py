@@ -1,4 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
+# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -72,9 +73,9 @@ DEFAULT_CONFIG = {
     'apiPollInterval': 25,
     'apiVersion': 6,
     'webBacklog': 5,
-    'webBindAddress': os.getenv('ANKICONNECT_BIND_ADDRESS', '127.0.0.1'),
-    'webBindPort': 8765,
-    'webCorsOrigin': os.getenv('ANKICONNECT_CORS_ORIGIN', None),
+    'webBindAddress': os.getenv('ANKICONNECT_PLUS_BIND_ADDRESS', '127.0.0.1'),
+    'webBindPort': 8766,
+    'webCorsOrigin': os.getenv('ANKICONNECT_PLUS_CORS_ORIGIN', None),
     'webCorsOriginList': ['http://localhost'],
     'ignoreOriginList': [],
     'webTimeout': 10000,

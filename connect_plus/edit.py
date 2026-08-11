@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+
 import aqt
 import aqt.editor
 import aqt.browser.previewer
@@ -25,7 +27,7 @@ from . import anki_version
 # > Edit.open_dialog_and_show_note_with_id(note_id)
 
 
-DOMAIN_PREFIX = "foosoft.ankiconnect."
+DOMAIN_PREFIX = "connectplus."
 
 
 def get_note_by_note_id(note_id):
