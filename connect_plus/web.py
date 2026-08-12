@@ -19,7 +19,7 @@ import jsonschema
 import select
 import socket
 
-from . import util
+from . import core, util
 
 #
 # WebRequest
@@ -288,7 +288,29 @@ def format_success_reply(api_version, result):
 
 
 def format_exception_reply(_api_version, exception):
-    return {"result": None, "error": str(exception)}
+    """The structured error envelope (SPEC 25.1, revision 13).
+
+    'error' is byte-for-byte what it always was; 'errorCode' and 'retryable'
+    are additive and ALWAYS present, so a client branches on a stable shape
+    instead of hardcoding the SPEC's retryable table or parsing a code out of
+    English text. Before revision 13 `retryable` existed only as a Python
+    attribute on core.PlusError and never reached the wire at all.
+
+    Both are null for anything that is not a core.PlusError — i.e. every
+    upstream AnkiConnect action error, which carries no '[code] ' prefix
+    either. That is the whole prefixing boundary, in one place
+    (core.PLUS_ERROR_PREFIX_NOTE, served by plusInfo).
+
+    This is also the single choke point for 'multi': AnkiConnect.multi maps
+    self.handler over its sub-actions and each sub-action's exception is
+    formatted here, so nested sub-responses carry the same four keys as a
+    top-level one.
+    """
+    if isinstance(exception, core.PlusError):
+        return {"result": None, "error": str(exception),
+                "errorCode": exception.code, "retryable": exception.retryable}
+    return {"result": None, "error": str(exception),
+            "errorCode": None, "retryable": None}
 
 
 request_schema = {

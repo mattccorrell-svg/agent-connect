@@ -19,6 +19,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -48,7 +49,45 @@ def _signature_string(method):
     return ', '.join(parts)
 
 
-def plus_api():
+#
+# Argument-binding TypeError -> house format (SPEC 25.3, revision 13; round-3
+# field feedback ASK 11b). CPython renders these with the bound method's
+# __qualname__, which put this add-on's internal class name on the wire
+# ("PlusMixin.renderCard() missing 1 required positional argument: 'cardIds'")
+# right beside house-format messages like "invalid parameter: field: string
+# required". Strip the qualifier, unquote the argument names.
+#
+_ARITY_QUALNAME_RE = re.compile(r'^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.(\w+\(\))')
+_ARITY_MISSING_RE = re.compile(
+    r'^(\w+\(\)) missing \d+ required (?:positional|keyword-only) arguments?: (.+)$')
+_ARITY_UNEXPECTED_RE = re.compile(
+    r"^(\w+\(\)) got an unexpected keyword argument '([^']*)'$")
+_ARITY_NAME_RE = re.compile(r"'([^']*)'")
+
+
+def _normalize_arity_message(message):
+    """House-format an argument-binding TypeError message.
+
+    Recognized forms collapse to '<action>() missing required argument(s): a, b'
+    and '<action>() unexpected keyword argument: b'. Anything unrecognized is
+    returned with only the leading class qualifier removed, so no message ever
+    keeps the internal class name.
+    """
+    message = _ARITY_QUALNAME_RE.sub(r'\1', message, count=1)
+    match = _ARITY_MISSING_RE.match(message)
+    if match:
+        names = _ARITY_NAME_RE.findall(match.group(2))
+        if names:
+            return '{} missing required argument{}: {}'.format(
+                match.group(1), '' if len(names) == 1 else 's', ', '.join(names))
+    match = _ARITY_UNEXPECTED_RE.match(message)
+    if match:
+        return '{} unexpected keyword argument: {}'.format(
+            match.group(1), match.group(2))
+    return message
+
+
+def plus_api(guard_sync=True):
     """@util.api() plus the SPEC 25 stable-error-code guarantee.
 
     Wraps the action so every exception leaving it is a core.PlusError whose
@@ -68,11 +107,34 @@ def plus_api():
     a "self" key cannot fail bound-method binding BEFORE this wrapper runs
     (which would let the raw TypeError escape unprefixed); it lands in
     **kwargs instead, and the binding failure moves to the inner func(...)
-    call, where the tb_next-is-None branch maps it to [invalid_param].
+    call, where the tb_next-is-None branch maps it to [invalid_param]. Those
+    binding messages are house-formatted by _normalize_arity_message so the
+    internal class name never reaches the wire (SPEC 25.3).
+
+    guard_sync (SPEC 25.2, revision 13) adds the sync guard: while a syncNow
+    job is in state 'syncing' the backend holds the collection mutex for the
+    whole sync_collection call, so any collection touch here would block the
+    Qt main thread — and with it this HTTP server — until the sync finished.
+    Guarded actions refuse with the retryable [sync_in_progress] instead of
+    blocking. This is what makes sync_in_progress genuinely REACHABLE rather
+    than a reserved code. Pass guard_sync=False for the four actions that must
+    never be refused: syncStatus and syncNow are how a caller observes and
+    drives the sync (guarding them would make the state unobservable and
+    would break syncNow's documented {started: false, reason:
+    'already_syncing'} contract), and plusInfo/ankihubStatus touch no
+    collection at all. 'media_syncing' is deliberately NOT guarded — by then
+    sync_collection has returned and the collection mutex is free, exactly as
+    in stock Anki, where reviewing during a media sync is normal.
     """
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, /, *args, **kwargs):
+            if guard_sync:
+                # read-only probe: never creates the lazy job slot
+                job = getattr(self, '_plusSyncJobState', None)
+                if job is not None and job.get('state') == 'syncing':
+                    raise core.PlusError('sync_in_progress',
+                                         core.SYNC_IN_PROGRESS_MESSAGE)
             try:
                 return func(self, *args, **kwargs)
             except core.PlusError:
@@ -82,7 +144,8 @@ def plus_api():
                     # raised AT our call expression (no deeper frame): the
                     # params failed to bind — unexpected keyword / missing
                     # required argument from the JSON request
-                    raise core.PlusError('invalid_param', str(e)) from None
+                    raise core.PlusError(
+                        'invalid_param', _normalize_arity_message(str(e))) from None
                 raise core.PlusError('internal', str(e)) from e
             except Exception as e:
                 if str(e) == 'collection is not available':
@@ -234,13 +297,14 @@ class PlusMixin:
 
 
     @plus_api()
-    def renderCard(self, cardIds, format='html'):
-        return core.render_card(self.collection(), cardIds, render_format=format)
+    def renderCard(self, cardIds, format='html', cssMode=None):
+        return core.render_card(self.collection(), cardIds, render_format=format,
+                                css_mode=cssMode)
 
 
     @plus_api()
     def notesSlim(self, query=None, noteIds=None, fields=None, stripHtml=True,
-                  maxFieldLength=400, offset=0, limit=200):
+                  maxFieldLength=400, offset=0, limit=200, omitEmptyFields=False):
         return core.notes_slim(
             self.collection(),
             query=query,
@@ -249,7 +313,8 @@ class PlusMixin:
             strip_html=stripHtml,
             max_field_length=maxFieldLength,
             offset=offset,
-            limit=limit
+            limit=limit,
+            omit_empty_fields=omitEmptyFields
         )
 
 
@@ -292,10 +357,17 @@ class PlusMixin:
         )
 
 
+    # orphanMediaLimit's default is spelled as a literal, not as
+    # core.ORPHAN_MEDIA_DEFAULT_LIMIT: plusInfo's actionDocs render defaults
+    # with json.dumps, and every wrapper default must be a JSON literal so the
+    # params string stays readable ('orphanMediaLimit=100'). The two are held
+    # in lockstep by a test (headless_sync_ankihub_test test5).
     @plus_api()
-    def checkDeckIntegrity(self, deckName, includeOrphanMedia=False):
+    def checkDeckIntegrity(self, deckName, includeOrphanMedia=False,
+                           orphanMediaLimit=100):
         return core.check_deck_integrity(self.collection(), deckName,
-                                         include_orphan_media=includeOrphanMedia)
+                                         include_orphan_media=includeOrphanMedia,
+                                         orphan_media_limit=orphanMediaLimit)
 
 
     @plus_api()
@@ -316,6 +388,11 @@ class PlusMixin:
             max_preview=maxPreview,
             undo_label=undoLabel
         )
+
+
+    @plus_api()
+    def undoStatus(self):
+        return core.undo_status(self.collection())
 
 
     #
@@ -440,7 +517,10 @@ class PlusMixin:
         self._plusSyncFinishGui()
 
 
-    @plus_api()
+    # guard_sync=False: syncNow's own busy states are DATA, not errors — it
+    # reports {started: false, reason: 'already_syncing'} (SPEC 18.1), and the
+    # guard raising [sync_in_progress] here would break that contract.
+    @plus_api(guard_sync=False)
     def syncNow(self):
         mw = self.window()
         if mw.col is None:
@@ -467,7 +547,11 @@ class PlusMixin:
         return {'started': True, 'mediaSync': syncMedia}
 
 
-    @plus_api()
+    # guard_sync=False: syncStatus is the ONLY way to observe a running sync
+    # and the documented way to wait one out — it already skips all collection
+    # access while job.state == 'syncing' (Deviation #9b), so it is safe to
+    # call throughout and must never be refused.
+    @plus_api(guard_sync=False)
     def syncStatus(self, localOnly=False, timeoutSecs=8):
         if not isinstance(localOnly, bool):
             raise core.PlusError('invalid_param', 'invalid parameter: localOnly: boolean required')
@@ -486,6 +570,15 @@ class PlusMixin:
             'lastSyncMs': None,
             'modMs': None,
             'required': None,
+            # SPEC 18.2, revision 12 (round-3 field feedback): 'required' used
+            # to be indistinguishable between a server-verified answer and a
+            # purely local inference — measured localOnly true/false latencies
+            # were identical (26.3/17.2/21.9 ms vs 24.9/24.6/23.7 ms) because
+            # rslib short-circuits the request whenever the collection is
+            # locally dirty. serverChecked is true ONLY when this call
+            # completed a network status round trip; false always means "not
+            # verified by this call", never "the server says no".
+            'serverChecked': False,
         }
         if job['state'] == 'syncing':
             # the backend holds the collection lock for the whole sync: any
@@ -506,7 +599,17 @@ class PlusMixin:
             status['required'] = 'error'
             return status
         if localOnly:
-            status['required'] = 'normal_sync' if local['dirty'] else 'unknown_no_network'
+            if not local['dirty']:
+                status['required'] = 'unknown_no_network'
+            elif collection.schema_changed():
+                # revision 12: a schema-changed collection cannot converge with
+                # a normal sync, and the backend's OWN local verdict for
+                # scm > ls is full_sync_required (measured against an
+                # unreachable endpoint: no socket opened, required=2). Reporting
+                # 'normal_sync' here under-reported exactly that case.
+                status['required'] = 'full_sync_required'
+            else:
+                status['required'] = 'normal_sync'
             return status
 
         try:
@@ -520,6 +623,13 @@ class PlusMixin:
         if resp.new_endpoint:
             mw.pm.set_current_sync_url(resp.new_endpoint)
         status['required'] = core.SYNC_STATUS_REQUIRED.get(resp.required, 'error')
+        # the response proto carries no round-trip flag, but the short-circuit
+        # rule is decidable locally and exactly: rslib answers from the local
+        # state iff the collection is dirty (mod > ls or scm > ls) — the same
+        # predicate core.local_sync_dirty already computed above, verified
+        # against an unreachable endpoint (dirty: 0.018 ms, no socket; clean:
+        # NetworkError, socket attempted). Never guessed true.
+        status['serverChecked'] = not local['dirty']
         return status
 
 
@@ -706,7 +816,9 @@ class PlusMixin:
                               '{}: {}'.format(code, message))
 
 
-    @plus_api()
+    # guard_sync=False: touches the AnkiHub add-on's own config/db, never the
+    # anki collection, so a running sync cannot block it (SPEC 25.2)
+    @plus_api(guard_sync=False)
     def ankihubStatus(self):
         # read-only probe: NEVER network, never raises for a missing/disabled
         # add-on, never imports an add-on Anki did not load itself
@@ -901,17 +1013,37 @@ class PlusMixin:
                 'resubmittedAsChange': False}
 
 
-    @plus_api()
+    # guard_sync=False: pure reflection over module constants and the wrapper
+    # signatures — no collection access at all, and discoverability must keep
+    # working before a profile is open and during a sync (SPEC 4.9, 25.2)
+    @plus_api(guard_sync=False)
     def plusInfo(self):
         # actionDocs = the discoverability surface (SPEC 4.9): one-line summary
         # from core.PLUS_ACTION_SUMMARIES + params read live off the wrapper
         # signatures at call time. No collection access — plusInfo must keep
         # working before a profile is open.
+        # 'returns' (revision 13): actionDocs used to document INPUTS only, so
+        # callers guessed output shapes and took KeyErrors against the real
+        # ones. Static sketches from core.PLUS_ACTION_RETURNS — the signatures
+        # are read live, but a return shape is not introspectable.
         actionDocs = {}
         for name in core.PLUS_ACTIONS:
             actionDocs[name] = {
                 'summary': core.PLUS_ACTION_SUMMARIES.get(name, ''),
                 'params': _signature_string(getattr(self, name)),
+                'returns': core.PLUS_ACTION_RETURNS.get(name, ''),
+            }
+        # errorCodes (revision 13): the full wire vocabulary with retryable
+        # read from the single source of truth (core.PLUS_ERROR_CODES) plus
+        # reachable/meaning, so a client can build its retry table at runtime
+        # instead of hardcoding the SPEC's table.
+        errorCodes = {}
+        for code, retryable in core.PLUS_ERROR_CODES.items():
+            doc = core.PLUS_ERROR_CODE_DOCS.get(code, {})
+            errorCodes[code] = {
+                'retryable': retryable,
+                'reachable': doc.get('reachable', True),
+                'meaning': doc.get('meaning', ''),
             }
         return {
             'name': 'AnkiConnect Plus',
@@ -919,6 +1051,10 @@ class PlusMixin:
             'apiVersion': util.setting('apiVersion'),
             'actions': list(core.PLUS_ACTIONS),
             'actionDocs': actionDocs,
+            'errorCodes': errorCodes,
+            # where the '[code] ' prefix and the errorCode/retryable response
+            # fields do and do NOT apply (Plus + unknown-action vs upstream)
+            'errorPrefixNote': core.PLUS_ERROR_PREFIX_NOTE,
             # named call patterns callers repeatedly failed to discover from
             # per-action docs alone (SPEC 4.9, revision 10)
             'recipes': [dict(recipe) for recipe in core.PLUS_RECIPES],

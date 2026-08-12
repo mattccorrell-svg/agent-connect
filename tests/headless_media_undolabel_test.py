@@ -144,16 +144,29 @@ def test1_media_exists():
     n_snap, u_snap = notes_snap(), undo_snap()
     media_before = sorted(os.listdir(col.media.dir()))
 
+    # revision 12 (round-3 field feedback): every entry carries actualName —
+    # null when the requested spelling IS the stored one
     r = core.media_exists(col, ["me-present.png", "me-absent.png", "sub/me.png",
                                 "/abs/me.png", "", "me-present.png"])
     assert r == {"results": [
-        {"filename": "me-present.png", "exists": True},
-        {"filename": "me-absent.png", "exists": False},
-        {"filename": "sub/me.png", "exists": False},
-        {"filename": "/abs/me.png", "exists": False},
-        {"filename": "", "exists": False},
-        {"filename": "me-present.png", "exists": True},
+        {"filename": "me-present.png", "exists": True, "actualName": None},
+        {"filename": "me-absent.png", "exists": False, "actualName": None},
+        {"filename": "sub/me.png", "exists": False, "actualName": None},
+        {"filename": "/abs/me.png", "exists": False, "actualName": None},
+        {"filename": "", "exists": False, "actualName": None},
+        {"filename": "me-present.png", "exists": True, "actualName": None},
     ]}, r
+
+    # case drift: on a case-INSENSITIVE volume (APFS/NTFS) os.path.isfile says
+    # yes for a spelling that will 404 on AnkiWeb/Linux/iOS — actualName is the
+    # channel that makes it visible. On a case-sensitive volume the same probe
+    # honestly reports exists:false, so both outcomes are accepted; what must
+    # never happen is exists:true with actualName None for a drifted spelling.
+    drifted = core.media_exists(col, ["ME-PRESENT.PNG"])["results"][0]
+    if drifted["exists"]:
+        assert drifted["actualName"] == "me-present.png", drifted
+    else:
+        assert drifted["actualName"] is None, drifted
 
     assert core.media_exists(col, []) == {"results": []}
 
@@ -335,13 +348,15 @@ def test6_undolabel_scheduler():
                        ",".join(str(n) for n in added))
 
     r = core.bulk_suspend(col, cids, undo_label="bench the leeches")
-    assert r == {"changed": 2, "undoEntry": LABEL + "bench the leeches"}, r
+    assert r == {"changed": 2, "changedIds": cids,
+                 "undoEntry": LABEL + "bench the leeches"}, r
     assert col.undo_status().undo == LABEL + "bench the leeches"
     r = core.bulk_suspend(col, cids, suspend=False)
     assert r["undoEntry"] == "AnkiConnect Plus: Bulk Suspend", r
 
     r = core.bulk_set_due_date(col, cids, "0", undo_label="due today")
-    assert r == {"changed": 2, "undoEntry": LABEL + "due today"}, r
+    assert r == {"changed": 2, "changedIds": cids, "unsuspended": [],
+                 "unburied": [], "undoEntry": LABEL + "due today"}, r
     assert col.undo_status().undo == LABEL + "due today"
     # bad days string still leaves the undo stack untouched, label or not
     u_snap = undo_snap()
@@ -468,14 +483,49 @@ def test8_undolabel_crop():
     assert r["undoEntry"] == "AnkiConnect Plus: Crop IO Image", r
 
 
+# ---------------------------------------------------------------- undoStatus
+def test10_undo_status():
+    # SPEC 26 (round-3 field feedback): until now undoEntry was the API's own
+    # REPORT of what it set, with no way for a caller to observe the stack —
+    # the reporter tried driving Anki's menu bar with AppleScript and was
+    # blocked by assistive-access permissions. undoStatus is that observation.
+    col.decks.id("R2Undo")
+    added = core.bulk_add_notes(
+        col, [basic_note("R2Undo", "undostatus-1")],
+        undo_label="observe me")["added"]
+    assert len(added) == 1, added
+
+    s = core.undo_status(col)
+    assert set(s) == {"undo", "redo", "lastStep"}, s
+    assert s["undo"] == LABEL + "observe me", s
+    assert s["redo"] is None, s
+    assert isinstance(s["lastStep"], int), s
+    # it agrees with the proto, and reading it changes nothing
+    snap = undo_snap()
+    assert core.undo_status(col) == s, "undoStatus is not stable"
+    assert undo_snap() == snap, "undoStatus touched the undo stack"
+
+    # after an undo the entry moves to redo, and lastStep advances
+    col.undo()
+    s2 = core.undo_status(col)
+    assert s2["redo"] == LABEL + "observe me", s2
+    assert s2["undo"] != LABEL + "observe me", s2
+    assert s2["lastStep"] > s["lastStep"], (s, s2)
+    # empty strings from the proto are normalized to null, never ""
+    assert s2["undo"] is None or s2["undo"].strip(), s2
+
+
 # ---------------------------------------------------------------- discoverability
 def test9_actions_registered():
     assert "mediaExists" in core.PLUS_ACTIONS
     assert "storeMediaFilesBulk" in core.PLUS_ACTIONS
-    assert len(core.PLUS_ACTIONS) == 26, len(core.PLUS_ACTIONS)
+    # 27 = 26 + round-3 SPEC 26 undoStatus
+    assert len(core.PLUS_ACTIONS) == 27, len(core.PLUS_ACTIONS)
+    assert "undoStatus" in core.PLUS_ACTIONS
     assert set(core.PLUS_ACTIONS) == set(core.PLUS_ACTION_SUMMARIES)
     assert core.PLUS_ACTION_SUMMARIES["mediaExists"]
     assert core.PLUS_ACTION_SUMMARIES["storeMediaFilesBulk"]
+    assert core.PLUS_ACTION_SUMMARIES["undoStatus"]
 
 
 run("test1_media_exists", test1_media_exists)
@@ -486,6 +536,7 @@ run("test5_undolabel_update_tags_replace", test5_undolabel_update_tags_replace)
 run("test6_undolabel_scheduler", test6_undolabel_scheduler)
 run("test7_undolabel_image_occlusion", test7_undolabel_image_occlusion)
 run("test8_undolabel_crop", test8_undolabel_crop)
+run("test10_undo_status", test10_undo_status)
 run("test9_actions_registered", test9_actions_registered)
 
 col.close()

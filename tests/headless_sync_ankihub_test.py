@@ -522,10 +522,11 @@ def _arg_spec(fn_node):
 
 def test5_wrapper_static_checks():
     api_methods = _plus_mixin_api_methods()
-    # PLUS_ACTIONS lists exactly 26 actions == the api-decorated mixin methods
-    # (26 = 24 + round-2 SPEC 22/23: mediaExists, storeMediaFilesBulk)
-    assert len(core.PLUS_ACTIONS) == 26, core.PLUS_ACTIONS
-    assert len(set(core.PLUS_ACTIONS)) == 26, "duplicate action names"
+    # PLUS_ACTIONS lists exactly 27 actions == the api-decorated mixin methods
+    # (27 = 24 + round-2 SPEC 22/23: mediaExists, storeMediaFilesBulk
+    #         + round-3 SPEC 26: undoStatus)
+    assert len(core.PLUS_ACTIONS) == 27, core.PLUS_ACTIONS
+    assert len(set(core.PLUS_ACTIONS)) == 27, "duplicate action names"
     assert set(api_methods) == set(core.PLUS_ACTIONS), (
         "PLUS_ACTIONS vs @util.api methods mismatch: only-in-actions=%s "
         "only-in-mixin=%s" % (sorted(set(core.PLUS_ACTIONS) - set(api_methods)),
@@ -554,9 +555,125 @@ def test5_wrapper_static_checks():
     assert defaults == {"source": None, "deckId": None, "autoAccept": False,
                         "resubmitAsChangeOnDuplicate": True}, defaults
 
+    # round-3 (SPEC 12/13/20/26) wrapper surface
+    names, defaults = _arg_spec(api_methods["undoStatus"])
+    assert names == ["self"], names
+
+    names, defaults = _arg_spec(api_methods["renderCard"])
+    assert names == ["self", "cardIds", "format", "cssMode"], names
+    assert defaults == {"format": "html", "cssMode": None}, defaults
+
+    names, defaults = _arg_spec(api_methods["notesSlim"])
+    assert names[-1] == "omitEmptyFields", names
+    assert defaults["omitEmptyFields"] is False, defaults
+
+    names, defaults = _arg_spec(api_methods["checkDeckIntegrity"])
+    assert names == ["self", "deckName", "includeOrphanMedia",
+                     "orphanMediaLimit"], names
+    # the wrapper default must be a JSON literal (actionDocs renders it with
+    # json.dumps), so it is spelled out — held in lockstep with core here
+    assert defaults["orphanMediaLimit"] == core.ORPHAN_MEDIA_DEFAULT_LIMIT, defaults
+
     # no kwarg-swallowing on the API surface
     for action, node in api_methods.items():
         assert node.args.vararg is None and node.args.kwarg is None, action
+
+
+def _load_plus():
+    """plus.py as a REAL module through a synthetic package (connect_plus's
+    __init__.py, which boots the add-on against aqt.mw, never runs)."""
+    import types
+    pkg_name = "ancp_sig_pkg"
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [os.path.join(REPO, "connect_plus")]
+        sys.modules[pkg_name] = pkg
+    return importlib.import_module(pkg_name + ".plus")
+
+
+def test7_sync_status_server_checked():
+    # SPEC 18.2 revision 12: serverChecked must be TRUE only when this call
+    # really completed a status round trip. rslib short-circuits the request
+    # whenever the collection is locally dirty (measured against an
+    # unreachable endpoint: dirty answered in 0.018 ms with no socket opened,
+    # clean raised NetworkError after attempting one), which is exactly
+    # core.local_sync_dirty's predicate — so the flag is derived, never guessed.
+    import anki.sync
+    from anki.sync_pb2 import SyncStatusResponse
+    plus = _load_plus()
+
+    class FakeMediaSyncer:
+        def is_syncing(self):
+            return False
+
+        def seconds_since_last_sync(self):
+            return 0
+
+    class FakePM:
+        def sync_auth(self):
+            return anki.sync.SyncAuth(hkey="fake-key", endpoint=None,
+                                      io_timeout_secs=60)
+
+        def set_current_sync_url(self, url):  # pragma: no cover
+            raise AssertionError("unexpected endpoint rewrite: %r" % url)
+
+    class FakeMW:
+        def __init__(self, collection):
+            self.col = collection
+            self.pm = FakePM()
+            self.media_syncer = FakeMediaSyncer()
+
+    class FakeAC(plus.PlusMixin):
+        def __init__(self, mw):
+            self._mw = mw
+
+        def window(self):
+            return self._mw
+
+    inst = FakeAC(FakeMW(col))
+    canned = {"required": SyncStatusResponse.NORMAL_SYNC}
+    # stub the backend probe: no socket, and the response carries no
+    # round-trip flag anyway (verified — only 'required' + 'new_endpoint')
+    col.sync_status = lambda auth: SyncStatusResponse(required=canned["required"])
+    try:
+        # dirty collection -> the backend answers locally; NOT server-verified
+        col.decks.id("SyncStatusDirtyDeck")
+        assert core.local_sync_dirty(col)["dirty"] is True
+        out = inst.syncStatus()
+        assert out["required"] == "normal_sync", out
+        assert out["serverChecked"] is False, out
+
+        # clean collection -> the probe really goes out
+        _ls, mod, scm = col.db.first("select ls, mod, scm from col")
+        col.db.execute("update col set ls = ?", max(mod, scm) + 1)
+        assert core.local_sync_dirty(col)["dirty"] is False
+        canned["required"] = SyncStatusResponse.NO_CHANGES
+        out = inst.syncStatus()
+        assert out["required"] == "no_changes", out
+        assert out["serverChecked"] is True, out
+
+        # localOnly never opens a socket, so it is never server-verified
+        out = inst.syncStatus(localOnly=True)
+        assert out["required"] == "unknown_no_network", out
+        assert out["serverChecked"] is False, out
+
+        # localOnly + schema changed -> full_sync_required, not normal_sync
+        # (the backend's OWN local verdict for scm > ls; reporting
+        # 'normal_sync' here under-reported a collection that cannot converge)
+        ls = col.db.scalar("select ls from col")
+        col.db.execute("update col set scm = ?", ls + 1)
+        assert col.schema_changed()
+        out = inst.syncStatus(localOnly=True)
+        assert out["required"] == "full_sync_required", out
+        assert out["serverChecked"] is False, out
+
+        # plain local changes still report normal_sync
+        col.db.execute("update col set scm = ?, mod = ?", ls - 1, ls + 1)
+        assert not col.schema_changed()
+        out = inst.syncStatus(localOnly=True)
+        assert out["required"] == "normal_sync", out
+    finally:
+        del col.sync_status
 
 
 def test5b_signature_string_docs():
@@ -568,13 +685,7 @@ def test5b_signature_string_docs():
     # _signature_string. If util.api() ever gains a wrapper that destroys
     # inspect.signature (functools-less, or any *args/**kwargs shim), every
     # params string silently degrades — this is the alarm for that.
-    import types
-    pkg_name = "ancp_sig_pkg"
-    if pkg_name not in sys.modules:
-        pkg = types.ModuleType(pkg_name)
-        pkg.__path__ = [os.path.join(REPO, "connect_plus")]
-        sys.modules[pkg_name] = pkg
-    plus = importlib.import_module(pkg_name + ".plus")
+    plus = _load_plus()
 
     api_methods = _plus_mixin_api_methods()
     mixin = plus.PlusMixin()  # no __init__; never dispatched, only reflected
@@ -605,6 +716,7 @@ run("test4_aqt_signature_compat", test4_aqt_signature_compat)
 run("test3_ankihub_addon_signature_gate", test3_ankihub_addon_signature_gate)
 run("test5_wrapper_static_checks", test5_wrapper_static_checks)
 run("test5b_signature_string_docs", test5b_signature_string_docs)
+run("test7_sync_status_server_checked", test7_sync_status_server_checked)
 
 
 def test6_no_network_no_entry_point():

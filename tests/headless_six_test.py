@@ -171,7 +171,30 @@ def test1_render_card():
     assert "render-front-XYZ" in t["question"], t["question"]
     assert "<" not in t["question"] and "<" not in t["answer"], t
     assert "render-back-QRS" in t["answer"], t["answer"]
-    assert t["css"].strip(), t
+    # revision 12 (SPEC 12): format='text' defaults to cssMode='omit' — css is
+    # meaningless in a text render and measured 90-95% of the payload
+    assert "css" not in t, t
+    assert "cssByNotetype" not in out, out
+    # ...but an explicit cssMode always wins, in either direction
+    t2 = core.render_card(col, [cid_basic], render_format="text",
+                          css_mode="perCard")["cards"][0]
+    assert t2["css"].strip(), t2
+    h_omit = core.render_card(col, [cid_basic], css_mode="omit")["cards"][0]
+    assert "css" not in h_omit, h_omit
+
+    # cssMode='byNotetype': css hoisted ONCE per notetype, none per card, and
+    # every card carries 'notetype' (present in all modes)
+    out_by = core.render_card(col, [cid_basic, cid_cloze, bogus],
+                              css_mode="byNotetype")
+    assert set(out_by["cssByNotetype"]) == {"Basic", "Cloze"}, out_by["cssByNotetype"]
+    assert out_by["cssByNotetype"]["Basic"] == b["css"], out_by["cssByNotetype"]
+    for card in out_by["cards"]:
+        assert "css" not in card, card
+        if "error" not in card:
+            assert card["notetype"] == card["modelName"], card
+    assert b["notetype"] == "Basic" and t["notetype"] == "Basic", (b, t)
+    expect_error(lambda: core.render_card(col, [cid_basic], css_mode="nope"),
+                 "invalid parameter: cssMode: one of perCard, byNotetype, omit required")
     scripted = ('<script>var leak = 1;</script>front-kept'
                 '<style>.x { color: red }</style>')
     assert core._render_format_text(col, scripted, "body") == "front-kept", \
@@ -216,13 +239,48 @@ def test2_notes_slim_query_and_fields():
     assert [n["noteId"] for n in out["notes"]] == rev, "caller order not preserved"
     assert out["total"] == 25, out["total"]
 
-    # duplicates returned twice; stale id omitted but counted in total
+    # duplicates returned twice AND counted twice in total
     out = core.notes_slim(col, note_ids=[SLIM_IDS[0], SLIM_IDS[0]])
     assert [n["noteId"] for n in out["notes"]] == [SLIM_IDS[0]] * 2, out
+    assert out["total"] == 2 and out["missing"] == [], out
+
+    # SPEC 13 revision 12 (DELIBERATE BREAKING CHANGE, round-3 field report):
+    # under noteIds 'total' now counts the ids FOUND, not the ids requested —
+    # it used to report 2 here while returning one note, with no channel at
+    # all for the stale id. The stale ids are named in 'missing', and
+    # len(noteIds) == total + len(missing) holds on every page.
     stale = 4444444444444
+    stale2 = 4444444444445
     out = core.notes_slim(col, note_ids=[SLIM_IDS[0], stale])
-    assert out["total"] == 2, out
+    assert out["total"] == 1, out
+    assert out["missing"] == [stale], out
     assert [n["noteId"] for n in out["notes"]] == [SLIM_IDS[0]], out
+    assert out["nextOffset"] is None, out
+
+    out = core.notes_slim(col, note_ids=[SLIM_IDS[0], stale, SLIM_IDS[1], stale2])
+    assert out["total"] == 2 and out["missing"] == [stale, stale2], out
+    assert len([SLIM_IDS[0], stale, SLIM_IDS[1], stale2]) == \
+        out["total"] + len(out["missing"]), out
+
+    # the reported pager trap: an all-stale request must not hand back a
+    # nextOffset pointing at another page that can only be empty
+    out = core.notes_slim(col, note_ids=[stale, stale, stale2], limit=2)
+    assert out["total"] == 0 and out["notes"] == [], out
+    assert out["missing"] == [stale, stale, stale2], out
+    assert out["nextOffset"] is None, out
+    # ...while a real note past the window still yields a nextOffset
+    out = core.notes_slim(col, note_ids=[stale, stale, SLIM_IDS[0]], limit=2)
+    assert out["total"] == 1 and out["notes"] == [], out
+    assert out["nextOffset"] == 2, out
+    page2 = core.notes_slim(col, note_ids=[stale, stale, SLIM_IDS[0]], limit=2,
+                            offset=2)
+    assert [n["noteId"] for n in page2["notes"]] == [SLIM_IDS[0]], page2
+    assert page2["nextOffset"] is None and page2["total"] == 1, page2
+
+    # query path: unchanged semantics (match count) + always-present missing
+    out = core.notes_slim(col, query="deck:SlimDeck", limit=10)
+    assert out["total"] == 25 and out["missing"] == [], out
+    assert out["nextOffset"] == 10, out
 
     # fields projection: only the named field, unknown name silently absent
     out = core.notes_slim(col, note_ids=[SLIM_IDS[0]], fields=["Front", "NoSuchField"])
@@ -257,6 +315,25 @@ def test2_notes_slim_query_and_fields():
     out = core.notes_slim(col, note_ids=[hid], max_field_length=0)
     assert out["notes"][0]["fields"]["Front"].endswith("ancp-six-pic.png"), out
     assert out["notes"][0]["truncatedFields"] == [], out["notes"][0]
+
+    # omitEmptyFields (SPEC 13, revision 12): default false keeps every field,
+    # true drops the ones whose EMITTED value is '' — including a field whose
+    # markup strips to nothing
+    r = core.bulk_add_notes(col, [
+        {"deckName": "SlimHtmlDeck", "modelName": "Basic", "tags": [],
+         "fields": {"Front": "slim-omit-front", "Back": "<br>"}}])
+    oid = r["added"][0]
+    out = core.notes_slim(col, note_ids=[oid])
+    assert list(out["notes"][0]["fields"]) == ["Front", "Back"], out["notes"][0]
+    assert out["notes"][0]["fields"]["Back"] == "", out["notes"][0]
+    out = core.notes_slim(col, note_ids=[oid], omit_empty_fields=True)
+    assert list(out["notes"][0]["fields"]) == ["Front"], out["notes"][0]
+    # ...but raw HTML '<br>' is NOT empty, so it survives with stripHtml=false
+    out = core.notes_slim(col, note_ids=[oid], omit_empty_fields=True,
+                          strip_html=False)
+    assert out["notes"][0]["fields"]["Back"] == "<br>", out["notes"][0]
+    expect_error(lambda: core.notes_slim(col, note_ids=[oid], omit_empty_fields="yes"),
+                 "invalid parameter: omitEmptyFields: boolean required")
 
 
 # ---------------------------------------------------------------- test 3
@@ -486,8 +563,11 @@ def test7_bulk_suspend():
     bogus = 999999999999
 
     # suspend 5 (+1 bogus, +1 duplicate id) -> changed 5, queues -1
+    # (revision 12: additive 'changedIds' names the cards actually written —
+    # deduplicated, bogus id dropped, precheck order)
     r = core.bulk_suspend(col, cids + [bogus, cids[0]])
-    assert r == {"changed": 5, "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
+    assert r == {"changed": 5, "changedIds": cids,
+                 "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
     assert all(q == -1 for q in queues().values()), queues()
     assert col.undo_status().undo == "AnkiConnect Plus: Bulk Suspend"
 
@@ -501,22 +581,24 @@ def test7_bulk_suspend():
     assert r["changed"] == 5, r
     snap = undo_snap()
     r = core.bulk_suspend(col, cids)
-    assert r == {"changed": 0, "undoEntry": None}, r
+    assert r == {"changed": 0, "changedIds": [], "undoEntry": None}, r
     assert undo_snap() == snap, "no-op suspend touched the undo stack"
 
     # unsuspend restores the queues
     r = core.bulk_suspend(col, cids, suspend=False)
-    assert r == {"changed": 5, "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
+    assert r == {"changed": 5, "changedIds": cids,
+                 "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
     assert all(q == 0 for q in queues().values()), queues()
 
     # unsuspend with nothing suspended -> no-op, stack untouched
     snap = undo_snap()
     r = core.bulk_suspend(col, cids, suspend=False)
-    assert r == {"changed": 0, "undoEntry": None}, r
+    assert r == {"changed": 0, "changedIds": [], "undoEntry": None}, r
     assert undo_snap() == snap
 
     # empty list; bad params
-    assert core.bulk_suspend(col, []) == {"changed": 0, "undoEntry": None}
+    assert core.bulk_suspend(col, []) == {"changed": 0, "changedIds": [],
+                                          "undoEntry": None}
     expect_error(lambda: core.bulk_suspend(col, [cids[0], "x"]),
                  "invalid parameter: cardIds: ints required")
     expect_error(lambda: core.bulk_suspend(col, cids, suspend="yes"),
@@ -536,7 +618,8 @@ def test8_bulk_set_due_date():
     orig = col.get_card(c0)
     orig_state = (orig.type, orig.queue, orig.due, orig.ivl)
     r = core.bulk_set_due_date(col, [c0], "0")
-    assert r == {"changed": 1, "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+    assert r == {"changed": 1, "changedIds": [c0], "unsuspended": [],
+                 "unburied": [], "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
     card = col.get_card(c0)
     assert card.type == 2 and card.queue == 2, (card.type, card.queue)
     assert card.due == today, (card.due, today)
@@ -548,7 +631,8 @@ def test8_bulk_set_due_date():
 
     # '1-3' -> each due within [today+1, today+3]; duplicate id counted once
     r = core.bulk_set_due_date(col, [c1, c2, c3, c1], "1-3")
-    assert r == {"changed": 3, "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+    assert r == {"changed": 3, "changedIds": [c1, c2, c3], "unsuspended": [],
+                 "unburied": [], "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
     for cid in (c1, c2, c3):
         card = col.get_card(cid)
         assert card.type == 2 and card.queue == 2, (cid, card.type, card.queue)
@@ -569,9 +653,33 @@ def test8_bulk_set_due_date():
     assert col.db.all("select id, type, queue, due, ivl from cards order by id") == rows_before, \
         "bad days string changed card state"
 
+    # SPEC 16.2 revision 12: set_due_date RESURRECTS suspended and buried
+    # cards — the round-3 field report's worst-consequence finding (suspend
+    # your leeches, reschedule the deck, silently un-suspend them). The
+    # revived ids must be disclosed.
+    assert core.bulk_suspend(col, [c1])["changed"] == 1
+    col.sched.bury_cards([c2], manual=True)
+    assert col.get_card(c1).queue == -1 and col.get_card(c2).queue == -3, \
+        (col.get_card(c1).queue, col.get_card(c2).queue)
+    r = core.bulk_set_due_date(col, [c1, c2, c3], "2")
+    assert r["unsuspended"] == [c1], r
+    assert r["unburied"] == [c2], r
+    assert r["changedIds"] == [c1, c2, c3] and r["changed"] == 3, r
+    assert col.get_card(c1).queue == 2 and col.get_card(c2).queue == 2, \
+        "set_due_date no longer resurrects; the disclosure needs rechecking"
+
+    # documented: it ALWAYS writes, even for a byte-identical repeat (no no-op
+    # suppression — '1-7' is nondeterministic by construction), so a repeat
+    # still creates an undo entry
+    before = col.undo_status().last_step
+    r = core.bulk_set_due_date(col, [c3], "2")
+    assert r["changed"] == 1 and r["unsuspended"] == [] and r["unburied"] == [], r
+    assert col.undo_status().last_step > before, "no-op repeat created no undo step"
+
     # only-bogus ids -> no-op; bad params
     assert core.bulk_set_due_date(col, [999999999999], "0") == \
-        {"changed": 0, "undoEntry": None}
+        {"changed": 0, "changedIds": [], "unsuspended": [], "unburied": [],
+         "undoEntry": None}
     expect_error(lambda: core.bulk_set_due_date(col, [c0], 5),
                  "invalid parameter: days: string like")
     expect_error(lambda: core.bulk_set_due_date(col, [c0], ""),

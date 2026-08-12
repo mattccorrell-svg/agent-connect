@@ -114,9 +114,11 @@ def run(name, fn):
 def test0_actions_registered():
     assert "checkDeckIntegrity" in core.PLUS_ACTIONS
     assert "bulkReplaceInFields" in core.PLUS_ACTIONS
-    # 26 = 24 + round-2 SPEC 22/23 (mediaExists, storeMediaFilesBulk)
-    assert len(core.PLUS_ACTIONS) == 26, core.PLUS_ACTIONS
-    assert len(set(core.PLUS_ACTIONS)) == 26, "duplicate action names"
+    assert "undoStatus" in core.PLUS_ACTIONS
+    # 27 = 24 + round-2 SPEC 22/23 (mediaExists, storeMediaFilesBulk)
+    #         + round-3 SPEC 26 (undoStatus)
+    assert len(core.PLUS_ACTIONS) == 27, core.PLUS_ACTIONS
+    assert len(set(core.PLUS_ACTIONS)) == 27, "duplicate action names"
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
     # summaries lockstep (SPEC 4.9): every action documented, no strays
     assert set(core.PLUS_ACTION_SUMMARIES) == set(core.PLUS_ACTIONS), (
@@ -150,7 +152,8 @@ def test2_integrity_clean_deck():
     assert out["unbalancedCloze"] == [], out
     assert out["clozeCardMismatch"] == [], out
     assert out["clozeNotesWithoutCloze"] == [], out
-    assert out["orphanMedia"] is None, out
+    assert out["orphanMediaCollectionWide"] is None, out
+    assert out["orphanMediaCount"] is None, out
     assert out["notesChecked"] == 2, out
     assert undo_snap() == snap, "checkDeckIntegrity touched the undo stack"
 
@@ -248,18 +251,30 @@ def test6_integrity_orphan_media():
     col.media.write_data(latex_name, make_png(4, 4))
     snap = undo_snap()
     out = core.check_deck_integrity(col, "Orphan", include_orphan_media=True)
-    assert isinstance(out["orphanMedia"], list), out
-    assert "seven-orphan.png" in out["orphanMedia"], out["orphanMedia"]
-    assert used not in out["orphanMedia"], out["orphanMedia"]
-    assert "_seven-static.png" not in out["orphanMedia"], out["orphanMedia"]
-    assert latex_name not in out["orphanMedia"], out["orphanMedia"]
-    assert out["orphanMedia"] == sorted(out["orphanMedia"])
+    # revision 12: renamed to orphanMediaCollectionWide (the only NON-deck-
+    # scoped list in the report) + always-present count and cap
+    orphans = out["orphanMediaCollectionWide"]
+    assert isinstance(orphans, list), out
+    assert "seven-orphan.png" in orphans, orphans
+    assert used not in orphans, orphans
+    assert "_seven-static.png" not in orphans, orphans
+    assert latex_name not in orphans, orphans
+    assert orphans == sorted(orphans)
+    assert out["orphanMediaCount"] == len(orphans), out
+    assert out["orphanMediaTruncated"] is False, out
+    # cap: the array shrinks to the limit, the COUNT still reports the truth
+    capped = core.check_deck_integrity(col, "Orphan", include_orphan_media=True,
+                                       orphan_media_limit=1)
+    assert capped["orphanMediaCollectionWide"] == orphans[:1], capped
+    assert capped["orphanMediaCount"] == out["orphanMediaCount"], capped
+    assert capped["orphanMediaTruncated"] is (out["orphanMediaCount"] > 1), capped
     # latex image absence is NOT missing media (regenerated on demand)
     assert all(e["noteId"] != latex_nid for e in out["missingMedia"]), out
     assert undo_snap() == snap, "orphan scan touched the undo stack"
     # flag off -> null, and the scan is collection-wide either way
     out2 = core.check_deck_integrity(col, "Orphan")
-    assert out2["orphanMedia"] is None, out2
+    assert out2["orphanMediaCollectionWide"] is None, out2
+    assert out2["orphanMediaCount"] is None, out2
 
 
 # ---------------------------------------------------------------- test 7

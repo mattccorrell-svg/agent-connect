@@ -401,8 +401,13 @@ def test5_integrity_buckets():
                                          "expectedOrds": [0, 1],
                                          "actualOrds": [0]}], out["clozeCardMismatch"]
     assert out["clozeNotesWithoutCloze"] == [], out["clozeNotesWithoutCloze"]
-    # includeOrphanMedia=false -> orphanMedia null
-    assert out["orphanMedia"] is None, out
+    # includeOrphanMedia=false -> the collection-wide array AND its count are
+    # null (revision 12: renamed from 'orphanMedia' — DELIBERATE BREAKING
+    # CHANGE — because it is the ONE non-deck-scoped list in this report)
+    assert "orphanMedia" not in out, out
+    assert out["orphanMediaCollectionWide"] is None, out
+    assert out["orphanMediaCount"] is None, out
+    assert out["orphanMediaTruncated"] is False, out
     assert out["notesChecked"] == 4, out["notesChecked"]
     # the healthy note and the other-deck note appear in no defect list
     flagged = ({e["noteId"] for e in out["missingMedia"]}
@@ -412,11 +417,23 @@ def test5_integrity_buckets():
     assert n_healthy not in flagged and n_else not in flagged, flagged
 
     out2 = core.check_deck_integrity(col, "FBIntegrity", include_orphan_media=True)
-    assert isinstance(out2["orphanMedia"], list), out2
-    assert "fb-orphan.png" in out2["orphanMedia"], out2["orphanMedia"]
+    orphans = out2["orphanMediaCollectionWide"]
+    assert isinstance(orphans, list), out2
+    assert "fb-orphan.png" in orphans, orphans
     # referenced from ANOTHER deck -> not an orphan (scan is collection-wide)
-    assert "fb-otherdeck.png" not in out2["orphanMedia"], out2["orphanMedia"]
-    assert "fb-used.png" not in out2["orphanMedia"], out2["orphanMedia"]
+    assert "fb-otherdeck.png" not in orphans, orphans
+    assert "fb-used.png" not in orphans, orphans
+    # the count is the FULL collection-wide size, the array is capped
+    assert out2["orphanMediaCount"] == len(orphans), out2
+    assert out2["orphanMediaTruncated"] is False, out2
+    capped = core.check_deck_integrity(col, "FBIntegrity", include_orphan_media=True,
+                                       orphan_media_limit=0)
+    assert capped["orphanMediaCollectionWide"] == [], capped
+    assert capped["orphanMediaCount"] == out2["orphanMediaCount"], capped
+    assert capped["orphanMediaTruncated"] is True, capped
+    expect_error(lambda: core.check_deck_integrity(col, "FBIntegrity",
+                                                   orphan_media_limit=-1),
+                 "invalid parameter: orphanMediaLimit: int >= 0 required")
     # defect buckets identical with the orphan scan on
     for key in ("missingMedia", "unbalancedCloze", "clozeCardMismatch",
                 "clozeNotesWithoutCloze", "notesChecked"):
@@ -563,12 +580,12 @@ def test7_plus_info_action_docs():
     assert info["actions"] == list(core.PLUS_ACTIONS)
 
     docs = info["actionDocs"]
-    # all 26 actions documented, no strays (26 = 24 + round-2 SPEC 22/23:
-    # mediaExists, storeMediaFilesBulk)
-    assert len(core.PLUS_ACTIONS) == 26, core.PLUS_ACTIONS
+    # all 27 actions documented, no strays (27 = 24 + round-2 SPEC 22/23:
+    # mediaExists, storeMediaFilesBulk + round-3 SPEC 26: undoStatus)
+    assert len(core.PLUS_ACTIONS) == 27, core.PLUS_ACTIONS
     assert set(docs) == set(core.PLUS_ACTIONS), \
         sorted(set(docs) ^ set(core.PLUS_ACTIONS))
-    assert len(docs) == 26, len(docs)
+    assert len(docs) == 27, len(docs)
 
     # summary non-empty for EVERY action; params never leak 'self'
     for name in core.PLUS_ACTIONS:

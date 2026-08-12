@@ -56,7 +56,7 @@ from aqt.qt import Qt, QTimer, QMessageBox, QCheckBox
 
 from .web import format_exception_reply, format_success_reply
 from .edit import Edit
-from . import web, util
+from . import core, web, util
 from . import plus
 
 
@@ -137,7 +137,16 @@ class AnkiConnect(plus.PlusMixin):
                         break
 
             if method is None:
-                raise Exception('unsupported action')
+                # SPEC 25.2 (revision 13): the ONE upstream-dispatcher error
+                # that gets a code. An unknown action used to answer a bare
+                # "unsupported action", so the documented parse rule
+                # error.split('] ', 1)[0].lstrip('[') silently returned the
+                # whole message — the single most likely error a new client
+                # hits was the one case the vocabulary did not cover. The
+                # message body is unchanged after the prefix. Errors raised by
+                # upstream AnkiConnect ACTIONS stay unprefixed (the boundary is
+                # documented in core.PLUS_ERROR_PREFIX_NOTE).
+                raise core.PlusError('unknown_action', 'unsupported action')
 
             api_return_value = methodInst(**params)
             reply = format_success_reply(version, api_return_value)

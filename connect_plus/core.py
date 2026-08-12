@@ -78,6 +78,8 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "checkDeckIntegrity",
                 # find/replace (literal or regex) on ONE named field's raw HTML, one undoable batch, dryRun preview
                 "bulkReplaceInFields",
+                # read Anki's own undo stack: what a single undo/redo would do right now (read-only)
+                "undoStatus",
                 "plusInfo"]
 # One-line summaries served by plusInfo's actionDocs (SPEC 4.9): the
 # discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
@@ -93,22 +95,146 @@ PLUS_ACTION_SUMMARIES = {
     "createBackup": "Create a .colpkg backup in the profile's backups folder; created=false means nothing changed since the last backup.",
     "cropImage": "Crop a media image into a NEW media file (original kept), optionally rewriting notes to reference it.",
     "cropImageOcclusionImage": "Crop an IO note's base image and remap its occlusion rects into the cropped frame, one undo entry.",
-    "renderCard": "Render cards' question/answer through Anki's template pipeline (read-only); format='html' (verbatim, scripts/styles included), 'body' (script/style blocks removed), or 'text' (visible text only).",
-    "notesSlim": "Compact paginated note reader for LLM consumption; exactly one of query/noteIds is required. stripHtml (default true; false returns raw field HTML), fields projection, maxFieldLength with per-note truncatedFields. Raw-fidelity field projection: fields=[...] + stripHtml=false + maxFieldLength=0 returns the chosen fields' exact stored HTML, untruncated.",
+    "renderCard": "Render cards' question/answer through Anki's template pipeline (read-only); format='html' (verbatim, scripts/styles included), 'body' (script/style blocks removed), or 'text' (visible text only). cssMode controls notetype CSS: 'perCard' (default for html/body), 'byNotetype' (one top-level cssByNotetype map, no per-card css) or 'omit' (default for format='text', where css is meaningless); every card carries 'notetype'.",
+    "notesSlim": "Compact paginated note reader for LLM consumption; exactly one of query/noteIds is required. stripHtml (default true; false returns raw field HTML), fields projection, omitEmptyFields, maxFieldLength with per-note truncatedFields. Under noteIds, 'total' counts the ids actually FOUND and 'missing' lists the ids that no longer exist. Raw-fidelity field projection: fields=[...] + stripHtml=false + maxFieldLength=0 returns the chosen fields' exact stored HTML, untruncated.",
     "mediaThumbnails": "Base64 thumbnails of media images: aspect-preserved, never upscaled (read-only).",
-    "mediaExists": "Membership probe: which of these bare media filenames exist in the media folder (read-only, input order; malformed/path-y names report exists:false).",
+    "mediaExists": "Membership probe: which of these bare media filenames exist in the media folder (read-only, input order; malformed/path-y names report exists:false). actualName reveals the true stored spelling when the filesystem matched case-insensitively (macOS/Windows) — a name that only differs in case will 404 on AnkiWeb/Linux/iOS.",
     "storeMediaFilesBulk": "Store many media files (base64 data or absolute path) in one call; per-item {requested, actual} makes Anki's dedup/rename decision visible, {requested, error} on failures, input order.",
-    "bulkSuspend": "Suspend or unsuspend cards as one undoable batch.",
-    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch.",
+    "bulkSuspend": "Suspend or unsuspend cards as one undoable batch; changedIds lists the cards actually written.",
+    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. It also always writes (no no-op suppression: '1-7' is nondeterministic by design).",
     "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting.",
     "syncStatus": "Read-only sync probe: login, local dirtiness, server-required kind, async job state.",
     "syncNow": "Start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus.",
     "ankihubStatus": "AnkiHub bridge probe: install/enable/login/deck status + add-on compatibility (read-only, never network).",
     "ankihubSuggestNoteUpdate": "Submit ONE change suggestion for an existing AnkiHub note through the installed AnkiHub add-on.",
     "ankihubSuggestNewNote": "Submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion.",
-    "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional collection-wide orphan-media scan.",
+    "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional orphan-media scan. Every list is deck-scoped EXCEPT orphanMediaCollectionWide, which is COLLECTION-WIDE (capped by orphanMediaLimit, full size in orphanMediaCount).",
     "bulkReplaceInFields": "Find/replace (literal or python-regex) on ONE named field's raw HTML, as one undoable batch; field, find and replace are required, plus exactly one of query/noteIds. dryRun returns a capped before/after preview.",
-    "plusInfo": "Name/version/action list plus per-action actionDocs (summary + params) and a 'recipes' list of named call patterns; works before a profile is open.",
+    "undoStatus": "Read Anki's undo stack (read-only): what a single undo/redo would do right now, plus lastStep — the observed truth behind every action's undoEntry.",
+    "plusInfo": "Name/version/action list plus per-action actionDocs (summary + params + returns), an 'errorCodes' map and a 'recipes' list of named call patterns; works before a profile is open.",
+}
+
+# plusInfo actionDocs 'returns' (SPEC 4.9, revision 13 — round-3 field feedback
+# ASK 1). actionDocs documented INPUTS and nothing else, so callers guessed
+# output shapes and took KeyErrors (measured: 'entries' guessed for queryRevlog,
+# which returns {rows,total,truncated,nextOffset}; a bare list guessed for
+# renderCard, which returns {cards:[...]}). One shape sketch per action, in the
+# same JSON-flavored shorthand as the params strings: `key: type` pairs, `|`
+# for alternatives, `[...]` for arrays of the enclosed item shape. Conditional
+# and mode-dependent keys are named inline. Every PLUS_ACTIONS name must be
+# present (locked by a test alongside PLUS_ACTION_SUMMARIES).
+PLUS_ACTION_RETURNS = {
+    "bulkAddNotes":
+        "{added: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
+        "dryRun=true instead returns {wouldAdd: int, skipped: [{index, reason}], undoEntry: null}.",
+    "bulkUpdateNoteFields":
+        "{updated: [noteId], unchanged: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
+        "dryRun=true returns {wouldUpdate: [noteId], unchanged, skipped, undoEntry: null}, and "
+        "dryRun+diff=true adds {preview: [{noteId, field, before, after}], previewTruncated: bool} "
+        "where field is a notetype field name or the literal '__tags__' for a tags-only change.",
+    "bulkAddTags":
+        "{updated: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
+        "dryRun=true returns {wouldUpdate: [noteId], skipped, undoEntry: null}.",
+    "addImageOcclusionNote":
+        "{noteId: int, cardIds: [int], undoEntry: str}",
+    "getImageOcclusionNote":
+        "{imageFilename: str, occlusions: [{ordinal, shape, left, top, width, height} for rects | "
+        "{ordinal, shape, properties} for ellipse/polygon/text], header: str, backExtra: str, "
+        "tags: [str], occludeInactive: bool}",
+    "updateImageOcclusionNote":
+        "{undoEntry: str|null} — null when nothing actually changed (no write, no undo entry).",
+    "queryRevlog":
+        "{rows: [{id, cardId, noteId, ease, interval, lastInterval, factor, timeMs, type, "
+        "reviewedAt}], total: int, truncated: bool, nextOffset: int|null} — NOT 'entries'; "
+        "total is the full match count, rows is the page.",
+    "createBackup":
+        "{created: bool} — false means the backend declined because nothing changed since the "
+        "last backup, which is a normal outcome and not an error.",
+    "cropImage":
+        "{newFilename: str, width: int, height: int, notesUpdated: [noteId], undoEntry: str|null}",
+    "cropImageOcclusionImage":
+        "{newFilename: str, occlusionsKept: int, occlusionsClipped: int, occlusionsDropped: int, "
+        "cardIds: [int], undoEntry: str}",
+    "renderCard":
+        "{cards: [{cardId, question, answer, deckName, modelName, notetype, ord} | "
+        "{cardId, error}]} — each card also carries 'css' when cssMode='perCard', and the "
+        "response gains a top-level {cssByNotetype: {notetypeName: css}} ONLY when "
+        "cssMode='byNotetype'. Per-card render failures are {cardId, error} entries inside "
+        "'cards', not a raised error.",
+    "notesSlim":
+        "{total: int, notes: [{noteId, modelName, tags: [str], fields: {name: value}, "
+        "truncatedFields: [name]}], missing: [noteId], nextOffset: int|null} — under noteIds, "
+        "total counts the ids FOUND and missing lists the ids that no longer exist "
+        "(len(noteIds) == total + len(missing) on every page); under query, total is the match "
+        "count and missing is always []. nextOffset is null when no further page can return a note.",
+    "mediaThumbnails":
+        "{thumbnails: [{filename, data, width, height} | {filename, error}]} — data is base64, "
+        "per-file failures are {filename, error} entries, never a raised error.",
+    "mediaExists":
+        "{results: [{filename, exists: bool, actualName: str|null}]} — input order and duplicates "
+        "preserved. actualName is non-null only when the filesystem matched case-insensitively "
+        "(macOS/Windows): the name as actually stored. A non-null actualName means the requested "
+        "spelling will 404 on AnkiWeb/Linux/iOS.",
+    "storeMediaFilesBulk":
+        "{stored: [{requested, actual} | {requested, error}]} — input order. actual != requested "
+        "reveals anki's dedup/rename decision (same name + different bytes gets a SHA-1 suffix).",
+    "bulkSuspend":
+        "{changed: int, changedIds: [cardId], undoEntry: str|null} — a data no-op returns "
+        "changed 0, changedIds [] and undoEntry null (nothing is written).",
+    "bulkSetDueDate":
+        "{changed: int, changedIds: [cardId], unsuspended: [cardId], unburied: [cardId], "
+        "undoEntry: str|null} — unsuspended/unburied are ALWAYS present ([] when empty) and list "
+        "the cards this call RESURRECTED: anki's set_due_date turns suspended and buried cards "
+        "into normal review cards. This action always writes; it never suppresses no-ops.",
+    "exportDeckApkg":
+        "{path: str, sizeBytes: int, notesExported: int} — path is the file actually written "
+        "(never an overwrite; a serial suffix is added if needed), so read it rather than "
+        "assuming the requested outPath.",
+    "syncStatus":
+        "{loggedIn: bool, job: {state, startedMs, result, error}, mediaSyncing: bool, "
+        "mediaSecondsSinceLastSync: int, lastSyncMs: int|null, modMs: int|null, "
+        "required: 'no_changes'|'normal_sync'|'full_sync_required'|'not_logged_in'|"
+        "'unknown_no_network'|'offline'|'auth_failed'|'error'|null, serverChecked: bool} — "
+        "serverChecked is true ONLY when this call completed a network round trip; false always "
+        "means 'not verified by this call', never 'the server says no'.",
+    "syncNow":
+        "{started: true, mediaSync: bool} on start, or {started: false, reason: "
+        "'collection_unavailable'|'not_logged_in'|'already_syncing'|'media_sync_in_progress'} — "
+        "a refusal is a normal response, NOT an error. Poll syncStatus for the outcome.",
+    "ankihubStatus":
+        "{installed: bool, enabled: bool, loggedIn: bool, addonVersion: str|null, "
+        "testedAddonVersion: str, appUrl: str|null, decks: [{ankihubDeckId, ankiDeckId, name, "
+        "userRelation, isAnkingDeck}], compatible: bool} — plus {problems: [str]} only when "
+        "compatible is false.",
+    "ankihubSuggestNoteUpdate":
+        "{result: 'success'|'noChanges'|'emptyFirstField'|..., comment: str} — comment is the "
+        "text actually submitted (rationale + folded source line).",
+    "ankihubSuggestNewNote":
+        "{result: 'success'|'noChanges'|'emptyFirstField'|..., resubmittedAsChange: bool} — "
+        "resubmittedAsChange true means the note already existed on AnkiHub and the call was "
+        "automatically retried as a change suggestion.",
+    "checkDeckIntegrity":
+        "{missingMedia: [{noteId, field, filename}], unbalancedCloze: [{noteId, field}], "
+        "clozeCardMismatch: [{noteId, expectedOrds, actualOrds}], clozeNotesWithoutCloze: "
+        "[noteId], orphanMediaCollectionWide: [filename]|null, orphanMediaCount: int|null, "
+        "orphanMediaTruncated: bool, notesChecked: int} — every list is DECK-SCOPED except "
+        "orphanMediaCollectionWide, which is COLLECTION-WIDE and capped at orphanMediaLimit "
+        "(default 100); orphanMediaCount is the true uncapped total. Both orphan fields are null "
+        "unless includeOrphanMedia=true.",
+    "bulkReplaceInFields":
+        "{changed: [noteId], matchesTotal: int, unchanged: [noteId], skipped: [{index, reason}], "
+        "undoEntry: str|null} — dryRun=true instead returns {wouldChange: [noteId], matchesTotal, "
+        "unchanged, skipped, preview: [{noteId, before, after}], previewTruncated: bool, "
+        "undoEntry: null}. before/after are raw field HTML.",
+    "undoStatus":
+        "{undo: str|null, redo: str|null, lastStep: int} — null (never '') when there is nothing "
+        "to undo/redo. lastStep is anki's monotonic undo-step counter: snapshot it, run a write, "
+        "call again — it advances iff an undo entry was really created.",
+    "plusInfo":
+        "{name: str, version: str, apiVersion: int, actions: [str], actionDocs: {action: "
+        "{summary, params, returns}}, errorCodes: {code: {retryable: bool, reachable: bool, "
+        "meaning: str}}, errorPrefixNote: str, recipes: [{name, description, example}], "
+        "docs: {plus, upstream, upstreamSource}}",
 }
 
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
@@ -132,7 +258,7 @@ PLUS_ERROR_CODES = {
     'io_error': False,                # reserved: disk read/write failure (today only per-item errors)
     'batch_reverted': False,          # atomic batch hit a hard error and was rolled back; JSON report after the prefix
     'collection_unavailable': True,   # no collection open (profile screen); retry once a profile is open
-    'sync_in_progress': True,         # reserved: syncNow reports busy states via {started:false, reason}
+    'sync_in_progress': True,         # REACHABLE (rev 13): the plus_api sync guard; poll syncStatus and retry
     'not_logged_in': False,           # a login this add-on cannot perform is required (e.g. AnkiHub add-on logged out)
     'auth_failed': False,             # stored credential rejected by the server (e.g. AnkiHub 401)
     'offline': True,                  # reserved: sync network failures surface in job.error / required, not raises
@@ -145,7 +271,100 @@ PLUS_ERROR_CODES = {
     'source_required': False,         # AnkiHub suggestion needs a source object/text it did not get
     'rationale_invalid': False,       # AnkiHub rationale empty or over the dialog's 1023-char cap
     'internal': False,                # unexpected failure inside the add-on or Anki (bug, not a caller error)
+    # dispatcher-level, not raised by any action: the requested action name is
+    # not served by this server at all (SPEC 25.2, revision 13)
+    'unknown_action': False,
 }
+
+# plusInfo 'errorCodes' (SPEC 25.1, revision 13 — round-3 field feedback ASK 1
+# and ASK 4). retryable is read from PLUS_ERROR_CODES so the two can never
+# drift; this map adds the two things a client could not otherwise learn
+# without the repo: whether a code is REACHABLE at all today, and what it
+# actually means. 'reachable': False marks a code the vocabulary reserves but
+# no code path raises — a caller must not build retry logic around it.
+PLUS_ERROR_CODE_DOCS = {
+    'not_found': {'reachable': True, 'meaning':
+        'A named thing does not exist: note, card, media file, IO notetype, output directory, '
+        'or an AnkiHub note that is not on AnkiHub / was deleted there.'},
+    'invalid_param': {'reachable': True, 'meaning':
+        'The request shape is wrong: the house "invalid parameter: <name>: <why>" family, plus '
+        'argument-binding failures (missing required argument, unexpected keyword argument).'},
+    'deck_not_found': {'reachable': True, 'meaning':
+        'The named deck does not exist. Decks are never auto-created by this add-on.'},
+    'duplicate': {'reachable': False, 'meaning':
+        'RESERVED — never raised. Duplicates are reported per item in skipped[].reason instead.'},
+    'unsupported_format': {'reachable': True, 'meaning':
+        'An image could not be loaded or re-encoded (corrupt file, or a format this Qt build '
+        'cannot write).'},
+    'io_error': {'reachable': False, 'meaning':
+        'RESERVED — never raised. Disk read/write failures surface per item in stored[].error.'},
+    'batch_reverted': {'reachable': True, 'meaning':
+        'An atomic batch hit a hard error and was rolled back completely; a JSON report follows '
+        'the message prefix. Nothing was written.'},
+    'collection_unavailable': {'reachable': True, 'meaning':
+        'No collection is open (Anki is on the profile screen). RETRYABLE: the identical call '
+        'succeeds once a profile is open.'},
+    'sync_in_progress': {'reachable': True, 'meaning':
+        'A syncNow job is mid-flight and the backend holds the collection lock, so this action '
+        'was refused rather than blocking Anki. RETRYABLE: poll syncStatus until job.state '
+        'leaves "syncing", then repeat the call. syncStatus, syncNow, plusInfo and ankihubStatus '
+        'are never refused this way — they are how you observe and drive the sync.'},
+    'not_logged_in': {'reachable': True, 'meaning':
+        'A login this add-on cannot perform is required — today only the AnkiHub add-on being '
+        'logged out. Requires the AnkiHub add-on to be installed to reach.'},
+    'auth_failed': {'reachable': True, 'meaning':
+        'A stored credential was rejected BY THE SERVER (AnkiHub HTTP 401). Distinct from '
+        'not_logged_in, which is a local check. Requires the AnkiHub add-on to reach.'},
+    'offline': {'reachable': False, 'meaning':
+        'RESERVED — never raised. Sync network failures surface in syncStatus job.error.code and '
+        "in 'required', not as an exception."},
+    'full_sync_required': {'reachable': False, 'meaning':
+        'RESERVED — never raised. Surfaced via the sync job error and syncStatus.required.'},
+    'network_error': {'reachable': True, 'meaning':
+        'Transport failure or an unexpected HTTP status (5xx included) talking to AnkiHub. '
+        'RETRYABLE. Requires the AnkiHub add-on to reach.'},
+    'rate_limited': {'reachable': True, 'meaning':
+        'The server applied a rate limit (AnkiHub HTTP 429). RETRYABLE after a wait. Requires '
+        'the AnkiHub add-on to reach.'},
+    'permission_denied': {'reachable': True, 'meaning':
+        'The server refused the operation (AnkiHub HTTP 403). Requires the AnkiHub add-on.'},
+    'validation_error': {'reachable': True, 'meaning':
+        'A well-formed request refused on semantic grounds: wrong note kind, IO note without an '
+        'image, a crop that would drop every occlusion, AnkiHub HTTP 400, note already on AnkiHub.'},
+    'incompatible_ankihub_addon': {'reachable': True, 'meaning':
+        'The AnkiHub add-on is missing, disabled, was not loaded this session, or has drifted '
+        'from the version this bridge was tested against. The bridge is unusable either way.'},
+    'source_required': {'reachable': True, 'meaning':
+        'An AnkiHub suggestion needs a source object/text it did not get (SPEC 19 source rules).'},
+    'rationale_invalid': {'reachable': True, 'meaning':
+        "An AnkiHub rationale was empty or exceeded the dialog's 1023-character cap."},
+    'internal': {'reachable': True, 'meaning':
+        'Something unexpected escaped an action (a backend exception or an add-on bug). The '
+        'original message body is preserved after the prefix. Not a caller error — report it.'},
+    'unknown_action': {'reachable': True, 'meaning':
+        'No action by that name is served here. Raised by the DISPATCHER, not by an action; see '
+        'the prefixing boundary note. Check plusInfo.actions and upstream AnkiConnect docs.'},
+}
+
+# The one boundary rule a client cannot infer from a single response (SPEC 25,
+# revision 13): the '[code] ' prefix is NOT universal across this server.
+PLUS_ERROR_PREFIX_NOTE = (
+    "Prefixing boundary: errors from the 27 Plus actions AND the dispatcher's unknown-action "
+    "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
+    "Errors from the ~90 UPSTREAM AnkiConnect actions are passed through verbatim and UNPREFIXED, "
+    "with errorCode: null and retryable: null — so error.split('] ', 1)[0].lstrip('[') is only "
+    "safe when errorCode is non-null. Read errorCode; do not parse the string. Per-item error "
+    "strings embedded inside a successful result (skipped[].reason, thumbnails[].error, "
+    "stored[].error, cards[].error) are never prefixed and never carry these fields."
+)
+
+# Message body for the SPEC 25.2 sync guard (the prefix is added by PlusError).
+# Kept here so the vocabulary and its one genuinely reachable retryable raise
+# site live together; the guard itself is in plus.py, where the job state is.
+SYNC_IN_PROGRESS_MESSAGE = (
+    'a sync is in progress and holds the collection lock; poll syncStatus '
+    'until job.state leaves "syncing", then retry'
+)
 
 # AnkiHub HTTP taxonomy code (SPEC 19; kept verbatim in message bodies) ->
 # SPEC 25 machine code for the '[code] ' prefix. Note the 401 mapping:
@@ -235,6 +454,42 @@ PLUS_RECIPES = [
                     'params': {'noteIds': [1712345678901], 'tags': 'reviewed',
                                'undoLabel': 'PI 7 tag sweep'}},
     },
+    {
+        'name': 'lean deck sweep',
+        'description': ("Reading a whole deck cheaply: call notesSlim with "
+                        "omitEmptyFields=true (empty fields are dropped from every "
+                        "note's fields dict) and a fields=[...] projection when you "
+                        "know which fields you need. On wide notetypes (AnKing-derived, "
+                        "19 fields of which ~4 are populated) omitEmptyFields alone cuts "
+                        "the payload roughly in half and the call is FASTER. Pair with "
+                        "renderCard cssMode='byNotetype' (or format='text', where CSS is "
+                        "omitted by default) when you also need rendered cards — the "
+                        "notetype stylesheet would otherwise repeat once per card."),
+        'example': {'action': 'notesSlim',
+                    'params': {'query': 'deck:current', 'omitEmptyFields': True,
+                               'limit': 200}},
+    },
+    {
+        'name': 'reading errors',
+        'description': ("Never parse the error string. An error response is "
+                        "{result: null, error: '[code] message', errorCode: str|null, "
+                        "retryable: bool|null}. Branch on errorCode: null means the error "
+                        "came from an UPSTREAM AnkiConnect action and carries no code (the "
+                        "'[code] ' prefix is absent too), so treat it as opaque. "
+                        "retryable=true means the IDENTICAL call may succeed later with no "
+                        "change by you — today that is collection_unavailable (open a "
+                        "profile), sync_in_progress (poll syncStatus until job.state leaves "
+                        "'syncing'), network_error and rate_limited (wait, then retry). "
+                        "Everything else needs a different request. plusInfo.errorCodes is "
+                        "the full vocabulary with retryable/reachable/meaning, so a client "
+                        "can build its retry table at runtime instead of hardcoding one. "
+                        "Inside upstream 'multi', each sub-response is a full envelope "
+                        "carrying the same four keys — check them per sub-response, not on "
+                        "the outer reply, which reports success even when every sub-action "
+                        "failed. Call this example once at startup and build your retry "
+                        "table from the errorCodes map it returns."),
+        'example': {'action': 'plusInfo', 'params': {}},
+    },
 ]
 
 UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
@@ -255,6 +510,13 @@ UNDO_LABEL_MAX_CHARS = 80
 # cards.queue: -1 = suspended; any negative queue (-1 suspended, -2 sibling-
 # buried, -3 manually buried) is restored by the backend unsuspend op (SPEC 16)
 QUEUE_SUSPENDED = -1
+
+# reserved 'field' name for the tag row of a bulkUpdateNoteFields dry-run diff
+# preview (SPEC 4.2, revision 12). Anki does NOT forbid a notetype field
+# literally named '__tags__' (probe-verified: models.add accepts it), so the
+# collision is possible-but-pathological and is documented rather than
+# defended against; a note's field rows are always emitted BEFORE its tag row.
+TAGS_PREVIEW_FIELD = '__tags__'
 
 # default target folder for exportDeckApkg when outPath is omitted (SPEC 17)
 EXPORT_DEFAULT_DIR = os.path.expanduser('~/Downloads')
@@ -277,6 +539,9 @@ SQL_IN_CHUNK = 15000
 
 # read-only action caps (SPEC 13, 14): oversized requests are clamped, not rejected
 NOTES_SLIM_LIMIT_CAP = 2000
+# checkDeckIntegrity's collection-wide orphan array is capped by default
+# (SPEC 20, revision 12); the full size always ships as orphanMediaCount
+ORPHAN_MEDIA_DEFAULT_LIMIT = 100
 THUMBNAIL_DIM_CAP = 1024
 THUMBNAIL_FORMATS = {'jpeg', 'png'}
 
@@ -629,18 +894,30 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
         # touches the collection or the in-memory Note (SPEC 15)
         if dry_run:
             updated.append(nid)
-            if diff and fields is not None:
+            if diff:
                 # one preview entry PER CHANGED FIELD, unchanged fields
                 # omitted (byte comparison against the loaded note — the
-                # same read the no-op check above already performs);
-                # tags-only changes contribute no preview entries
-                for name, value in fields.items():
-                    if ankiNote[name] == value:
-                        continue
+                # same read the no-op check above already performs)
+                if fields is not None:
+                    for name, value in fields.items():
+                        if ankiNote[name] == value:
+                            continue
+                        diffTotal += 1
+                        if len(preview) < max_preview:
+                            preview.append({'noteId': nid, 'field': name,
+                                            'before': ankiNote[name], 'after': value})
+                # ...plus ONE row for a tag change, under the reserved field
+                # name '__tags__' (SPEC 4.2, revision 12 — round-3 field
+                # feedback: a tags-only entry previously landed in wouldUpdate
+                # with no preview row at all, so a reviewer saw a note slated
+                # for an update with no visible reason). Emitted after the
+                # note's field rows, values space-joined in list order.
+                if tags is not None and list(tags) != ankiNote.tags:
                     diffTotal += 1
                     if len(preview) < max_preview:
-                        preview.append({'noteId': nid, 'field': name,
-                                        'before': ankiNote[name], 'after': value})
+                        preview.append({'noteId': nid, 'field': TAGS_PREVIEW_FIELD,
+                                        'before': ' '.join(ankiNote.tags),
+                                        'after': ' '.join(tags)})
             continue
 
         try:
@@ -1263,6 +1540,15 @@ def create_backup(col, force=True):
 
 RENDER_FORMATS = ('html', 'body', 'text')
 
+# how the notetype stylesheet is delivered (SPEC 12, revision 12 — round-3
+# field feedback: 50 rendered cards measured 314,564 B of which 265,350 B
+# (90%) was the SAME AnKing stylesheet repeated once per card).
+#   'perCard'    per-card 'css' key, today's behavior (default for html/body)
+#   'byNotetype' one top-level cssByNotetype {notetypeName: css}, no per-card css
+#   'omit'       no css anywhere (default for format 'text', where it is
+#                meaningless — the rendered text carries no markup to style)
+RENDER_CSS_MODES = ('perCard', 'byNotetype', 'omit')
+
 # matched open/close pairs only, non-greedy, case-insensitive, dot-matches-
 # newline; an unclosed <script>/<style> block is left in place (format 'body')
 _SCRIPT_BLOCK_RE = re.compile(r'(?si)<script\b.*?</script\s*>')
@@ -1279,15 +1565,24 @@ def _render_format_text(col, html, render_format):
     return html
 
 
-def render_card(col, card_ids, render_format='html'):
+def render_card(col, card_ids, render_format='html', css_mode=None):
     if not isinstance(card_ids, list) or not all(
             isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
         raise PlusError('invalid_param', 'invalid parameter: cardIds: ints required')
     if render_format not in RENDER_FORMATS:
         raise PlusError('invalid_param', 'invalid parameter: format: one of {} required'.format(
             ', '.join(RENDER_FORMATS)))
+    if css_mode is not None and css_mode not in RENDER_CSS_MODES:
+        raise PlusError('invalid_param', 'invalid parameter: cssMode: one of {} required'.format(
+            ', '.join(RENDER_CSS_MODES)))
+    if css_mode is None:
+        # format-dependent default (SPEC 12, revision 12): css is meaningless
+        # for 'text'. An explicit cssMode ALWAYS wins, including cssMode
+        # 'perCard' with format 'text'.
+        css_mode = 'omit' if render_format == 'text' else 'perCard'
 
     cards = []
+    cssByNotetype = {}
     for cid in card_ids:
         try:
             card = col.get_card(cid)
@@ -1296,7 +1591,8 @@ def render_card(col, card_ids, render_format='html'):
             continue
         try:
             out = card.render_output()
-            cards.append({
+            notetype = card.note_type()['name']
+            entry = {
                 'cardId': cid,
                 # rendered template HTML WITHOUT the notetype-CSS <style>
                 # wrapper (css ships separately so clients can wrap — or not —
@@ -1304,14 +1600,27 @@ def render_card(col, card_ids, render_format='html'):
                 # part of that HTML and survive verbatim under format 'html'
                 'question': _render_format_text(col, out.question_text, render_format),
                 'answer': _render_format_text(col, out.answer_text, render_format),
-                'css': out.css,
                 # current_deck_id() = odid or did: home deck for filtered cards
                 'deckName': col.decks.name(card.current_deck_id()),
-                'modelName': card.note_type()['name'],
+                'modelName': notetype,
+                # 'notetype' (revision 12): the key cssByNotetype is keyed by,
+                # present in EVERY cssMode. 'modelName' is the same string,
+                # kept for compat with upstream AnkiConnect's naming.
+                'notetype': notetype,
                 'ord': card.ord,
-            })
+            }
+            if css_mode == 'perCard':
+                entry['css'] = out.css
+            elif css_mode == 'byNotetype':
+                # first render of a notetype wins; the stylesheet is a
+                # property of the notetype, identical for all its cards
+                cssByNotetype.setdefault(notetype, out.css)
+            cards.append(entry)
         except Exception as e:
             cards.append({'cardId': cid, 'error': 'could not render card {}: {}'.format(cid, e)})
+    if css_mode == 'byNotetype':
+        # present only in this mode, so the other two shapes are byte-unchanged
+        return {'cards': cards, 'cssByNotetype': cssByNotetype}
     return {'cards': cards}
 
 
@@ -1319,8 +1628,25 @@ def render_card(col, card_ids, render_format='html'):
 # Slim note reads (SPEC 13)
 #
 
+def _existing_note_ids(col, ids):
+    """Set of the given note ids that still exist. One chunked read-only
+    existence select (SPEC 13, revision 12 — the noteIds path's honest
+    'total'/'missing' needs to know about ids OUTSIDE the current page, which
+    a per-page col.get_note loop cannot see). Read-only select of note ids:
+    the same 'note-id/card-id location select' family the HARD RULES allow."""
+    found = set()
+    unique = list(dict.fromkeys(ids))
+    for start in range(0, len(unique), SQL_IN_CHUNK):
+        chunk = unique[start:start + SQL_IN_CHUNK]
+        found.update(col.db.list(
+            'select id from notes where id in ({})'.format(','.join('?' * len(chunk))),
+            *chunk))
+    return found
+
+
 def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
-               max_field_length=400, offset=0, limit=200):
+               max_field_length=400, offset=0, limit=200,
+               omit_empty_fields=False):
     if (query is None) == (note_ids is None):
         raise PlusError('invalid_param', 'invalid parameter: query: exactly one of query or noteIds required')
     if query is not None and not isinstance(query, str):
@@ -1332,6 +1658,8 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
         _validate_tag_list(fields, 'fields')
     if not isinstance(strip_html, bool):
         raise PlusError('invalid_param', 'invalid parameter: stripHtml: boolean required')
+    if not isinstance(omit_empty_fields, bool):
+        raise PlusError('invalid_param', 'invalid parameter: omitEmptyFields: boolean required')
     if isinstance(max_field_length, bool) or not isinstance(max_field_length, int) or max_field_length < 0:
         raise PlusError('invalid_param', 'invalid parameter: maxFieldLength: int >= 0 required')
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -1347,10 +1675,25 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
             ids = sorted(col.find_notes(query, order=False))
         except SearchError as e:
             raise PlusError('invalid_param', 'invalid parameter: query: {}'.format(e))
+        # every id came out of the search: all of them exist
+        total = len(ids)
+        missing = []
+        exists = None
     else:
         ids = list(note_ids)  # caller order preserved, duplicates included
+        # SPEC 13, revision 12 (round-3 field feedback, DELIBERATE BREAKING
+        # CHANGE): 'total' used to be len(requested ids) — it counted ids that
+        # no longer exist, so [real, fake, real, fake] reported total 4 with 2
+        # notes and 3 stale ids reported total 3 with an empty page plus a
+        # nextOffset pointing at another empty page. total is now the number
+        # of requested entries that were FOUND, the stale ones are named in
+        # 'missing', and the invariant len(noteIds) == total + len(missing)
+        # holds on every page (duplicates counted on both sides).
+        found = _existing_note_ids(col, ids)
+        exists = [nid in found for nid in ids]
+        total = sum(exists)
+        missing = [nid for nid, ok in zip(ids, exists) if not ok]
 
-    total = len(ids)
     wanted = set(fields) if fields is not None else None
 
     notes = []
@@ -1358,8 +1701,8 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
         try:
             ankiNote = col.get_note(nid)
         except NotFoundError:
-            # noteIds path only: stale id, omitted from the page (SPEC 13);
-            # total still counts it, so pages may run short of limit
+            # noteIds path only: stale id, omitted from the page (SPEC 13)
+            # and named in 'missing'; pages may run short of limit
             continue
         model = ankiNote.note_type()
         outFields = {}
@@ -1379,6 +1722,13 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
                 # explicit truncation signal: the trailing '…' alone is
                 # ambiguous (a field may genuinely end in one)
                 truncatedFields.append(name)
+            if omit_empty_fields and text == '':
+                # SPEC 13, revision 12: drop the key entirely. The test is on
+                # the value that WOULD be emitted, so under stripHtml=true a
+                # field holding only markup ('<br>') also drops out. Measured
+                # on a 19-field AnKing-derived notetype with 4 fields
+                # populated: 49% smaller AND faster (0.68 ms -> 0.29 ms).
+                continue
             outFields[name] = text
         notes.append({
             'noteId': ankiNote.id,
@@ -1388,8 +1738,17 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
             'truncatedFields': truncatedFields,
         })
 
-    nextOffset = offset + limit if offset + limit < total else None
-    return {'total': total, 'notes': notes, 'nextOffset': nextOffset}
+    # pagination window is over the ID LIST (which is what offset/limit slice),
+    # not over 'total' — under noteIds the two are no longer the same number.
+    # nextOffset is suppressed when no FOUND id remains past the window, so a
+    # pager is never sent after a page that can only come back empty (SPEC 13,
+    # revision 12). Query path: every id exists, so this is the old rule.
+    window = offset + limit
+    hasMore = window < len(ids) if exists is None else any(
+        exists[i] for i in range(window, len(ids)))
+    nextOffset = window if hasMore else None
+    return {'total': total, 'notes': notes, 'missing': missing,
+            'nextOffset': nextOffset}
 
 
 #
@@ -1467,16 +1826,44 @@ def media_exists(col, filenames):
     simply exists:false (it can never name a stored media file); only a
     non-string entry is a hard parameter error. Rationale (round-2 field
     feedback): a caller pulled 4.22 MB via getMediaFilesNames to answer a
-    13-name membership test."""
+    13-name membership test.
+
+    actualName (revision 12, round-3 field feedback): APFS/NTFS answer
+    os.path.isfile case-insensitively, so 'BSOM_L2_S3A.PNG' reports exists
+    for a stored 'bsom_l2_s3a.png' — and that name 404s on AnkiWeb/Linux/iOS.
+    When the requested string is not byte-identical to the stored one,
+    actualName carries the TRUE on-disk spelling; null when it matches
+    exactly (or when the file does not exist). The media DB is deliberately
+    NOT the oracle here: files dropped into the media folder outside Anki are
+    absent from media.db2 and are not added by col.media.check()
+    (probe-verified), so a DB lookup would report exists:false for real
+    files. The directory listing is read at most once per call (~2 ms per
+    5,000 files, measured) and only when something actually exists."""
     if not isinstance(filenames, list) or not all(isinstance(f, str) for f in filenames):
         raise PlusError('invalid_param', 'invalid parameter: filenames: list of strings required')
 
     mediaDir = col.media.dir()
+    listing = None   # raw os.listdir names, read lazily
+    folded = None    # NFC-casefolded name -> sorted list of raw names
     results = []
     for filename in filenames:
         exists = bool(filename) and os.path.basename(filename) == filename \
             and os.path.isfile(os.path.join(mediaDir, filename))
-        results.append({'filename': filename, 'exists': exists})
+        actualName = None
+        if exists:
+            if listing is None:
+                listing = set(os.listdir(mediaDir))
+                folded = {}
+                for entry in sorted(listing):
+                    folded.setdefault(_nfc(entry).casefold(), []).append(entry)
+            if filename not in listing:
+                # case and/or unicode-normalization drift; ties (a
+                # case-sensitive volume holding several matches) resolve to
+                # the first in sorted order — deterministic, documented
+                candidates = folded.get(_nfc(filename).casefold())
+                actualName = candidates[0] if candidates else None
+        results.append({'filename': filename, 'exists': exists,
+                        'actualName': actualName})
     return {'results': results}
 
 
@@ -1593,7 +1980,7 @@ def bulk_suspend(col, card_ids, suspend=True, undo_label=None):
         # queue changes, so all of them count as pending (SPEC Deviation #8)
         pending = [cid for cid, queue in existing if queue < 0]
     if not pending:
-        return {'changed': 0, 'undoEntry': None}
+        return {'changed': 0, 'changedIds': [], 'undoEntry': None}
 
     target = col.add_custom_undo_entry(undo_name)
     try:
@@ -1613,8 +2000,14 @@ def bulk_suspend(col, card_ids, suspend=True, undo_label=None):
     if not changed:
         # data no-op: pop the empty custom entry so the Undo menu stays clean
         _revert_batch(col, undo_name)
-        return {'changed': 0, 'undoEntry': None}
-    return {'changed': changed, 'undoEntry': undo_name}
+        return {'changed': 0, 'changedIds': [], 'undoEntry': None}
+    # changedIds (revision 12, round-3 field feedback: the bulk family reported
+    # ids inconsistently — bulkAddTags/bulkUpdateNoteFields returned id lists,
+    # the scheduler pair only counts) = the precheck set actually passed to the
+    # op, which IS the set the op changes (Deviation #8). In the suspend
+    # direction 'changed' stays backend-authoritative, so a (never observed)
+    # backend/precheck disagreement would show as changed != len(changedIds).
+    return {'changed': changed, 'changedIds': pending, 'undoEntry': undo_name}
 
 
 def bulk_set_due_date(col, card_ids, days, undo_label=None):
@@ -1631,8 +2024,13 @@ def bulk_set_due_date(col, card_ids, days, undo_label=None):
         raise PlusError('invalid_param', 'invalid parameter: days: {}'.format(days))
     existing = _existing_cards(col, card_ids)
     if not existing:
-        return {'changed': 0, 'undoEntry': None}
+        return {'changed': 0, 'changedIds': [], 'unsuspended': [], 'unburied': [],
+                'undoEntry': None}
     ids = [cid for cid, _queue in existing]
+    # queues are already in hand from the precheck: remember the cards that
+    # were suspended (-1) or buried (-2 sibling, -3 manual) so the RESURRECTION
+    # side effect can be reported (revision 12, round-3 field feedback)
+    preNegative = [(cid, queue) for cid, queue in existing if queue < 0]
 
     target = col.add_custom_undo_entry(undo_name)
     try:
@@ -1646,9 +2044,26 @@ def bulk_set_due_date(col, card_ids, days, undo_label=None):
         _revert_batch(col, undo_name)
         raise PlusError('batch_reverted', 'bulkSetDueDate failed (batch reverted): {}'.format(e))
 
+    # DISCLOSURE (SPEC 16.2, revision 12 — round-3 field feedback): anki's own
+    # set_due_date turns every targeted card into a review card, which SILENTLY
+    # RESURRECTS suspended and buried ones (measured: 5 cards queue -1 -> queue
+    # 2 with no signal of any kind). The revived ids are reported here; the
+    # post-state is re-read ONLY for cards whose queue was negative before the
+    # op, so the common case costs nothing.
+    unsuspended = []
+    unburied = []
+    for cid, queue in preNegative:
+        try:
+            after = col.get_card(cid).queue
+        except NotFoundError:  # pragma: no cover - handlers are serialized
+            continue
+        if after >= 0:
+            (unsuspended if queue == QUEUE_SUSPENDED else unburied).append(cid)
+
     # set_due_date returns plain OpChanges (no count); it applies to every
     # existing card regardless of state (SPEC Deviation #8)
-    return {'changed': len(ids), 'undoEntry': undo_name}
+    return {'changed': len(ids), 'changedIds': ids, 'unsuspended': unsuspended,
+            'unburied': unburied, 'undoEntry': undo_name}
 
 
 #
@@ -1764,11 +2179,15 @@ def _cloze_numbers(col, field_values):
         anki.notes_pb2.Note(fields=list(field_values))))
 
 
-def check_deck_integrity(col, deck_name, include_orphan_media=False):
+def check_deck_integrity(col, deck_name, include_orphan_media=False,
+                         orphan_media_limit=ORPHAN_MEDIA_DEFAULT_LIMIT):
     if not isinstance(deck_name, str) or not deck_name:
         raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
     if not isinstance(include_orphan_media, bool):
         raise PlusError('invalid_param', 'invalid parameter: includeOrphanMedia: boolean required')
+    if isinstance(orphan_media_limit, bool) or not isinstance(orphan_media_limit, int) \
+            or orphan_media_limit < 0:
+        raise PlusError('invalid_param', 'invalid parameter: orphanMediaLimit: int >= 0 required')
     did = col.decks.id_for_name(deck_name)
     if did is None:
         raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
@@ -1858,6 +2277,8 @@ def check_deck_integrity(col, deck_name, include_orphan_media=False):
                                           'actualOrds': actualOrds})
 
     orphanMedia = None
+    orphanMediaCount = None
+    orphanMediaTruncated = False
     if include_orphan_media:
         # COLLECTION-WIDE by nature: a file unreferenced by this deck may be
         # used by any other note or notetype template, so orphan status can
@@ -1887,12 +2308,26 @@ def check_deck_integrity(col, deck_name, include_orphan_media=False):
         orphanMedia = sorted(
             fname for fname in mediaFiles - referenced
             if not fname.startswith('_') and not fname.startswith('.'))
+        # revision 12 (round-3 field feedback): the uncapped array measured
+        # 1,659,713 B / 37,243 entries on a real collection and, sitting beside
+        # four DECK-scoped arrays, read as "this deck has 37,243 orphans". The
+        # count is now always reported, the array is capped, and the key names
+        # its scope. orphanMediaLimit=0 = count only.
+        orphanMediaCount = len(orphanMedia)
+        orphanMediaTruncated = orphanMediaCount > orphan_media_limit
+        if orphanMediaTruncated:
+            orphanMedia = orphanMedia[:orphan_media_limit]
 
     return {'missingMedia': missingMedia,
             'unbalancedCloze': unbalancedCloze,
             'clozeCardMismatch': clozeCardMismatch,
             'clozeNotesWithoutCloze': clozeNotesWithoutCloze,
-            'orphanMedia': orphanMedia,
+            # NOT deck-scoped, unlike every list above it — the name says so
+            # (renamed from 'orphanMedia', revision 12; DELIBERATE BREAKING
+            # CHANGE, the old key was one day old)
+            'orphanMediaCollectionWide': orphanMedia,
+            'orphanMediaCount': orphanMediaCount,
+            'orphanMediaTruncated': orphanMediaTruncated,
             'notesChecked': len(nids)}
 
 
@@ -2018,6 +2453,34 @@ def bulk_replace_in_fields(col, query=None, note_ids=None, field=None,
     return {'changed': changed, 'matchesTotal': matchesTotal,
             'unchanged': unchanged, 'skipped': skipped,
             'undoEntry': undo_name if changed else None}
+
+
+#
+# Undo stack read (SPEC 26)
+#
+
+def undo_status(col):
+    """Read anki's undo stack (SPEC 26). Pure read: col.undo_status() is a
+    backend get_undo_status RPC, no write, no stack change.
+
+    Rationale (round-3 field feedback): every write action REPORTS the undo
+    entry name it set, but a caller had no way to OBSERVE the stack, so the
+    undoEntry contract could only be taken on trust (the reporter resorted to
+    driving Anki's menu bar with AppleScript and was blocked by assistive-
+    access permissions).
+
+    UndoStatus is the collection_pb2 proto with str 'undo'/'redo' and uint32
+    'last_step'. Empty strings mean "nothing to undo/redo" (never None, never
+    a raise, probe-verified on a fresh collection) and are normalized to null.
+    lastStep is anki's monotonic step counter: it advances on every undoable
+    operation, so a caller can prove a call created a new entry (or, for the
+    documented always-writes case in §16.2, that a byte-identical repeat
+    still did).
+    """
+    status = col.undo_status()
+    return {'undo': status.undo or None,
+            'redo': status.redo or None,
+            'lastStep': status.last_step}
 
 
 #

@@ -132,6 +132,10 @@ def test1_error_code_vocabulary():
         "rate_limited": True, "permission_denied": False,
         "validation_error": False, "incompatible_ankihub_addon": False,
         "source_required": False, "rationale_invalid": False, "internal": False,
+        # revision 13 (round-3 ASK 11a): the dispatcher's unknown-action error
+        # is now the one non-action error carrying a code, so this closed-set
+        # lock grows by exactly one member.
+        "unknown_action": False,
     }
     assert core.PLUS_ERROR_CODES == expected, core.PLUS_ERROR_CODES
 
@@ -262,10 +266,14 @@ def test4_diff_preview():
     n0, n1, n2 = added
     n_snap, u_snap = notes_snap(), undo_snap()
 
+    # revision 12 (round-3 field feedback, INVERTED assertion): a tags-only
+    # entry used to land in wouldUpdate with NO preview row — 4 wouldUpdate
+    # entries, 3 rows, and a reviewer with no way to see why. Tag changes now
+    # emit one row under the reserved field name '__tags__'.
     r = core.bulk_update_note_fields(col, [
         {"id": n0, "fields": {"Front": "D0", "Back": "b0"}},   # Back unchanged -> omitted
         {"id": n1, "fields": {"Front": "d1"}},                 # full no-op -> unchanged
-        {"id": n2, "tags": ["cef"]},                           # tags-only -> no preview entry
+        {"id": n2, "tags": ["cef"]},                           # tags-only -> ONE __tags__ row
         {"id": 4242424242, "fields": {"Front": "x"}},          # skipped
     ], dry_run=True, diff=True)
     assert r["wouldUpdate"] == [n0, n2], r
@@ -273,8 +281,24 @@ def test4_diff_preview():
     assert r["skipped"][0]["reason"] == "note was not found: 4242424242", r
     assert r["preview"] == [
         {"noteId": n0, "field": "Front", "before": "d0", "after": "D0"},
+        {"noteId": n2, "field": "__tags__", "before": "", "after": "cef"},
     ], r
     assert r["previewTruncated"] is False and r["undoEntry"] is None, r
+    # every wouldUpdate note is now represented in the preview
+    assert {row["noteId"] for row in r["preview"]} == set(r["wouldUpdate"]), r
+
+    # a note changing BOTH fields and tags gets both rows, fields first, and
+    # an unchanged tag list contributes nothing (the dry run above wrote
+    # nothing, so n2's stored tags are still empty)
+    r = core.bulk_update_note_fields(col, [
+        {"id": n2, "fields": {"Front": "D2"}, "tags": ["cef", "extra"]},
+        {"id": n0, "fields": {"Front": "D0b"}, "tags": []},   # tags already []
+    ], dry_run=True, diff=True)
+    assert r["preview"] == [
+        {"noteId": n2, "field": "Front", "before": "d2", "after": "D2"},
+        {"noteId": n2, "field": "__tags__", "before": "", "after": "cef extra"},
+        {"noteId": n0, "field": "Front", "before": "d0", "after": "D0b"},
+    ], r
 
     # cap: one entry PER CHANGED FIELD, previewTruncated when entries remain
     r = core.bulk_update_note_fields(col, [
@@ -283,6 +307,13 @@ def test4_diff_preview():
     ], dry_run=True, diff=True, max_preview=2)
     assert len(r["preview"]) == 2 and r["previewTruncated"] is True, r
     assert r["preview"][0]["noteId"] == n0 and r["preview"][1]["noteId"] == n0, r
+    # tag rows count toward maxPreview like any other row
+    r = core.bulk_update_note_fields(col, [
+        {"id": n0, "fields": {"Front": "X0"}, "tags": ["capped"]},
+        {"id": n1, "fields": {"Front": "X1"}},
+    ], dry_run=True, diff=True, max_preview=2)
+    assert [row["field"] for row in r["preview"]] == ["Front", "__tags__"], r
+    assert r["previewTruncated"] is True, r
     # maxPreview=0: empty preview, truncation signalled
     r = core.bulk_update_note_fields(col, [{"id": n0, "fields": {"Front": "X"}}],
                                      dry_run=True, diff=True, max_preview=0)
@@ -427,12 +458,318 @@ def test6_wrapper_layer():
     assert code_of(lambda: DeepTypeErrAC().mediaExists(filenames=["x.png"])) == "internal"
 
 
+# ============================================================================
+# ROUND-3 field feedback: the error surface (ASK 4, ASK 11, ASK 1).
+# ============================================================================
+
+def _load_plus_pkg(pkg_name):
+    """Load connect_plus/{core,plus,web}.py under a private package name."""
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [os.path.join(REPO, "connect_plus")]
+        pkg.__package__ = pkg_name
+        sys.modules[pkg_name] = pkg
+    return importlib.import_module(pkg_name + ".plus")
+
+
+def _load_dispatcher(pkg_name):
+    """Load the REAL AnkiConnect dispatcher headless.
+
+    connect_plus/__init__.py ends in an entry block that binds the web-server
+    socket and starts a QTimer; that block is guarded by `__name__ != "plugin"`
+    and is cut from the source here, so the module body (which is what the
+    dispatcher lives in) executes with no side effects at all. util.setting is
+    pre-patched to the shipped defaults because aqt.mw is None headless.
+    """
+    path = os.path.join(REPO, "connect_plus", "__init__.py")
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [os.path.join(REPO, "connect_plus")]
+    pkg.__package__ = pkg_name
+    sys.modules[pkg_name] = pkg
+    util_mod = importlib.import_module(pkg_name + ".util")
+    util_mod.setting = lambda key: util_mod.DEFAULT_CONFIG[key]
+    with open(path, encoding="utf-8") as handle:
+        src = handle.read()
+    marker = 'if __name__ != "plugin":'
+    assert marker in src, "entry-block guard moved; this loader must be updated"
+    src = src[:src.index(marker)]
+    pkg.__dict__["__file__"] = path
+    exec(compile(src, path, "exec"), pkg.__dict__)
+    inst = pkg.__dict__["AnkiConnect"].__new__(pkg.__dict__["AnkiConnect"])
+    inst.log = None
+    return pkg, inst
+
+
+# ------------------------------------------------- ASK 4: structured envelope
+def test8_structured_error_envelope():
+    _load_plus_pkg("ancp_r3_err_pkg")
+    web = importlib.import_module("ancp_r3_err_pkg.web")
+    pkg_core = sys.modules["ancp_r3_err_pkg.core"]
+
+    # a Plus error puts code AND retryable on the wire; the string is unchanged
+    err = pkg_core.PlusError("collection_unavailable", "collection is not available")
+    reply = web.format_exception_reply(6, err)
+    assert reply == {"result": None,
+                     "error": "[collection_unavailable] collection is not available",
+                     "errorCode": "collection_unavailable",
+                     "retryable": True}, reply
+
+    # a non-retryable one
+    reply = web.format_exception_reply(6, pkg_core.PlusError("not_found", "note was not found: 1"))
+    assert reply["errorCode"] == "not_found" and reply["retryable"] is False, reply
+
+    # anything that is not a PlusError (every upstream action error) keeps its
+    # verbatim string and gets explicit nulls — the keys are ALWAYS present so
+    # a client can branch on a stable shape
+    reply = web.format_exception_reply(6, Exception("guru meditation"))
+    assert reply == {"result": None, "error": "guru meditation",
+                     "errorCode": None, "retryable": None}, reply
+    # ... at every api version, including the v4 legacy path
+    assert set(web.format_exception_reply(4, Exception("x"))) == \
+        {"result", "error", "errorCode", "retryable"}
+
+    # success replies are untouched (no new keys, v4 still returns raw)
+    assert web.format_success_reply(6, {"a": 1}) == {"result": {"a": 1}, "error": None}
+    assert web.format_success_reply(4, {"a": 1}) == {"a": 1}
+
+    # retryable on the wire must agree with the vocabulary for every code
+    for code, retryable in pkg_core.PLUS_ERROR_CODES.items():
+        got = web.format_exception_reply(6, pkg_core.PlusError(code, "m"))
+        assert got["errorCode"] == code and got["retryable"] is retryable, (code, got)
+
+
+# ------------------------------- ASK 11a + ASK 4: dispatcher & multi nesting
+def test9_dispatcher_boundary():
+    pkg, inst = _load_dispatcher("ancp_r3_disp_pkg")
+
+    # (a) an unknown action is now the ONE dispatcher error carrying a code
+    reply = inst.handler({"action": "noSuchAction", "version": 6})
+    assert reply == {"result": None, "error": "[unknown_action] unsupported action",
+                     "errorCode": "unknown_action", "retryable": False}, reply
+    # the documented parse rule works on it (it did not before revision 13)
+    assert reply["error"].split("] ", 1)[0].lstrip("[") == "unknown_action"
+
+    # (b) the prefixing BOUNDARY: upstream errors stay verbatim + null/null.
+    # the api-key refusal is raised by the dispatcher itself but is not an
+    # unknown action, so it is deliberately NOT prefixed.
+    reply = inst.handler({"action": "deckNames", "version": 6, "key": "wrong"})
+    assert reply["error"] == "valid api key must be provided", reply
+    assert reply["errorCode"] is None and reply["retryable"] is None, reply
+    # an upstream ACTION that raises: unprefixed, no code (aqt.mw is None here)
+    reply = inst.handler({"action": "deckNames", "version": 6})
+    assert reply["error"] and not reply["error"].startswith("["), reply
+    assert reply["errorCode"] is None and reply["retryable"] is None, reply
+
+    # (c) multi: each sub-response is a FULL envelope with the same four keys
+    reply = inst.handler({"action": "multi", "version": 6, "params": {"actions": [
+        {"action": "noSuchAction"},
+        {"action": "renderCard"},
+        {"action": "deckNames"},
+    ]}})
+    assert reply["error"] is None, reply          # the outer multi itself succeeded
+    subs = reply["result"]
+    assert len(subs) == 3, subs
+    for sub in subs:
+        assert set(sub) == {"result", "error", "errorCode", "retryable"}, sub
+    assert subs[0]["errorCode"] == "unknown_action" and subs[0]["retryable"] is False
+    assert subs[1]["errorCode"] == "invalid_param" and subs[1]["retryable"] is False
+    assert subs[2]["errorCode"] is None and subs[2]["retryable"] is None
+
+    # (d) ASK 11b end-to-end: no internal class name reaches the wire
+    assert "PlusMixin" not in subs[1]["error"], subs[1]
+    assert subs[1]["error"] == \
+        "[invalid_param] renderCard() missing required argument: cardIds", subs[1]
+
+
+# ---------------------------------------- ASK 11b: arity messages, house style
+def test10_arity_message_house_format():
+    plus = _load_plus_pkg("ancp_r3_err_pkg")
+    norm = plus._normalize_arity_message
+
+    assert norm("PlusMixin.renderCard() missing 1 required positional argument: 'cardIds'") \
+        == "renderCard() missing required argument: cardIds"
+    assert norm("PlusMixin.bulkReplaceInFields() missing 2 required positional "
+                "arguments: 'find' and 'replace'") \
+        == "bulkReplaceInFields() missing required arguments: find, replace"
+    assert norm("PlusMixin.f() missing 3 required positional arguments: 'a', 'b' and 'c'") \
+        == "f() missing required arguments: a, b, c"
+    assert norm("PlusMixin.f() missing 1 required keyword-only argument: 'a'") \
+        == "f() missing required argument: a"
+    assert norm("PlusMixin.mediaExists() got an unexpected keyword argument 'bogus'") \
+        == "mediaExists() unexpected keyword argument: bogus"
+    # unrecognized forms keep their text but never keep the class name
+    assert norm("PlusMixin.mediaExists() got multiple values for argument 'self'") \
+        == "mediaExists() got multiple values for argument 'self'"
+    # a message with no qualifier at all is returned untouched
+    assert norm("invalid parameter: field: string required") == \
+        "invalid parameter: field: string required"
+
+    # and the wrapper actually applies it, still coded invalid_param
+    class FakeAC(plus.PlusMixin):
+        def collection(self):
+            raise Exception("collection is not available")
+
+    try:
+        FakeAC().renderCard()
+        raise AssertionError("expected an exception")
+    except Exception as e:
+        assert str(e) == "[invalid_param] renderCard() missing required argument: cardIds", str(e)
+
+
+# --------------------------------- ASK 4: sync_in_progress is REACHABLE now
+def test11_sync_guard_reachable():
+    plus = _load_plus_pkg("ancp_r3_err_pkg")
+    pkg_core = sys.modules["ancp_r3_err_pkg.core"]
+    util_mod = sys.modules["ancp_r3_err_pkg.util"]
+
+    # the four actions that must NEVER be refused: syncStatus/syncNow are how a
+    # caller observes and drives the sync, plusInfo/ankihubStatus touch no
+    # collection. Everything else is guarded.
+    EXEMPT = {"syncStatus", "syncNow", "plusInfo", "ankihubStatus"}
+
+    class FakeAC(plus.PlusMixin):
+        def collection(self):
+            raise AssertionError("guarded action reached the collection during a sync")
+
+    inst = FakeAC()
+    # the test hook the locked design calls for: set the job state directly on a
+    # constructed mixin — no real sync, no network, no Qt.
+    inst._plusSyncJobState = {"state": "syncing", "startedMs": 1,
+                              "result": None, "error": None}
+
+    def code_of(fn):
+        try:
+            fn()
+        except Exception as err:
+            return str(err).split("] ", 1)[0].lstrip("[")
+        return None
+
+    # the guard runs BEFORE argument binding, so a bare call reaches it for
+    # every guarded action regardless of that action's required params
+    for name in pkg_core.PLUS_ACTIONS:
+        if name in EXEMPT:
+            continue
+        assert code_of(getattr(inst, name)) == "sync_in_progress", name
+
+    # the message is stable and points at the recovery move
+    try:
+        inst.undoStatus()
+        raise AssertionError("expected an exception")
+    except Exception as e:
+        assert str(e) == "[sync_in_progress] " + pkg_core.SYNC_IN_PROGRESS_MESSAGE, str(e)
+        assert "syncStatus" in str(e)
+    # and it is flagged retryable, so a client knows to poll rather than fail
+    assert pkg_core.PLUS_ERROR_CODES["sync_in_progress"] is True
+
+    # the exempt four are NOT refused (they fail for unrelated headless
+    # reasons — window()/mw is absent — which is exactly the point)
+    for name in ("syncStatus", "syncNow", "ankihubStatus"):
+        assert code_of(getattr(inst, name)) != "sync_in_progress", name
+    orig = util_mod.setting
+    util_mod.setting = lambda key: util_mod.DEFAULT_CONFIG[key]
+    try:
+        assert inst.plusInfo()["name"] == "AnkiConnect Plus"   # works mid-sync
+    finally:
+        util_mod.setting = orig
+
+    # 'media_syncing' is deliberately NOT guarded: sync_collection has returned
+    # and the collection mutex is free (stock Anki lets you review here too)
+    inst._plusSyncJobState["state"] = "media_syncing"
+    assert code_of(lambda: inst.undoStatus()) != "sync_in_progress"
+    # ... and once the job is idle/done the guard is gone entirely
+    for state in ("idle", "done", "error"):
+        inst._plusSyncJobState["state"] = state
+        assert code_of(lambda: inst.undoStatus()) != "sync_in_progress", state
+    # an instance that never synced has no job slot at all
+    assert code_of(lambda: FakeAC().undoStatus()) != "sync_in_progress"
+
+
+# ------------------------- ASK 1: plusInfo returns + errorCodes + boundary note
+def test12_plusinfo_returns_and_error_codes():
+    plus = _load_plus_pkg("ancp_r3_err_pkg")
+    pkg_core = sys.modules["ancp_r3_err_pkg.core"]
+    util_mod = sys.modules["ancp_r3_err_pkg.util"]
+
+    orig = util_mod.setting
+    util_mod.setting = lambda key: util_mod.DEFAULT_CONFIG[key]
+    try:
+        info = plus.PlusMixin().plusInfo()
+    finally:
+        util_mod.setting = orig
+
+    # (i) 'returns' for all 27 actions, no strays, none empty
+    assert set(pkg_core.PLUS_ACTION_RETURNS) == set(pkg_core.PLUS_ACTIONS), \
+        sorted(set(pkg_core.PLUS_ACTION_RETURNS) ^ set(pkg_core.PLUS_ACTIONS))
+    assert len(pkg_core.PLUS_ACTIONS) == 27, len(pkg_core.PLUS_ACTIONS)
+    for name in pkg_core.PLUS_ACTIONS:
+        entry = info["actionDocs"][name]
+        assert set(entry) == {"summary", "params", "returns"}, (name, sorted(entry))
+        assert entry["returns"].strip(), name
+        assert entry["returns"].startswith("{"), (name, entry["returns"][:40])
+
+    # the two shapes the field report measured callers guessing WRONG
+    assert "rows:" in info["actionDocs"]["queryRevlog"]["returns"]
+    assert "'entries'" in info["actionDocs"]["queryRevlog"]["returns"]  # names the trap
+    assert info["actionDocs"]["renderCard"]["returns"].startswith("{cards:")
+    # and the round-3 shape changes are all described
+    assert "missing" in info["actionDocs"]["notesSlim"]["returns"]
+    assert "unsuspended" in info["actionDocs"]["bulkSetDueDate"]["returns"]
+    assert "orphanMediaCollectionWide" in info["actionDocs"]["checkDeckIntegrity"]["returns"]
+    assert "serverChecked" in info["actionDocs"]["syncStatus"]["returns"]
+    assert "actualName" in info["actionDocs"]["mediaExists"]["returns"]
+
+    # (ii) errorCodes covers the FULL vocabulary incl. unknown_action, with
+    # retryable read from the single source of truth
+    codes = info["errorCodes"]
+    assert set(codes) == set(pkg_core.PLUS_ERROR_CODES), \
+        sorted(set(codes) ^ set(pkg_core.PLUS_ERROR_CODES))
+    assert "unknown_action" in codes
+    for code, entry in codes.items():
+        assert set(entry) == {"retryable", "reachable", "meaning"}, (code, sorted(entry))
+        assert entry["retryable"] is pkg_core.PLUS_ERROR_CODES[code], code
+        assert isinstance(entry["reachable"], bool), code
+        assert isinstance(entry["meaning"], str) and entry["meaning"].strip(), code
+
+    # the reserved-vs-reachable split is the thing ASK 4 asked to be honest
+    # about: a caller must not build retry logic on an unreachable code
+    reserved = {c for c, e in codes.items() if not e["reachable"]}
+    assert reserved == {"duplicate", "io_error", "offline", "full_sync_required"}, \
+        sorted(reserved)
+    for code in reserved:
+        assert "RESERVED" in codes[code]["meaning"], code
+    # sync_in_progress moved from reserved to reachable in revision 13
+    assert codes["sync_in_progress"]["reachable"] is True
+    assert codes["sync_in_progress"]["retryable"] is True
+    assert "syncStatus" in codes["sync_in_progress"]["meaning"]
+    # every retryable code a client can actually hit
+    retryable_reachable = sorted(c for c, e in codes.items()
+                                 if e["retryable"] and e["reachable"])
+    assert retryable_reachable == ["collection_unavailable", "network_error",
+                                   "rate_limited", "sync_in_progress"], retryable_reachable
+
+    # (iii) the prefixing-boundary note, and the two new recipes
+    note = info["errorPrefixNote"]
+    assert note == pkg_core.PLUS_ERROR_PREFIX_NOTE
+    for token in ("unknown-action", "UPSTREAM", "errorCode", "null"):
+        assert token in note, token
+    names = [r["name"] for r in info["recipes"]]
+    assert "lean deck sweep" in names and "reading errors" in names, names
+    reading = next(r for r in info["recipes"] if r["name"] == "reading errors")
+    for token in ("errorCode", "retryable", "multi", "plusInfo.errorCodes"):
+        assert token in reading["description"], token
+
+
 run("test1_error_code_vocabulary", test1_error_code_vocabulary)
 run("test2_raise_site_codes", test2_raise_site_codes)
 run("test3_per_item_errors_not_prefixed", test3_per_item_errors_not_prefixed)
 run("test4_diff_preview", test4_diff_preview)
 run("test5_discoverability_lock_core", test5_discoverability_lock_core)
 run("test6_wrapper_layer", test6_wrapper_layer)
+run("test8_structured_error_envelope", test8_structured_error_envelope)
+run("test9_dispatcher_boundary", test9_dispatcher_boundary)
+run("test10_arity_message_house_format", test10_arity_message_house_format)
+run("test11_sync_guard_reachable", test11_sync_guard_reachable)
+run("test12_plusinfo_returns_and_error_codes", test12_plusinfo_returns_and_error_codes)
 
 
 def test7_no_network():
