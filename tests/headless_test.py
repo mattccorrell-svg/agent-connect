@@ -10,13 +10,16 @@ import os
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import traceback
 import zlib
 
-SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-           "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_test_r1")
-CORE_PATH = "/Users/mattyc/Downloads/anki-connect-plus/connect_plus/core.py"
+SCRATCH = (os.environ.get("ANCP_TEST_SCRATCH")
+           or tempfile.mkdtemp(prefix="ancp_test_r1_"))
+CORE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "connect_plus", "core.py")
 
 # safety guards
 assert not SCRATCH.startswith(os.path.expanduser("~/Library")), "scratch dir must not be under ~/Library"

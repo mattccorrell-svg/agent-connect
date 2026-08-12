@@ -32,8 +32,10 @@ import re
 
 import anki.collection
 import anki.notes
+import anki.sync
 import anki.utils
-from anki.errors import InvalidInput, NotFoundError, SearchError
+from anki.errors import (Interrupted, InvalidInput, NetworkError,
+                         NotFoundError, SearchError, SyncError, SyncErrorKind)
 
 PLUS_VERSION = "1.0.0"
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
@@ -55,6 +57,16 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "bulkSetDueDate",
                 # export a deck (and its subdecks) to a .apkg file, never overwriting
                 "exportDeckApkg",
+                # read-only sync probe: login, local dirtiness, server-required kind, async job state
+                "syncStatus",
+                # start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus
+                "syncNow",
+                # AnkiHub bridge: install/enable/login/deck status + add-on compatibility probe (read-only, never network)
+                "ankihubStatus",
+                # submit ONE change suggestion for an existing AnkiHub note through the installed AnkiHub add-on
+                "ankihubSuggestNoteUpdate",
+                # submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion
+                "ankihubSuggestNewNote",
                 "plusInfo"]
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
 DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
@@ -95,6 +107,13 @@ SQL_IN_CHUNK = 15000
 NOTES_SLIM_LIMIT_CAP = 2000
 THUMBNAIL_DIM_CAP = 1024
 THUMBNAIL_FORMATS = {'jpeg', 'png'}
+
+# SyncStatusResponse.Required / SyncCollectionResponse.ChangesRequired proto
+# enum -> stable string maps (SPEC 18). Any post-sync required != 0 means a
+# normal sync cannot converge, so plus.py refuses with full_sync_required.
+SYNC_STATUS_REQUIRED = {0: 'no_changes', 1: 'normal_sync', 2: 'full_sync_required'}
+SYNC_COLLECTION_REQUIRED = {0: 'no_changes', 1: 'normal_sync', 2: 'full_sync',
+                            3: 'full_download', 4: 'full_upload'}
 
 
 #
@@ -1250,3 +1269,287 @@ def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
                                     limit=anki.collection.DeckIdLimit(did))
     return {'path': out_path, 'sizeBytes': os.path.getsize(out_path),
             'notesExported': notes}
+
+
+#
+# Sync helpers (SPEC 18) — pure logic; the job state machine lives in plus.py
+#
+
+def bounded_sync_auth(auth, timeout_secs):
+    """Copy of a SyncAuth with io_timeout_secs clamped for status probes.
+
+    pm.sync_auth() carries pm.network_timeout() (default 60 s) — far too long
+    for a poll running on the Qt main thread. The proto endpoint field reads
+    as '' when unset; that maps back to unset (None) here.
+    """
+    if isinstance(timeout_secs, bool) or not isinstance(timeout_secs, int) or timeout_secs < 1:
+        raise Exception('invalid parameter: timeoutSecs: int >= 1 required')
+    return anki.sync.SyncAuth(hkey=auth.hkey,
+                              endpoint=auth.endpoint or None,
+                              io_timeout_secs=timeout_secs)
+
+
+def local_sync_dirty(col):
+    """Read-only local dirtiness check (SPEC 18): no network, no writes.
+
+    ls = last-sync ms epoch, mod = collection mod-time ms (col table).
+    dirty when mod > ls (normal changes) or scm > ls (schema changed —
+    col.schema_changed(), which itself is a read-only select).
+    """
+    ls, mod = col.db.first('select ls, mod from col')
+    # bool(): schema_changed() surfaces SQLite's raw 0/1 int, not a bool
+    return {'lastSyncMs': ls, 'modMs': mod,
+            'dirty': bool(mod > ls or col.schema_changed())}
+
+
+def classify_sync_error(exc):
+    """Map a sync exception to a stable code string (SPEC 18).
+
+    Mirrors aqt.sync.handle_sync_error's dispatch (SP/aqt/sync.py:69-76)
+    without any of its dialogs: SyncError kind AUTH -> 'auth_failed'
+    (plus.py then clears stored auth, as aqt does), NetworkError ->
+    'offline', Interrupted -> 'aborted', anything else -> 'error'.
+    """
+    if isinstance(exc, SyncError):
+        return 'auth_failed' if exc.kind is SyncErrorKind.AUTH else 'error'
+    if isinstance(exc, NetworkError):
+        return 'offline'
+    if isinstance(exc, Interrupted):
+        return 'aborted'
+    return 'error'
+
+
+#
+# AnkiHub suggestion helpers (SPEC 19) — pure logic only. This module never
+# imports the AnkiHub add-on (nor aqt); the bridge that does lives in plus.py.
+# All dialog-replication facts below were verified against the installed
+# add-on version 2026-08-10.1.
+#
+
+ANKIHUB_ADDON_PACKAGE = '1322529746'
+ANKIHUB_TESTED_ADDON_VERSION = '2026-08-10.1'
+
+# settings.RATIONALE_FOR_CHANGE_MAX_LENGTH in the tested add-on. The limit
+# lives only in their dialog widget (rationale_edit trim loop), so the API
+# must enforce it here. The widget deletes chars while
+# len >= RATIONALE_FOR_CHANGE_MAX_LENGTH (suggestion_dialog.py:676-677), so
+# the dialog's effective cap is 1023 — the API byte-matches that (server
+# acceptance of a 1024th character is unverified; no network calls allowed).
+ANKIHUB_RATIONALE_MAX_LENGTH = 1024
+
+# SuggestionType wire values (ankihub_client/models.py:21-30). The enum
+# values are (wire, label) tuples; the wire value is value[0].
+ANKIHUB_CHANGE_TYPES = ('updated_content', 'new_content', 'spelling/grammar',
+                        'content_error', 'new_card_to_add', 'new_tags',
+                        'updated_tags', 'delete', 'other')
+
+# change type -> SourceType options the dialog offers for it
+# (suggestion_dialog.py change_type_to_source_types). The Source widget is
+# shown ONLY for these change types — new/updated content additionally gated
+# on the target being the AnKing deck; delete's source is shown on any deck.
+ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE = {
+    'new_content': ('AMBOSS', 'UWorld', 'Society Guidelines', 'Other'),
+    'updated_content': ('AMBOSS', 'UWorld', 'Society Guidelines', 'Other'),
+    'delete': ('Duplicate Note',),
+}
+
+# SourceTypes whose input text may be left empty (the dialog drops the
+# "(Required)" label for these; source_types_where_input_is_optional)
+ANKIHUB_OPTIONAL_SOURCE_TYPES = ('Duplicate Note',)
+
+# change types for which the AnKing deck REQUIRES a source object
+ANKIHUB_SOURCE_REQUIRED_CHANGE_TYPES = ('new_content', 'updated_content')
+
+# the dialog's UWorld step dropdown options are 'Step 1'..'Step 3'
+ANKIHUB_UWORLD_STEPS = (1, 2, 3)
+
+# ChangeSuggestionResult member name -> locked API result string
+ANKIHUB_CHANGE_RESULTS = {'SUCCESS': 'success', 'NO_CHANGES': 'noChanges',
+                          'ANKIHUB_NOT_FOUND': 'notFoundOnAnkiHub',
+                          'EMPTY_FIRST_FIELD': 'emptyFirstField'}
+
+# call-time feature detection: these functions must exist on the add-on's
+# main.suggestions module with AT LEAST these keyword parameters
+ANKIHUB_REQUIRED_SIGNATURES = {
+    'suggest_note_update': ('note', 'change_type', 'comment',
+                            'media_upload_cb', 'auto_accept'),
+    'suggest_new_note': ('note', 'comment', 'ankihub_did',
+                         'media_upload_cb', 'auto_accept'),
+    'resubmit_new_note_as_change_suggestion': ('note', 'ah_did',
+                                               'conflicting_ah_nid',
+                                               'change_type', 'comment',
+                                               'auto_accept'),
+    'has_empty_first_field': ('note',),
+    'parse_duplicate_anki_id_error': ('errors',),
+}
+
+# fragment of the server's 400 non_field_error for a change suggestion whose
+# fields/tags match the server revision (main/suggestions.py:64)
+ANKIHUB_NO_CHANGES_ERROR_FRAGMENT = "don't have any changes to the original note"
+ANKIHUB_SYNC_FIRST_ADVICE = (' (the note may already match the AnkiHub revision'
+                             ' - sync with AnkiHub first, then re-suggest)')
+
+
+def validate_ankihub_change_type(change_type):
+    if not isinstance(change_type, str) or change_type not in ANKIHUB_CHANGE_TYPES:
+        raise Exception('invalid parameter: changeType: one of {} required'.format(
+            ', '.join(ANKIHUB_CHANGE_TYPES)))
+    return change_type
+
+
+def validate_ankihub_rationale(rationale):
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise Exception('RATIONALE_INVALID: rationale must be a non-empty string')
+    if len(rationale) >= ANKIHUB_RATIONALE_MAX_LENGTH:
+        # >= matches the dialog widget's trim loop: max 1023 characters
+        raise Exception('RATIONALE_INVALID: rationale is {} characters; the '
+                        'AnkiHub dialog caps it at {}'.format(
+                            len(rationale), ANKIHUB_RATIONALE_MAX_LENGTH - 1))
+    return rationale
+
+
+def _ankihub_source_parts(source, allowed_types):
+    """Validate a {type, text[, step]} source; return (type, raw_text, line).
+
+    line is the dialog's exact comment suffix (_comment_with_source,
+    suggestion_dialog.py:507-512): '\\nSource: {type} - {text}', with the
+    UWorld step dropdown text prepended to the text ('Step N ',
+    suggestion_dialog.py:963-970). line is '' when raw_text is blank — the
+    dialog only folds a source whose text carries content.
+    """
+    if not isinstance(source, dict):
+        raise Exception('invalid parameter: source: object {type, text} required')
+    unknown = sorted(set(source) - {'type', 'text', 'step'})
+    if unknown:
+        raise Exception('invalid parameter: source: unknown key(s): {}'.format(
+            ', '.join(str(key) for key in unknown)))
+    source_type = source.get('type')
+    if not isinstance(source_type, str) or source_type not in allowed_types:
+        raise Exception('invalid parameter: source.type: one of {} required '
+                        'here'.format(', '.join(allowed_types)))
+    text = source.get('text', '')
+    if not isinstance(text, str):
+        raise Exception('invalid parameter: source.text: string required')
+    step = source.get('step')
+    if source_type == 'UWorld':
+        if isinstance(step, bool) or not isinstance(step, int) \
+                or step not in ANKIHUB_UWORLD_STEPS:
+            raise Exception('invalid parameter: source.step: 1, 2 or 3 '
+                            'required for UWorld sources')
+        folded_text = 'Step {} {}'.format(step, text)
+    else:
+        if step is not None:
+            raise Exception('invalid parameter: source.step: only valid for '
+                            'UWorld sources')
+        folded_text = text
+    if not text.strip():
+        return source_type, text, ''
+    return source_type, text, '\nSource: {} - {}'.format(source_type, folded_text)
+
+
+def ankihub_comment_for_update(rationale, change_type, source, for_anking_deck):
+    """Final comment for a change suggestion, replicating the AnkiHub dialog's
+    Source rules exactly (suggestion_dialog.py:778-786, 829-846):
+
+    - a Source exists only for new_content/updated_content on the AnKing deck
+      (REQUIRED there, non-empty text) and for delete on any deck (optional,
+      'Duplicate Note' only); anywhere else a source param is rejected
+    - the folded line is '\\nSource: {type} - {text}' with UWorld's 'Step N '
+      prefix; a blank optional source folds nothing
+    """
+    rationale = validate_ankihub_rationale(rationale)
+    change_type = validate_ankihub_change_type(change_type)
+    anking_source = (change_type in ANKIHUB_SOURCE_REQUIRED_CHANGE_TYPES
+                     and for_anking_deck)
+    source_shown = anking_source or change_type == 'delete'
+    if source is None:
+        if anking_source:
+            raise Exception("SOURCE_REQUIRED: the AnKing deck requires a "
+                            "source {{type, text}} for changeType '{}' "
+                            "(types: {})".format(
+                                change_type,
+                                ', '.join(ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE[change_type])))
+        return rationale
+    if not source_shown:
+        raise Exception("invalid parameter: source: not accepted for "
+                        "changeType '{}'{} - the AnkiHub dialog offers a "
+                        "Source only for new_content/updated_content on the "
+                        "AnKing deck and for delete".format(
+                            change_type,
+                            '' if change_type in ANKIHUB_SOURCE_REQUIRED_CHANGE_TYPES
+                            else ' on any deck'))
+    source_type, raw_text, line = _ankihub_source_parts(
+        source, ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE[change_type])
+    if source_type not in ANKIHUB_OPTIONAL_SOURCE_TYPES and not raw_text.strip():
+        raise Exception('SOURCE_REQUIRED: source.text must be non-empty for '
+                        '{} sources'.format(source_type))
+    return rationale + line
+
+
+def ankihub_comment_for_new_note(rationale, source):
+    """Final comment for a new-note suggestion. The add-on's new-note dialog
+    flow has NO Source widget and submits the rationale alone
+    (suggestion_dialog.py:373-376); the optional source here is a locked API
+    extension folded with the identical line format. 'Duplicate Note' is
+    excluded — it cannot describe a brand-new note.
+    """
+    rationale = validate_ankihub_rationale(rationale)
+    if source is None:
+        return rationale
+    _source_type, _raw_text, line = _ankihub_source_parts(
+        source, ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE['new_content'])
+    return rationale + line
+
+
+def map_ankihub_http_error(status_code, body):
+    """AnkiHubHTTPError -> (taxonomy code, message); pure and testable.
+
+    400 = server validation (body passed through; the 'no changes vs server
+    revision' error gets sync-with-AnkiHub-first advice appended), 401 =
+    bad/expired token, 403 = permission/subscription, 404 = note deleted or
+    tombstoned on AnkiHub, 429 = rate limited, anything else (5xx included)
+    = NETWORK_ERROR. body may be parsed JSON, a text snippet, or None.
+    """
+    if isinstance(body, str):
+        detail = body
+    elif body is None:
+        detail = ''
+    else:
+        detail = json.dumps(body, separators=(',', ':'))
+    if status_code == 400:
+        message = detail or 'validation failed'
+        if ANKIHUB_NO_CHANGES_ERROR_FRAGMENT in message:
+            message += ANKIHUB_SYNC_FIRST_ADVICE
+        return 'VALIDATION_ERROR', message
+    if status_code == 401:
+        return ('ANKIHUB_NOT_LOGGED_IN', 'AnkiHub rejected the stored token '
+                '(401) - log in through the AnkiHub add-on')
+    if status_code == 403:
+        message = body.get('detail') if isinstance(body, dict) else None
+        return 'PERMISSION_DENIED', message or detail or 'permission denied (403)'
+    if status_code == 404:
+        return ('NOTE_DELETED_ON_ANKIHUB', 'the note does not exist on '
+                'AnkiHub (deleted or tombstoned)')
+    if status_code == 429:
+        return ('RATE_LIMITED', 'AnkiHub rate limit hit (429) - wait before '
+                'submitting more suggestions')
+    return 'NETWORK_ERROR', 'unexpected AnkiHub response: HTTP {}{}'.format(
+        status_code, ' ' + detail if detail else '')
+
+
+def map_ankihub_change_result(result_name):
+    """ChangeSuggestionResult member NAME -> locked API result string."""
+    mapped = ANKIHUB_CHANGE_RESULTS.get(result_name)
+    if mapped is None:
+        raise Exception('INCOMPATIBLE_ANKIHUB_ADDON: unknown '
+                        'ChangeSuggestionResult member {!r} (this bridge was '
+                        'tested against add-on version {})'.format(
+                            result_name, ANKIHUB_TESTED_ADDON_VERSION))
+    return mapped
+
+
+def ankihub_missing_params(param_names, function_name):
+    """Names from ANKIHUB_REQUIRED_SIGNATURES[function_name] absent from
+    param_names, sorted. Non-empty means the installed add-on's signature
+    drifted from the tested version -> INCOMPATIBLE_ANKIHUB_ADDON."""
+    return sorted(set(ANKIHUB_REQUIRED_SIGNATURES[function_name]) - set(param_names))
