@@ -25,6 +25,7 @@ this module never imports aqt so it stays headless-testable.
 
 import base64
 import binascii
+import datetime
 import json
 import os
 import re
@@ -32,7 +33,7 @@ import re
 import anki.collection
 import anki.notes
 import anki.utils
-from anki.errors import NotFoundError
+from anki.errors import InvalidInput, NotFoundError, SearchError
 
 PLUS_VERSION = "1.0.0"
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
@@ -42,6 +43,18 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "cropImage",
                 # crop an IO note's base image and remap its occlusion rects into the cropped frame, one undo entry
                 "cropImageOcclusionImage",
+                # render cards' question/answer HTML + css through Anki's own template pipeline (read-only)
+                "renderCard",
+                # compact, paginated, HTML-stripped note reader built for LLM consumption (read-only)
+                "notesSlim",
+                # base64 thumbnails of media images: aspect-preserved, never upscaled (read-only)
+                "mediaThumbnails",
+                # suspend or unsuspend cards as one undoable batch
+                "bulkSuspend",
+                # reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch
+                "bulkSetDueDate",
+                # export a deck (and its subdecks) to a .apkg file, never overwriting
+                "exportDeckApkg",
                 "plusInfo"]
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
 DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
@@ -52,6 +65,15 @@ UNDO_BULK_UPDATE = 'AnkiConnect Plus: Bulk Update'
 UNDO_BULK_TAGS = 'AnkiConnect Plus: Bulk Tags'
 UNDO_CROP_IMAGE = 'AnkiConnect Plus: Crop Image'
 UNDO_CROP_IO = 'AnkiConnect Plus: Crop IO Image'
+UNDO_BULK_SUSPEND = 'AnkiConnect Plus: Bulk Suspend'
+UNDO_BULK_DUE = 'AnkiConnect Plus: Bulk Due Date'
+
+# cards.queue: -1 = suspended; any negative queue (-1 suspended, -2 sibling-
+# buried, -3 manually buried) is restored by the backend unsuspend op (SPEC 16)
+QUEUE_SUSPENDED = -1
+
+# default target folder for exportDeckApkg when outPath is omitted (SPEC 17)
+EXPORT_DEFAULT_DIR = os.path.expanduser('~/Downloads')
 
 IO_STOCK_KIND = 6
 
@@ -68,6 +90,11 @@ CLIP_EPS_PX = 1e-6
 # SQLite allows at most 32766 bound variables per statement; chunk IN-lists
 # well below that so fixed parameters (mid, dids, since/until, limit) still fit.
 SQL_IN_CHUNK = 15000
+
+# read-only action caps (SPEC 13, 14): oversized requests are clamped, not rejected
+NOTES_SLIM_LIMIT_CAP = 2000
+THUMBNAIL_DIM_CAP = 1024
+THUMBNAIL_FORMATS = {'jpeg', 'png'}
 
 
 #
@@ -180,10 +207,12 @@ def _validate_tag_list(tags, name):
 # Bulk actions
 #
 
-def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False):
+def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=False):
     if not isinstance(notes, list):
         raise Exception('invalid parameter: notes: list required')
     if not notes:
+        if dry_run:
+            return {'wouldAdd': 0, 'skipped': [], 'undoEntry': None}
         return {'added': [], 'skipped': [], 'undoEntry': None}
     for i, note in enumerate(notes):
         if not isinstance(note, dict):
@@ -283,6 +312,14 @@ def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False):
                 continue
         seen.add(key)
 
+    # dry run: everything above IS the real path's validation (resolution pass
+    # + duplicate precheck, both read-only); stop at the zero-write boundary
+    # so the two paths cannot drift (SPEC 15)
+    if dry_run:
+        skipped = [{'index': i, 'reason': entry['skip']}
+                   for i, entry in enumerate(resolved) if 'skip' in entry]
+        return {'wouldAdd': len(resolved) - len(skipped), 'skipped': skipped, 'undoEntry': None}
+
     # write pass
     added = []
     skipped = []
@@ -311,7 +348,7 @@ def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False):
     return {'added': added, 'skipped': skipped, 'undoEntry': UNDO_BULK_ADD if added else None}
 
 
-def bulk_update_note_fields(col, notes, atomic=True):
+def bulk_update_note_fields(col, notes, atomic=True, dry_run=False):
     if not isinstance(notes, list):
         raise Exception('invalid parameter: notes: list required')
 
@@ -355,6 +392,12 @@ def bulk_update_note_fields(col, notes, atomic=True):
                 skipped.append({'index': i, 'reason': 'invalid parameter: notes[{}].fields.{}: string required'.format(i, badValue)})
                 continue
 
+        # dry run: full per-entry validation done, nothing read past this point
+        # touches the collection or the in-memory Note (SPEC 15)
+        if dry_run:
+            updated.append(nid)
+            continue
+
         try:
             if fields is not None:
                 for name, value in fields.items():
@@ -372,11 +415,13 @@ def bulk_update_note_fields(col, notes, atomic=True):
                 raise _batch_error('bulkUpdateNoteFields', UNDO_BULK_UPDATE, 'updatedBeforeRevert', i, e, len(updated), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
+    if dry_run:
+        return {'wouldUpdate': updated, 'skipped': skipped, 'undoEntry': None}
     _pop_empty_undo(col, target, updated, UNDO_BULK_UPDATE)
     return {'updated': updated, 'skipped': skipped, 'undoEntry': UNDO_BULK_UPDATE if updated else None}
 
 
-def bulk_add_tags(col, note_ids, tags, atomic=True):
+def bulk_add_tags(col, note_ids, tags, atomic=True, dry_run=False):
     if not isinstance(note_ids, list):
         raise Exception('invalid parameter: noteIds: list required')
     if not all(isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids):
@@ -402,6 +447,10 @@ def bulk_add_tags(col, note_ids, tags, atomic=True):
         missing = [t for t in tagList if not ankiNote.has_tag(t)]
         if not missing:
             continue
+        # dry run: same no-op detection as the real path, zero writes (SPEC 15)
+        if dry_run:
+            updated.append(nid)
+            continue
         try:
             for t in missing:
                 ankiNote.add_tag(t)
@@ -416,6 +465,8 @@ def bulk_add_tags(col, note_ids, tags, atomic=True):
                 raise _batch_error('bulkAddTags', UNDO_BULK_TAGS, 'updatedBeforeRevert', i, e, len(updated), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
+    if dry_run:
+        return {'wouldUpdate': updated, 'skipped': skipped, 'undoEntry': None}
     _pop_empty_undo(col, target, updated, UNDO_BULK_TAGS)
     return {'updated': updated, 'skipped': skipped, 'undoEntry': UNDO_BULK_TAGS if updated else None}
 
@@ -878,3 +929,324 @@ def create_backup(col, force=True):
     os.makedirs(folder, exist_ok=True)
     created = col.create_backup(backup_folder=folder, force=force, wait_for_completion=True)
     return {'created': created}
+
+
+#
+# Card rendering (SPEC 12)
+#
+
+def render_card(col, card_ids):
+    if not isinstance(card_ids, list) or not all(
+            isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
+        raise Exception('invalid parameter: cardIds: ints required')
+
+    cards = []
+    for cid in card_ids:
+        try:
+            card = col.get_card(cid)
+        except NotFoundError:
+            cards.append({'cardId': cid, 'error': 'card was not found: {}'.format(cid)})
+            continue
+        try:
+            out = card.render_output()
+            cards.append({
+                'cardId': cid,
+                # rendered template HTML WITHOUT the <style> wrapper; css ships
+                # separately so clients can wrap (or not) themselves
+                'question': out.question_text,
+                'answer': out.answer_text,
+                'css': out.css,
+                # current_deck_id() = odid or did: home deck for filtered cards
+                'deckName': col.decks.name(card.current_deck_id()),
+                'modelName': card.note_type()['name'],
+                'ord': card.ord,
+            })
+        except Exception as e:
+            cards.append({'cardId': cid, 'error': 'could not render card {}: {}'.format(cid, e)})
+    return {'cards': cards}
+
+
+#
+# Slim note reads (SPEC 13)
+#
+
+def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
+               max_field_length=400, offset=0, limit=200):
+    if (query is None) == (note_ids is None):
+        raise Exception('invalid parameter: query: exactly one of query or noteIds required')
+    if query is not None and not isinstance(query, str):
+        raise Exception('invalid parameter: query: string required')
+    if note_ids is not None and (not isinstance(note_ids, list) or not all(
+            isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids)):
+        raise Exception('invalid parameter: noteIds: ints required')
+    if fields is not None:
+        _validate_tag_list(fields, 'fields')
+    if not isinstance(strip_html, bool):
+        raise Exception('invalid parameter: stripHtml: boolean required')
+    if isinstance(max_field_length, bool) or not isinstance(max_field_length, int) or max_field_length < 0:
+        raise Exception('invalid parameter: maxFieldLength: int >= 0 required')
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise Exception('invalid parameter: offset: int >= 0 required')
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise Exception('invalid parameter: limit: must be >= 1')
+    limit = min(limit, NOTES_SLIM_LIMIT_CAP)
+
+    if query is not None:
+        try:
+            # order=False is the fastest path; sorting ids ourselves gives a
+            # deterministic ascending-noteId (creation) order for pagination
+            ids = sorted(col.find_notes(query, order=False))
+        except SearchError as e:
+            raise Exception('invalid parameter: query: {}'.format(e))
+    else:
+        ids = list(note_ids)  # caller order preserved, duplicates included
+
+    total = len(ids)
+    wanted = set(fields) if fields is not None else None
+
+    notes = []
+    for nid in ids[offset:offset + limit]:
+        try:
+            ankiNote = col.get_note(nid)
+        except NotFoundError:
+            # noteIds path only: stale id, omitted from the page (SPEC 13);
+            # total still counts it, so pages may run short of limit
+            continue
+        model = ankiNote.note_type()
+        outFields = {}
+        for fld in model['flds']:
+            name = fld['name']
+            if wanted is not None and name not in wanted:
+                continue
+            text = ankiNote[name]
+            if strip_html:
+                # module-level anki.utils.html_to_text_line routes through the
+                # collection-less current_i18n backend and raises headless;
+                # the open collection's backend works everywhere (SPEC 13)
+                text = col._backend.html_to_text_line(text=text, preserve_media_filenames=True)
+            if max_field_length and len(text) > max_field_length:
+                text = text[:max_field_length] + '…'
+            outFields[name] = text
+        notes.append({
+            'noteId': ankiNote.id,
+            'modelName': model['name'],
+            'tags': list(ankiNote.tags),
+            'fields': outFields,
+        })
+
+    nextOffset = offset + limit if offset + limit < total else None
+    return {'total': total, 'notes': notes, 'nextOffset': nextOffset}
+
+
+#
+# Media thumbnails (SPEC 14)
+#
+
+def media_thumbnails(col, filenames, max_dim=320, image_format='jpeg', quality=70):
+    """Pure read: encodes scaled-down copies to base64, writes nothing.
+
+    PyQt6 is imported lazily so importing this module stays Qt-free; QImage
+    load/scale/save needs no Q(Gui)Application on this build (probe-verified).
+    """
+    if not isinstance(filenames, list) or not all(isinstance(f, str) for f in filenames):
+        raise Exception('invalid parameter: filenames: list of strings required')
+    if isinstance(max_dim, bool) or not isinstance(max_dim, int) or max_dim < 1:
+        raise Exception('invalid parameter: maxDim: must be >= 1')
+    max_dim = min(max_dim, THUMBNAIL_DIM_CAP)
+    if image_format not in THUMBNAIL_FORMATS:
+        raise Exception('invalid parameter: format: jpeg or png required')
+    if isinstance(quality, bool) or not isinstance(quality, int) or not (0 <= quality <= 100):
+        raise Exception('invalid parameter: quality: int 0-100 required')
+    if not filenames:
+        return {'thumbnails': []}
+
+    from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+    from PyQt6.QtGui import QImage
+
+    mediaDir = col.media.dir()
+    thumbnails = []
+    for filename in filenames:
+        if not filename or os.path.basename(filename) != filename:
+            thumbnails.append({'filename': filename,
+                               'error': 'invalid parameter: filenames: bare media filename required'})
+            continue
+        path = os.path.join(mediaDir, filename)
+        if not os.path.isfile(path):
+            thumbnails.append({'filename': filename,
+                               'error': 'media file was not found: {}'.format(filename)})
+            continue
+        img = QImage(path)
+        if img.isNull() or img.width() < 1 or img.height() < 1:
+            thumbnails.append({'filename': filename,
+                               'error': 'could not load image: {} (unsupported or corrupt format)'.format(filename)})
+            continue
+        # scale only when a side exceeds the cap: this conditional is the
+        # never-upscale guarantee (QImage.scaled itself happily upscales)
+        if img.width() > max_dim or img.height() > max_dim:
+            img = img.scaled(max_dim, max_dim, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = img.save(buf, image_format, quality if image_format == 'jpeg' else -1)
+        buf.close()
+        if not ok:
+            thumbnails.append({'filename': filename,
+                               'error': 'could not encode thumbnail as {}: {}'.format(image_format, filename)})
+            continue
+        thumbnails.append({
+            'filename': filename,
+            'data': base64.b64encode(bytes(ba)).decode('ascii'),
+            'width': img.width(),
+            'height': img.height(),
+        })
+    return {'thumbnails': thumbnails}
+
+
+#
+# Scheduler bulk ops (SPEC 16)
+#
+
+def _existing_cards(col, card_ids):
+    """Dedupe card ids (first occurrence wins) and drop ids with no card,
+    returning [(cid, queue)]. Read-only. Keeps backend behavior on unknown
+    ids out of the contract entirely (SPEC 16)."""
+    if not isinstance(card_ids, list) or not all(
+            isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
+        raise Exception('invalid parameter: cardIds: ints required')
+    existing = []
+    for cid in dict.fromkeys(card_ids):
+        try:
+            existing.append((cid, col.get_card(cid).queue))
+        except NotFoundError:
+            continue
+    return existing
+
+
+def bulk_suspend(col, card_ids, suspend=True):
+    if not isinstance(suspend, bool):
+        raise Exception('invalid parameter: suspend: boolean required')
+    existing = _existing_cards(col, card_ids)
+
+    if suspend:
+        # suspending an already-suspended card is a no-op; buried cards DO
+        # change (queue -2/-3 -> -1), so they count as pending
+        pending = [cid for cid, queue in existing if queue != QUEUE_SUSPENDED]
+    else:
+        # the backend restore op unsuspends AND unburies: every negative
+        # queue changes, so all of them count as pending (SPEC Deviation #8)
+        pending = [cid for cid, queue in existing if queue < 0]
+    if not pending:
+        return {'changed': 0, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(UNDO_BULK_SUSPEND)
+    try:
+        if suspend:
+            # OpChangesWithCount: backend-authoritative changed count
+            changed = col.sched.suspend_cards(pending).count
+        else:
+            # unsuspend returns plain OpChanges (no count); the pending
+            # precheck is the changed count (SPEC Deviation #8)
+            col.sched.unsuspend_cards(pending)
+            changed = len(pending)
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, UNDO_BULK_SUSPEND)
+        raise Exception('bulkSuspend failed (batch reverted): {}'.format(e))
+
+    if not changed:
+        # data no-op: pop the empty custom entry so the Undo menu stays clean
+        _revert_batch(col, UNDO_BULK_SUSPEND)
+        return {'changed': 0, 'undoEntry': None}
+    return {'changed': changed, 'undoEntry': UNDO_BULK_SUSPEND}
+
+
+def bulk_set_due_date(col, card_ids, days):
+    if not isinstance(days, str) or not days:
+        raise Exception('invalid parameter: days: string like "0" or "1-7" required')
+    # pre-validate the backend grammar ("0", "5", "1-7", "3!", "1-7!") BEFORE
+    # any undo entry exists: if InvalidInput fired after add_custom_undo_entry,
+    # popping the empty entry via col.undo() would push a phantom Redo item
+    # (SPEC 16.2 promises the undo stack is left untouched on a bad days string).
+    # ASCII digits only: the backend regex accepts unicode digits but its int
+    # parse then rejects them, so [0-9] is the true accepted alphabet.
+    if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?!?', days):
+        raise Exception('invalid parameter: days: {}'.format(days))
+    existing = _existing_cards(col, card_ids)
+    if not existing:
+        return {'changed': 0, 'undoEntry': None}
+    ids = [cid for cid, _queue in existing]
+
+    target = col.add_custom_undo_entry(UNDO_BULK_DUE)
+    try:
+        col.sched.set_due_date(ids, days)
+        col.merge_undo_entries(target)
+    except InvalidInput as e:
+        # bad days string: the op never ran, pop the empty custom entry
+        _revert_batch(col, UNDO_BULK_DUE)
+        raise Exception('invalid parameter: days: {}'.format(e))
+    except Exception as e:
+        _revert_batch(col, UNDO_BULK_DUE)
+        raise Exception('bulkSetDueDate failed (batch reverted): {}'.format(e))
+
+    # set_due_date returns plain OpChanges (no count); it applies to every
+    # existing card regardless of state (SPEC Deviation #8)
+    return {'changed': len(ids), 'undoEntry': UNDO_BULK_DUE}
+
+
+#
+# Deck export (SPEC 17)
+#
+
+def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
+                     include_media=True):
+    if not isinstance(deck_name, str) or not deck_name:
+        raise Exception('invalid parameter: deckName: string required')
+    if out_path is not None and (not isinstance(out_path, str) or not out_path):
+        raise Exception('invalid parameter: outPath: string required')
+    if not isinstance(include_scheduling, bool):
+        raise Exception('invalid parameter: includeScheduling: boolean required')
+    if not isinstance(include_media, bool):
+        raise Exception('invalid parameter: includeMedia: boolean required')
+    did = col.decks.id_for_name(deck_name)
+    if did is None:
+        raise Exception('deck was not found: {}'.format(deck_name))
+
+    if out_path is None:
+        # sanitize: unicode word chars, dot, dash survive; '::' and anything
+        # else collapse to single dashes
+        stem = re.sub(r'[^\w.-]+', '-', deck_name).strip('-.') or 'deck'
+        out_path = os.path.join(EXPORT_DEFAULT_DIR, '{}-{}.apkg'.format(
+            stem, datetime.date.today().isoformat()))
+    else:
+        out_path = os.path.expanduser(out_path)
+        # outPath must be a FILE path: a directory (or trailing slash) would
+        # make splitext see no extension and the collision loop would write a
+        # surprise sibling like '<dir>-2' (or a file literally named '-2')
+        if os.path.isdir(out_path) or not os.path.basename(out_path):
+            raise Exception(
+                'invalid parameter: outPath: is a directory: {}'.format(out_path))
+    outDir = os.path.dirname(out_path) or '.'
+    if not os.path.isdir(outDir):
+        raise Exception('output directory was not found: {}'.format(outDir))
+
+    # never overwrite: append -2, -3, ... before the extension (race-free:
+    # handlers are serialized on the main thread, SPEC 3.1)
+    base, ext = os.path.splitext(out_path)
+    serial = 2
+    while os.path.exists(out_path):
+        out_path = '{}-{}{}'.format(base, serial, ext)
+        serial += 1
+
+    options = anki.collection.ExportAnkiPackageOptions(
+        with_scheduling=include_scheduling,
+        # deck presets are NOT exported (matches Anki's own dialog default);
+        # importing presets would mutate the receiving collection's config
+        with_deck_configs=False,
+        with_media=include_media,
+        legacy=False,  # modern package format (Anki 2.1.50+)
+    )
+    notes = col.export_anki_package(out_path=out_path, options=options,
+                                    limit=anki.collection.DeckIdLimit(did))
+    return {'path': out_path, 'sizeBytes': os.path.getsize(out_path),
+            'notesExported': notes}

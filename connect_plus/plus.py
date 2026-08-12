@@ -62,21 +62,27 @@ class PlusMixin:
 
 
     @util.api()
-    def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False):
+    def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False, dryRun=False):
         if not isinstance(notes, list):
             raise Exception('invalid parameter: notes: list required')
-        prepared = [self._plusEmbedNoteMedia(note) for note in notes]
-        return core.bulk_add_notes(self.collection(), prepared, atomic=atomic, allow_duplicates=allowDuplicates)
+        if dryRun:
+            # dry run writes NOTHING: media embedding stores files, so it is
+            # skipped and fields are validated as submitted (SPEC 15)
+            prepared = notes
+        else:
+            prepared = [self._plusEmbedNoteMedia(note) for note in notes]
+        return core.bulk_add_notes(self.collection(), prepared, atomic=atomic,
+                                   allow_duplicates=allowDuplicates, dry_run=dryRun)
 
 
     @util.api()
-    def bulkUpdateNoteFields(self, notes, atomic=True):
-        return core.bulk_update_note_fields(self.collection(), notes, atomic=atomic)
+    def bulkUpdateNoteFields(self, notes, atomic=True, dryRun=False):
+        return core.bulk_update_note_fields(self.collection(), notes, atomic=atomic, dry_run=dryRun)
 
 
     @util.api()
-    def bulkAddTags(self, noteIds, tags, atomic=True):
-        return core.bulk_add_tags(self.collection(), noteIds, tags, atomic=atomic)
+    def bulkAddTags(self, noteIds, tags, atomic=True, dryRun=False):
+        return core.bulk_add_tags(self.collection(), noteIds, tags, atomic=atomic, dry_run=dryRun)
 
 
     @util.api()
@@ -141,6 +147,53 @@ class PlusMixin:
     @util.api()
     def createBackup(self, force=True):
         return core.create_backup(self.collection(), force=force)
+
+
+    @util.api()
+    def renderCard(self, cardIds):
+        return core.render_card(self.collection(), cardIds)
+
+
+    @util.api()
+    def notesSlim(self, query=None, noteIds=None, fields=None, stripHtml=True,
+                  maxFieldLength=400, offset=0, limit=200):
+        return core.notes_slim(
+            self.collection(),
+            query=query,
+            note_ids=noteIds,
+            fields=fields,
+            strip_html=stripHtml,
+            max_field_length=maxFieldLength,
+            offset=offset,
+            limit=limit
+        )
+
+
+    @util.api()
+    def mediaThumbnails(self, filenames, maxDim=320, format='jpeg', quality=70):
+        return core.media_thumbnails(self.collection(), filenames, max_dim=maxDim,
+                                     image_format=format, quality=quality)
+
+
+    @util.api()
+    def bulkSuspend(self, cardIds, suspend=True):
+        return core.bulk_suspend(self.collection(), cardIds, suspend=suspend)
+
+
+    @util.api()
+    def bulkSetDueDate(self, cardIds, days):
+        return core.bulk_set_due_date(self.collection(), cardIds, days)
+
+
+    @util.api()
+    def exportDeckApkg(self, deckName, outPath=None, includeScheduling=True, includeMedia=True):
+        return core.export_deck_apkg(
+            self.collection(),
+            deckName,
+            out_path=outPath,
+            include_scheduling=includeScheduling,
+            include_media=includeMedia
+        )
 
 
     @util.api()

@@ -24,6 +24,7 @@ All locked decisions survive. The following are minimal adaptations forced by th
 5. **`bulkAddNotes` accepts the full upstream note shape, but per-note `options.duplicateScope` / `options.duplicateScopeOptions` are ignored in v1.** Duplicate detection is the locked csum precheck, whose semantics are Anki's native ones: same notetype + same stripped first field, collection-wide. Per-note `options.allowDuplicate` **is** honored (overrides the batch-level `allowDuplicates`). Presence of `duplicateScope` keys is silently ignored (documented in README).
 6. **`bulkAddNotes` uses a per-note `col.add_note` loop, not plural `col.add_notes`,** because `atomic: false` partial-continue and per-note skip reporting are impossible with the all-in-one-transaction plural call. The single-undo-entry contract is met with `add_custom_undo_entry` + `merge_undo_entries` (probe-verified pattern). Measured cost of the loop is ~34 ms per 300 notes — acceptable.
 7. **`undoEntry` in bulk-action returns is `null` when the batch performed zero collection writes** (everything skipped). The custom undo entry is created lazily right before the first actual write so we never leave an empty entry on the undo stack.
+8. **`bulkSuspend` (unsuspend direction) and `bulkSetDueDate` compute `changed` from a read-only precheck, not from the backend.** The locked `{changed, undoEntry}` shape assumed a backend count, but only `suspend_cards` returns `OpChangesWithCount`; `unsuspend_cards` and `set_due_date` return plain `OpChanges` (verified in `SP/anki/scheduler/base.py:150-156,205-227`). Adaptation: input ids are deduplicated and filtered to existing cards via `col.get_card` (so backend behavior on unknown ids never enters the contract); unsuspend's `changed` = cards whose queue was negative before the op (the restore op changes exactly those — it also unburies); `set_due_date`'s `changed` = the count of existing cards passed (the op applies to every one regardless of state). The suspend direction still uses the backend's authoritative `.count`.
 
 ---
 
@@ -158,6 +159,7 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 | `notes` | array of note objects | required | Same shape as upstream `addNotes`: `{deckName, modelName, fields: {FieldName: html}, tags: [str], options?: {allowDuplicate?: bool, ...}, audio?/video?/picture?: [...]}` |
 | `atomic` | bool | `true` | `true`: any hard error reverts the whole batch and raises. `false`: continue past per-note hard errors, reporting them in `skipped`. |
 | `allowDuplicates` | bool | `false` | Batch default; per-note `options.allowDuplicate`, when present, overrides it for that note. |
+| `dryRun` | bool | `false` | `true`: run the identical resolution pass + duplicate precheck, write nothing, return `{wouldAdd, skipped, undoEntry: null}` — see §15. |
 
 **Returns**
 
@@ -212,6 +214,7 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 |---|---|---|---|
 | `notes` | array of `{id: int, fields?: {FieldName: html}, tags?: [str]}` | required | `fields` updates only the named fields; `tags`, when present, **replaces** the note's whole tag list. At least one of `fields`/`tags` must be present per entry. |
 | `atomic` | bool | `true` | Same contract as bulkAddNotes. |
+| `dryRun` | bool | `false` | `true`: run the identical per-entry validation, write nothing, return `{wouldUpdate, skipped, undoEntry: null}` — see §15. |
 
 **Returns** `{"updated": [noteIds], "skipped": [{"index", "reason"}], "undoEntry": "AnkiConnect Plus: Bulk Update" | null}`
 
@@ -234,6 +237,7 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 | `noteIds` | [int] | required | |
 | `tags` | str or [str] | required | String is split on whitespace, upstream-style. Empty after normalization → error. |
 | `atomic` | bool | `true` | |
+| `dryRun` | bool | `false` | `true`: run the identical validation + missing-tag detection, write nothing, return `{wouldUpdate, skipped, undoEntry: null}` — see §15. |
 
 **Returns** `{"updated": [noteIds that actually changed], "skipped": [{"index", "reason"}], "undoEntry": "AnkiConnect Plus: Bulk Tags" | null}`
 
@@ -501,7 +505,7 @@ Must contain, in order:
 3. **Install**: copy or symlink the `connect_plus` folder into Anki's add-on directory as exactly `connect_plus`:
    `ln -s /Users/mattyc/Downloads/anki-connect-plus/connect_plus "~/Library/Application Support/Anki2/addons21/connect_plus"` (macOS path; folder name is load-bearing, §6.4). Restart Anki. (The symlink itself is an addons21 *addition*, not a modification of existing Anki data; creating it is a user action — never automated by tooling per the hard rules.)
 4. **Coexistence note**: runs alongside stock AnkiConnect (2055492159) in the same Anki — stock on 8765, Plus on 8766; all upstream actions are also served on 8766; configs are independent; env overrides are `ANKICONNECT_PLUS_BIND_ADDRESS` / `ANKICONNECT_PLUS_CORS_ORIGIN`; banner string on 8766 reads "AnkiConnect Plus v.6".
-5. **New-action reference**: params/returns/errors for the nine actions (condensed from §4), incl. the `interval` sign convention and `type` enum for queryRevlog, the atomic/undo contract for bulks, deviations #1–#5, and one curl example, e.g.:
+5. **New-action reference**: params/returns/errors for the seventeen actions (condensed from §§4, 11–14, 16–17), incl. the `interval` sign convention and `type` enum for queryRevlog, the atomic/undo contract for bulks, the `dryRun` param on the three bulk actions (`wouldAdd` count vs `wouldUpdate` id-list, `undoEntry: null`, and §15's skipped-media-embedding limitation), the `bulkSetDueDate` `days` grammar, the `exportDeckApkg` never-overwrite `-2` suffixing and fixed `with_deck_configs=False` choice, deviations #1–#8, and one curl example, e.g.:
    ```bash
    curl localhost:8766 -d '{"action":"plusInfo","version":6}'
    ```
@@ -613,3 +617,216 @@ Crop the base image of a **built-in IO note** and remap every occlusion rect int
 - **Derived naming**: `<stem>-crop.<ext>` keeping the source extension when Qt can encode it; otherwise (readable-but-not-writable formats: `gif`, `svg`, `svgz`, `pdf`, `tga`, or an unknown extension) the crop is re-encoded as PNG under `<stem>-crop.png`. Name collisions are resolved by `col.media.write_data`'s dedup (same bytes → same name reused; different bytes → sha1-renamed) and the returned name is authoritative.
 - **Write-format allowlist** (probe-verified on this build): `bmp cur heic heif icns ico jfif jp2 jpeg jpg pbm pgm png ppm tif tiff wbmp webp xbm xpm` (`core.CROP_WRITE_FORMATS`).
 - **Headless rule**: all Qt imports live inside the core function bodies (lazy), keeping `core.py`'s module import aqt-free AND Qt-free; no application object is created. Pillow is not a dependency (not installed in the venv).
+
+---
+
+## 12. `renderCard` (spec revision 3, 2026-08-11)
+
+First of three **read-only** actions (`renderCard`, `notesSlim`, `mediaThumbnails` — §§12–14) bringing the action count to fourteen. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. None of the three performs any collection write, media write, or undo-stack change; tests assert `undo_status()` unchanged after each call.
+
+Render cards' question/answer HTML exactly as Anki's own template pipeline produces them.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `cardIds` | [int] | required | Bad ids (and per-card render failures) become per-item `error` entries, never a hard failure. Empty list → `{"cards": []}`. |
+
+**Returns**
+
+```json
+{"cards": [
+  {"cardId": 1712345678901, "question": "<b>front html</b>", "answer": "…", "css": ".card {…}", "deckName": "HA2::PI 7", "modelName": "Basic", "ord": 0},
+  {"cardId": 42, "error": "card was not found: 42"}
+]}
+```
+
+- `question`/`answer` are the rendered template HTML **without** the `<style>` wrapper; `css` is the notetype styling returned separately (clients wanting the `card.question()` equivalent concatenate `"<style>" + css + "</style>" + question`).
+- Audio/TTS: rendered text contains `[anki:play:q:<idx>]` markers in place of `[sound:...]` tags (backend behavior). The referenced filenames live in the render output's `question_av_tags`/`answer_av_tags` and are **not** returned in v1.
+- `deckName` is the card's current home deck (`odid` when in a filtered deck) via `col.decks.name(card.current_deck_id())`.
+- One entry per input id, in input order; duplicate ids render twice.
+
+**Anki API calls** — `col.get_card(cid)` (`NotFoundError` → per-item `"card was not found: <id>"`); `card.render_output()` (`SP/anki/cards.py:161-170`) → `TemplateRenderOutput` (`SP/anki/template.py:280-293`) with `question_text`/`answer_text`/`css`; `col.decks.name(card.current_deck_id())` (`SP/anki/decks.py:384-388`, `SP/anki/cards.py:194-195`); `card.note_type()["name"]` (`SP/anki/cards.py:180-181`, cached lookup). `anki.template` imports zero aqt — probe-verified headless render of Basic + Cloze cards.
+
+**Error cases** — hard (whole action): `"invalid parameter: cardIds: ints required"` (non-list, or any non-int/bool element). Per-item: `"card was not found: <id>"`; any per-card render exception → `"could not render card <id>: <err>"`.
+
+**Edge cases tests must cover** — Basic card renders (question contains the field text, css non-empty, `ord` 0); cloze question contains `class="cloze"` markup; mixed good/bad ids → per-item errors interleaved in input order with successful renders; a `[sound:...]` field renders with an `[anki:play:` marker in the text; undo queue untouched.
+
+## 13. `notesSlim` (spec revision 3, 2026-08-11)
+
+Compact, paginated, HTML-stripped note reader designed for LLM consumption: deterministic order, bounded field lengths, one round trip. Read-only; issues no SQL.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `query` | str | — | Anki search string, passed **verbatim** to the backend parser (empty string matches all notes). Exactly one of `query`/`noteIds` is required. |
+| `noteIds` | [int] | — | Explicit ids; page order = caller order (duplicates allowed and returned twice). |
+| `fields` | [str] | `null` | Field-name filter; `null` = all fields. Names not present on a note's model are simply absent for that note (a result set may span models) — never an error. |
+| `stripHtml` | bool | `true` | Strips via the backend single-line helper: media filenames preserved, `[sound:...]` tags kept, `<br>`/`<div>` boundaries become single spaces. `false` returns raw field HTML. |
+| `maxFieldLength` | int | `400` | Per-field character cap applied AFTER stripping (or to the raw HTML when `stripHtml: false` — may cut mid-tag; it is a preview); longer values are cut at the cap with `…` appended. `0` = no truncation. |
+| `offset` | int | `0` | Offset into the full matched id list. |
+| `limit` | int | `200` | Must be ≥ 1; values above 2000 are silently clamped to 2000 (`core.NOTES_SLIM_LIMIT_CAP`). |
+
+**Returns**
+
+```json
+{"total": 812,
+ "notes": [{"noteId": 1712345678901, "modelName": "Cloze", "tags": ["HA2::PI7"],
+            "fields": {"Text": "The capital of {{c1::France}} is {{c2::Paris::city hint}}.", "Back Extra": ""}}],
+ "nextOffset": 200}
+```
+
+- `total` = full match count before pagination; `nextOffset` = `offset + limit` while more ids remain, else `null`.
+- **Cloze markup passes through unmodified** under `stripHtml: true`: the backend single-line helper strips HTML only, so `{{c1::...}}` / `{{c2::...::hint}}` markers survive verbatim in the output (probe-verified) — clients must not expect any bracketed-hint conversion.
+- **Deterministic order**: query path returns ascending `noteId` (creation order — ids are sorted in core, `find_notes` is called with `order=False`); noteIds path preserves caller order.
+- The `fields` output dict is in the note's model field order (filtered by the `fields` param when given).
+- noteIds path: an id whose note no longer exists is **silently omitted** from `notes` (this shape has no per-item error entry); `total` still counts every supplied id, so a page can come back shorter than `limit`. Query-path ids always exist (same synchronous handler, §3.1).
+
+**Anki API calls** — `col.find_notes(query, order=False)` (`SP/anki/collection.py:669-683`; result supports `len()` and slicing; `order=False` is the fastest path, ordering is ours) — bad syntax raises `anki.errors.SearchError`, re-raised as `"invalid parameter: query: <backend message>"`; `col.get_note(nid)` (`NotFoundError` → omit, noteIds path only); `note.note_type()` for model name + field order. HTML stripping: `col._backend.html_to_text_line(text=..., preserve_media_filenames=True)` — the module-level `anki.utils.html_to_text_line` routes through the collection-less `current_i18n` backend and raises `CollectionNotOpen` headless (probe-verified gotcha), so the open collection's backend is called directly.
+
+**Error cases** — `"invalid parameter: query: exactly one of query or noteIds required"` (both given or neither); `"invalid parameter: query: string required"`; `"invalid parameter: query: <backend parse error>"`; `"invalid parameter: noteIds: ints required"`; `"invalid parameter: fields: list of strings required"`; `"invalid parameter: stripHtml: boolean required"`; `"invalid parameter: maxFieldLength: int >= 0 required"`; `"invalid parameter: offset: int >= 0 required"`; `"invalid parameter: limit: must be >= 1"`.
+
+**Edge cases tests must cover** — query/noteIds mutual exclusion (both and neither → error); pagination: `total` stable across pages, `nextOffset` chains cover exactly `total`, final page `nextOffset: null`; ascending id order on the query path, caller order on the noteIds path; `stripHtml: true` collapses `<div>` lines to single spaces and keeps media filenames; `stripHtml: false` returns raw HTML; `maxFieldLength` truncates at the cap with `…` appended, `0` disables; `fields` filter returns only the named fields, unknown name absent without error; stale noteId omitted while `total` counts it; empty query string matches all notes; bad search syntax → query error; undo queue untouched.
+
+## 14. `mediaThumbnails` (spec revision 3, 2026-08-11)
+
+Base64 thumbnails of collection media images — aspect-preserved, never upscaled, batched with per-item errors. Pure read: nothing is written to the media folder or the collection.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `filenames` | [str] | required | Bare media filenames (same guard as §11.1: `os.path.basename(name) == name`; empty string fails the guard). Empty list → `{"thumbnails": []}`. |
+| `maxDim` | int | `320` | Longest output side. Must be ≥ 1; values above 1024 are silently clamped to 1024 (`core.THUMBNAIL_DIM_CAP`). |
+| `format` | str | `"jpeg"` | `"jpeg"` or `"png"` only (`core.THUMBNAIL_FORMATS`). |
+| `quality` | int | `70` | JPEG encode quality 0–100; ignored for png (Qt default `-1` passed). |
+
+**Returns**
+
+```json
+{"thumbnails": [
+  {"filename": "anatomy.png", "data": "<base64>", "width": 320, "height": 214},
+  {"filename": "gone.png", "error": "media file was not found: gone.png"}
+]}
+```
+
+- One entry per input filename, input order, duplicates processed twice.
+- `width`/`height` = actual thumbnail pixel dimensions. An image already fitting within `maxDim` on both sides is **not upscaled**: it is returned at native size (still re-encoded to `format`).
+
+**Anki/Qt API calls** — lazy in-function PyQt6 imports exactly like the §11 crop code (`QImage`; `Qt` enums, `QBuffer`/`QByteArray`/`QIODevice` from `QtCore`); no application object needed (probe-verified). Scale: `img.scaled(maxDim, maxDim, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)` (probe-verified positional form), executed **only when** a side exceeds `maxDim` — this conditional is what guarantees no upscaling. Encode to bytes via `QBuffer` (no temp files): `img.save(buffer, format, quality)`, quality `-1` for png. Alpha: Qt's JPEG encoder flattens transparency (no compositing is done here); clients that need alpha request `format: "png"`.
+
+**Order of operations** — batch-level param validation first (hard errors, nothing processed); then per file: bare-name guard → `os.path.isfile` → `QImage` load/null check → conditional scale → encode. Every per-file failure produces a per-item `error` entry and the batch continues.
+
+**Error cases** — hard: `"invalid parameter: filenames: list of strings required"`; `"invalid parameter: maxDim: must be >= 1"`; `"invalid parameter: format: jpeg or png required"`; `"invalid parameter: quality: int 0-100 required"`. Per-item: `"invalid parameter: filenames: bare media filename required"`; `"media file was not found: <filename>"`; `"could not load image: <filename> (unsupported or corrupt format)"`; `"could not encode thumbnail as <format>: <filename>"`.
+
+**Edge cases tests must cover** — wide image (640×160, maxDim 320) → 320×80; tall image scales to the height cap; small image (≤ maxDim both sides) returned at native size, not upscaled; `data` base64 round-trips to a decodable image of the reported dims (verify with QImage in the test); png format preserves the alpha channel; per-item error for a missing and a path-y filename while the rest of the batch succeeds; maxDim clamp at 1024; bad format/quality → hard error, nothing processed; media dir file count identical before/after; undo queue untouched.
+
+---
+
+## 15. `dryRun` mode on the bulk actions (spec revision 4, 2026-08-11)
+
+An optional `dryRun: false` parameter on the three existing bulk actions (`bulkAddNotes`, `bulkUpdateNoteFields`, `bulkAddTags` — param rows added to §§4.1–4.3). **No new action names**: `core.PLUS_ACTIONS` is unchanged by this section. Purpose: preview exactly what a batch would do — which entries pass validation, which get skipped and why — before committing anything.
+
+**Shared-validation invariant (the anti-drift rule)** — the dry path is NOT a reimplementation. Each core function runs its normal code and short-circuits at its zero-write boundary, so dry and real validation are the same lines of code by construction:
+- `bulk_add_notes`: the full resolution pass + duplicate precheck (both read-only) run unchanged; the early return sits between the dedup stamping and the write pass.
+- `bulk_update_note_fields`: the whole per-entry validation chain (dict/id/fields-or-tags/type checks, `col.get_note` load, whole-entry field validation) runs unchanged; `dryRun` records the id and `continue`s immediately before the try/write block — before the in-memory `Note` object is ever mutated.
+- `bulk_add_tags`: top-level validation, `col.get_note`, and the missing-tag computation run unchanged; the short-circuit sits after the `if not missing: continue` no-op filter, so no-op notes are omitted from both lists exactly as in real mode.
+
+**Returns** (same envelope as the real action; the success key is renamed because its semantics change)
+
+```json
+{"wouldAdd": 2, "skipped": [{"index": 1, "reason": "duplicate"}], "undoEntry": null}
+```
+```json
+{"wouldUpdate": [1712345678901], "skipped": [{"index": 1, "reason": "note was not found: 42"}], "undoEntry": null}
+```
+
+- `bulkAddNotes` → `wouldAdd` is a **count** (note ids do not exist until a real add). `bulkUpdateNoteFields` / `bulkAddTags` → `wouldUpdate` is the **list of note ids** that would be written (ids are known). `skipped` is identical in shape and reason strings to the real path. `undoEntry` is always `null`.
+- `bulkAddTags` dry run: notes already having every tag appear in **neither** list (same as real mode).
+- Hard parameter errors (`"invalid parameter: notes: list required"` etc.) raise exactly as in real mode — dryRun only suppresses writes, not validation errors.
+
+**Zero-mutation guarantees (provable)** — under `dryRun: true`: no `col.add_note` / `col.update_note` call; no `add_custom_undo_entry` (the lazy `target` is never reached), so `col.undo_status()` is bit-identical before/after; no media write — the `bulkAddNotes` wrapper **skips `_plusEmbedNoteMedia`** because upstream media embedding stores files (consequence, documented limitation: notes carrying `audio`/`video`/`picture` keys are validated on their fields **as submitted**, without media-filename substitution; the real run's substituted fields could in principle differ for first-field emptiness/duplicate checks). `atomic` is accepted but irrelevant (no write-time hard-error path can fire).
+
+**What a dry run cannot predict** — write-time hard errors (the `atomic=false` skipped entries produced by an exception inside the write block). A dry-run "would" verdict is a validation verdict, not a transaction guarantee.
+
+**Edge cases tests must cover** — mixed batch (valid + duplicate + unknown model + empty first field) → `wouldAdd` counts only the valid ones, `skipped` reasons identical to a real run on the same batch; note count / field values / tags unchanged in the DB after each dry call; `undo_status()` unchanged (no entry created, not even an empty one); dry-then-real sequence: the real run's `added`/`updated` lengths match the dry prediction; `bulkAddTags` dry run omits already-tagged notes from both lists; empty `notes` list → `{wouldAdd: 0, skipped: [], undoEntry: null}`; hard param errors still raise under dryRun.
+
+## 16. `bulkSuspend` & `bulkSetDueDate` (spec revision 4, 2026-08-11)
+
+Two scheduler bulk actions, bringing the action count to sixteen. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. Both follow the §3.3 undo conventions with new entry names `"AnkiConnect Plus: Bulk Suspend"` / `"AnkiConnect Plus: Bulk Due Date"`, and both share an id-precheck helper: input `cardIds` are **deduplicated (first occurrence wins) and filtered to existing cards** via `col.get_card` (read-only) before any op — unknown ids are silently dropped, never an error, and backend behavior on unknown ids never enters the contract (Deviation #8).
+
+### 16.1 `bulkSuspend`
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `cardIds` | [int] | required | Deduplicated; unknown ids dropped. |
+| `suspend` | bool | `true` | `true`: suspend. `false`: unsuspend (backend restore op — **also unburies** buried cards; documented backend behavior). |
+
+**Returns**
+
+```json
+{"changed": 2, "undoEntry": "AnkiConnect Plus: Bulk Suspend"}
+```
+- `changed`: cards whose state actually changed. Suspend direction: backend-authoritative (`OpChangesWithCount.count`); already-suspended cards do not count, buried cards do (they become suspended). Unsuspend direction: precheck count of cards whose queue was negative (suspended −1, sibling-buried −2, manually buried −3) — exactly the set the restore op changes (Deviation #8).
+- `changed: 0` → `undoEntry: null` and the undo stack is untouched (a no-op batch is skipped before any op; a backend-reported 0 pops the empty custom entry, Deviation #7 precedent).
+
+**Anki API calls** — `col.get_card(cid)` precheck (`NotFoundError` → drop); `col.sched.suspend_cards(ids) -> OpChangesWithCount` (`SP/anki/scheduler/base.py:153-156`); `col.sched.unsuspend_cards(ids) -> OpChanges` (`base.py:150-151`, backend `restore_buried_and_suspended_cards`); undo per §3.3: `add_custom_undo_entry` **before** the op (the op must merge into it), `merge_undo_entries` after. Only cards that would change are passed to the op.
+
+**Error cases** — `"invalid parameter: cardIds: ints required"`; `"invalid parameter: suspend: boolean required"`; unexpected op failure → `"bulkSuspend failed (batch reverted): <err>"` (custom entry reverted).
+
+**Edge cases tests must cover** — suspend 2 new cards (+1 bogus id in the list) → `changed: 2`, both queues −1, `undo_status().undo` = the entry name, single `col.undo()` restores both queues and pops the entry; suspending an already-suspended card → `changed: 0`, `undoEntry: null`, undo stack unchanged; unsuspend the suspended pair → `changed: 2`, queues restored; unsuspend with nothing suspended → `changed: 0`, no op; duplicate ids counted once; empty `cardIds` → `{changed: 0, undoEntry: null}`.
+
+### 16.2 `bulkSetDueDate`
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `cardIds` | [int] | required | Deduplicated; unknown ids dropped. |
+| `days` | str | required | Backend grammar: `"0"` = due today, `"5"` = in 5 days, `"1-7"` = uniform-random per card in the range, `"3!"` = also force interval to 3 days (probe-verified). Bad strings raise. |
+
+**Returns**
+
+```json
+{"changed": 3, "undoEntry": "AnkiConnect Plus: Bulk Due Date"}
+```
+- `changed` = count of existing (deduplicated) cards passed to the op — `set_due_date` applies to every one regardless of current state, turning new cards into review cards (probe: new 0/0 → `type=2 queue=2 ivl=1`) (Deviation #8). No existing cards → `{changed: 0, undoEntry: null}`, no op.
+
+**Anki API calls** — `col.get_card` precheck; `col.sched.set_due_date(card_ids, days) -> OpChanges` (`SP/anki/scheduler/base.py:205-227`; the optional `config_key` is not used — no config default is read or written); undo per §3.3 (entry created before the op, merged after). The `days` grammar is pre-validated in core (`re.fullmatch(r'[0-9]+(?:-[0-9]+)?!?', days)` — ASCII digits only, matching what the backend actually accepts) **before** `add_custom_undo_entry`, so a bad string raises `"invalid parameter: days: <bad string>"` with the undo stack genuinely untouched (popping an empty custom entry via `col.undo()` would push a phantom Redo item). The `anki.errors.InvalidInput` handler (message = the bad string; empty custom entry popped, error re-raised house-style) remains as a backstop for grammar drift only.
+
+**Error cases** — `"invalid parameter: cardIds: ints required"`; `"invalid parameter: days: string like \"0\" or \"1-7\" required"` (non-string or empty); `"invalid parameter: days: <bad string>"` (grammar rejected by core's pre-validation — same message shape as the backend's InvalidInput, whose message is the echoed bad string; undo stack left untouched, verified bit-identical `undo_status()`); unexpected op failure → `"bulkSetDueDate failed (batch reverted): <err>"`.
+
+**Edge cases tests must cover** — `"0"` on a new card → due today, `type=2 queue=2`, single `col.undo()` restores the new state and pops the entry; `"1-7"` on several cards → each due within [1,7] days; `"3!"` → due 3 and `ivl` 3; `"bogus"` → `invalid parameter: days:` error AND `undo_status()` unchanged (no empty entry left); only-bogus ids → `{changed: 0, undoEntry: null}`; duplicate ids counted once.
+
+## 17. `exportDeckApkg` (spec revision 4, 2026-08-11)
+
+Export one deck (including its subdecks) to an `.apkg` file on disk, bringing the action count to seventeen. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. Runs on the **open** collection (no close/reopen — that is only needed for full `.colpkg` exports); media is written synchronously into the zip during the call.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `deckName` | str | required | Must exist (`col.decks.id_for_name`); export covers the deck **and all its subdecks** (backend `DeckIdLimit` semantics). |
+| `outPath` | str | `null` | Target file path (`~` expanded). Default: `~/Downloads/<sanitized-deck>-<YYYY-MM-DD>.apkg` (`core.EXPORT_DEFAULT_DIR`). The parent directory must already exist. |
+| `includeScheduling` | bool | `true` | Maps to proto `with_scheduling`. `false` exports notes/cards as new. |
+| `includeMedia` | bool | `true` | Maps to proto `with_media`. `false` still writes an (empty) `media` zip member. |
+
+**Returns**
+
+```json
+{"path": "/Users/mattyc/Downloads/HA2-PI-7-2026-08-11.apkg", "sizeBytes": 152344, "notesExported": 214}
+```
+- `path`: the file actually written (after collision suffixing). `sizeBytes`: `os.path.getsize` of it. `notesExported`: the backend's return value (number of notes in the package) — harmless extension beyond the locked `{path, sizeBytes}` shape, kept because the count is authoritative and free.
+
+**Filename semantics (exact)** — sanitized stem: `re.sub(r'[^\w.-]+', '-', deckName).strip('-.')`, falling back to `"deck"` when nothing survives (`\w` is unicode-aware: unicode letters/digits/underscore, dot, dash survive; `::`, spaces, and runs of other characters collapse to single dashes — `"HA2::PI 7"` → `"HA2-PI-7"`). **Never overwrite**: while the target exists, `-2`, `-3`, … is appended before the extension (`report.apkg` → `report-2.apkg`). The exists-check→write sequence is race-free per §3.1 (handlers serialized on the main thread).
+
+**Anki API calls** — `col.decks.id_for_name(deckName)`; `col.export_anki_package(out_path=..., options=..., limit=anki.collection.DeckIdLimit(did)) -> int` (number of notes exported; `SP/anki/collection.py:367-374`, kw-only); `options = anki.collection.ExportAnkiPackageOptions(with_scheduling=includeScheduling, with_deck_configs=False, with_media=includeMedia, legacy=False)` (proto fields per `SP/anki/_backend/import_export_pb2.pyi:250-268`). Fixed choices, documented: `with_deck_configs=False` (deck presets are never exported — matches Anki's own dialog default and keeps imports from mutating the receiving collection's presets); `legacy=False` (modern zstd package, Anki 2.1.50+; zip members `meta`/`collection.anki21b`/`collection.anki2`/`media`+numbered files).
+
+**Order of operations** — all validation (param types, deck lookup, output-directory existence) before any filesystem write; then collision suffixing; then the export call. The export itself is read-only with respect to the collection: no undo entry is created and `undo_status()` is unchanged (tests assert this).
+
+**Error cases** — `"invalid parameter: deckName: string required"` (non-string or empty); `"deck was not found: <name>"`; `"invalid parameter: outPath: string required"` (non-string or empty string); `"invalid parameter: outPath: is a directory: <path>"` (outPath resolves to an existing directory, or ends in a path separator — outPath must be a file path; without this guard the collision loop would write a surprise sibling like `<dir>-2`); `"invalid parameter: includeScheduling: boolean required"`; `"invalid parameter: includeMedia: boolean required"`; `"output directory was not found: <dir>"`; backend export failures surface through the envelope verbatim.
+
+**Edge cases tests must cover** — export of a small deck with a media-bearing note → file exists, `sizeBytes` matches on-disk size, zip members include `media`, `notesExported` correct; subdeck note included when exporting the parent; repeat export to the same path → `-2` (then `-3`) suffix, first file untouched; `includeMedia: false` → smaller file, media member empty; `includeScheduling: false` accepted; unknown deck / bad outPath dir → error with no file written; sanitized default filename for a `::`-nested deck name; undo queue untouched.
