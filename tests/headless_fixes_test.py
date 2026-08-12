@@ -83,7 +83,7 @@ def test1_bad_days_leaves_undo_stack_untouched():
         except AssertionError:
             raise
         except Exception as e:
-            assert str(e).startswith("invalid parameter: days:"), (bad, str(e))
+            assert str(e).startswith("[invalid_param] invalid parameter: days:"), (bad, str(e))
         after = undo_snapshot()
         assert after == before, (
             "undo_status changed after bad days %r: %r -> %r" % (bad, before, after))
@@ -91,7 +91,7 @@ def test1_bad_days_leaves_undo_stack_untouched():
     try:
         core.bulk_set_due_date(col, [cid], "abc")
     except Exception as e:
-        assert str(e) == "invalid parameter: days: abc", str(e)
+        assert str(e) == "[invalid_param] invalid parameter: days: abc", str(e)
 
 
 # ---------------------------------------------------------------- test 2
@@ -119,7 +119,7 @@ def test3_export_rejects_directory_outpath():
         except AssertionError:
             raise
         except Exception as e:
-            assert str(e).startswith("invalid parameter: outPath: is a directory:"), (bad, str(e))
+            assert str(e).startswith("[invalid_param] invalid parameter: outPath: is a directory:"), (bad, str(e))
         assert sorted(os.listdir(SCRATCH)) == siblings_before, "sibling file written for %r" % bad
         assert sorted(os.listdir(target_dir)) == inside_before, "file written inside dir for %r" % bad
 
@@ -132,7 +132,7 @@ def test4_export_rejects_empty_outpath():
     except AssertionError:
         raise
     except Exception as e:
-        assert str(e) == "invalid parameter: outPath: string required", str(e)
+        assert str(e) == "[invalid_param] invalid parameter: outPath: string required", str(e)
 
 
 # ---------------------------------------------------------------- test 5

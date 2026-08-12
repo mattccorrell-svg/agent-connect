@@ -484,6 +484,9 @@ def test3_ankihub_addon_signature_gate():
 # wrapper static checks: ast over plus.py, no instantiation
 
 def _plus_mixin_api_methods():
+    # api-marking decorators: bare @util.api() (pre-SPEC-25) or @plus_api()
+    # (SPEC 25 — plus_api wraps every action in the stable-error-code catch
+    # and applies util.api() itself, so it IS the api marker now)
     with open(PLUS_PATH, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     mixin = next(node for node in tree.body
@@ -493,11 +496,15 @@ def _plus_mixin_api_methods():
         if not isinstance(node, ast.FunctionDef):
             continue
         for dec in node.decorator_list:
-            if (isinstance(dec, ast.Call)
-                    and isinstance(dec.func, ast.Attribute)
-                    and dec.func.attr == "api"
-                    and isinstance(dec.func.value, ast.Name)
-                    and dec.func.value.id == "util"):
+            is_util_api = (isinstance(dec, ast.Call)
+                           and isinstance(dec.func, ast.Attribute)
+                           and dec.func.attr == "api"
+                           and isinstance(dec.func.value, ast.Name)
+                           and dec.func.value.id == "util")
+            is_plus_api = (isinstance(dec, ast.Call)
+                           and isinstance(dec.func, ast.Name)
+                           and dec.func.id == "plus_api")
+            if is_util_api or is_plus_api:
                 api_methods[node.name] = node
     return api_methods
 
@@ -515,9 +522,10 @@ def _arg_spec(fn_node):
 
 def test5_wrapper_static_checks():
     api_methods = _plus_mixin_api_methods()
-    # PLUS_ACTIONS lists exactly 22 actions == the api-decorated mixin methods
-    assert len(core.PLUS_ACTIONS) == 22, core.PLUS_ACTIONS
-    assert len(set(core.PLUS_ACTIONS)) == 22, "duplicate action names"
+    # PLUS_ACTIONS lists exactly 26 actions == the api-decorated mixin methods
+    # (26 = 24 + round-2 SPEC 22/23: mediaExists, storeMediaFilesBulk)
+    assert len(core.PLUS_ACTIONS) == 26, core.PLUS_ACTIONS
+    assert len(set(core.PLUS_ACTIONS)) == 26, "duplicate action names"
     assert set(api_methods) == set(core.PLUS_ACTIONS), (
         "PLUS_ACTIONS vs @util.api methods mismatch: only-in-actions=%s "
         "only-in-mixin=%s" % (sorted(set(core.PLUS_ACTIONS) - set(api_methods)),
@@ -551,6 +559,38 @@ def test5_wrapper_static_checks():
         assert node.args.vararg is None and node.args.kwarg is None, action
 
 
+def test5b_signature_string_docs():
+    # SPEC 4.9 edge case: every actionDocs `params` string matches the
+    # wrapper's real signature. plus.py is loaded as a REAL module through a
+    # synthetic package (types.ModuleType with __path__ only — connect_plus's
+    # __init__.py, which boots the add-on against aqt.mw, never runs), so this
+    # exercises the LIVE util.api()-decorated methods and the LIVE
+    # _signature_string. If util.api() ever gains a wrapper that destroys
+    # inspect.signature (functools-less, or any *args/**kwargs shim), every
+    # params string silently degrades — this is the alarm for that.
+    import types
+    pkg_name = "ancp_sig_pkg"
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [os.path.join(REPO, "connect_plus")]
+        sys.modules[pkg_name] = pkg
+    plus = importlib.import_module(pkg_name + ".plus")
+
+    api_methods = _plus_mixin_api_methods()
+    mixin = plus.PlusMixin()  # no __init__; never dispatched, only reflected
+    for name in core.PLUS_ACTIONS:
+        arg_names, ast_defaults = _arg_spec(api_methods[name])
+        assert arg_names and arg_names[0] == "self", (name, arg_names)
+        expected = ", ".join(
+            "%s=%s" % (p, json.dumps(ast_defaults[p])) if p in ast_defaults else p
+            for p in arg_names[1:])
+        rendered = plus._signature_string(getattr(mixin, name))
+        assert rendered == expected, (name, rendered, expected)
+        # the bound method really excludes self and exposes the AST params
+        assert list(inspect.signature(getattr(mixin, name)).parameters) == \
+            arg_names[1:], name
+
+
 # ================================================================ run
 run("test1a_sync_enum_maps", test1a_sync_enum_maps)
 run("test1b_local_dirty_lifecycle", test1b_local_dirty_lifecycle)
@@ -564,6 +604,7 @@ run("test2e_source_required_decision", test2e_source_required_decision)
 run("test4_aqt_signature_compat", test4_aqt_signature_compat)
 run("test3_ankihub_addon_signature_gate", test3_ankihub_addon_signature_gate)
 run("test5_wrapper_static_checks", test5_wrapper_static_checks)
+run("test5b_signature_string_docs", test5b_signature_string_docs)
 
 
 def test6_no_network_no_entry_point():

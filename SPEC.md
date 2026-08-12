@@ -1,6 +1,6 @@
 # AnkiConnect Plus — Implementation Specification
 
-Version: 1.0.0 (spec revision 1, 2026-08-11)
+Version: 1.0.0 (spec revision 11, 2026-08-12 — revision 7 field-feedback amendments to §§4.2, 4.3, 4.7, 4.9, 12, 13, 15; revision 8 adds the two field-feedback actions §§20–21, `checkDeckIntegrity` and `bulkReplaceInFields`; revision 9 (round-2 field feedback, 2026-08-12) adds `mediaExists` and `storeMediaFilesBulk` (§§22–23) and the cross-cutting `undoLabel` param (§24, amending §§3.3, 4.4, 4.6 — §4.6's return changing from `null` to `{undoEntry}` is one of the round's TWO deliberate breaking contract changes, beside §25's error prefix); revision 10 (round-2 field feedback, 2026-08-12) adds the `diff`/`maxPreview` dry-run preview on `bulkUpdateNoteFields` (§§4.2, 15), stable machine-parseable error codes on every raised Plus error (§25, amending §3.2 and every action's error list — the round's second deliberate breaking change), and the discoverability lock (§4.9 `recipes`, §13 raw-fidelity-field-projection naming); revision 11 (round-2 fix pass, 2026-08-12) amends §§4.6/24 (no-op `updateImageOcclusionNote` returns `undoEntry: null` instead of echoing an unrelated stale entry) and §15/§4.9 (duplicate-note-id dry-run parity caveat on `bulkUpdateNoteFields`); sections carry their own revision markers)
 Target Anki: 25.09.4 (Qt6, python 3.13). Fork of AnkiConnect (GPLv3) by Alex Yatskov / FooSoft.
 Working copy: `/Users/mattyc/Downloads/anki-connect-plus/connect_plus/`
 Venv python for all headless execution/tests: `/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python`
@@ -8,7 +8,7 @@ Anki packages: `/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv
 
 HARD RULES (repeated from project charter, enforced by this spec):
 - Never modify anything under `~/Library/Application Support/Anki2/` and never write to the user's real collection during development/testing. All tests run against scratch `.anki2` collections.
-- Raw `col.db` **writes are forbidden everywhere** in this codebase. Read-only `SELECT` statements are allowed only where this spec explicitly says so (`queryRevlog`, the bulkAddNotes csum precheck, note-id/card-id location selects, and the §18 sync dirtiness select `select ls, mod from col`). Rationale: raw non-select SQL through `DBProxy` wipes the entire undo queue, and raw note updates bypass `mod`/`usn` bookkeeping, silently breaking sync (verified in research).
+- Raw `col.db` **writes are forbidden everywhere** in this codebase. Read-only `SELECT` statements are allowed only where this spec explicitly says so (`queryRevlog`, the bulkAddNotes csum precheck, note-id/card-id location selects, the §18 sync dirtiness select `select ls, mod from col`, and the §20 integrity-audit scope/note/ord selects). Rationale: raw non-select SQL through `DBProxy` wipes the entire undo queue, and raw note updates bypass `mod`/`usn` bookkeeping, silently breaking sync (verified in research).
 - Never run `git commit` from automation.
 
 ---
@@ -125,12 +125,13 @@ Nothing else in `__init__.py` / `web.py` / `edit.py` / `util.py` changes.
   - The "snapshot max(id) → act → select new id" pattern used by `addImageOcclusionNote` is race-free because nothing else can run between the two selects.
 - New actions inherit upstream's envelope, apiKey check, CORS gate, and `multi` behavior unchanged (`web.py:164-212`, `__init__.py:106-147`). With `version >= 5` responses are `{"result": ..., "error": null}`; errors are `{"result": null, "error": str(exception)}`, HTTP always 200 (403 only for CORS-denied).
 
-### 3.2 Error style
+### 3.2 Error style (amended 2026-08-12, spec revision 10: stable error codes — see §25)
 
-- All action errors are `raise Exception("<message>")`. Message templates are specified per action. Where a JSON report is embedded, it is `json.dumps(report, separators=(",", ":"))` appended after a fixed prefix so callers can `split(": ", 1)[1]` and parse.
-- Type/param validation errors: `Exception("invalid parameter: <name>: <why>")`.
+- All action errors are raised exceptions whose message is `"[<code>] <message>"`: a **stable machine-parseable code prefix** (§25 vocabulary) followed by the pre-revision-10 message body **unchanged**. Raised as `core.PlusError(code, message)`; anything unexpected escaping an action is re-raised by the `plus_api` wrapper as `[internal]` (§25). Message templates are specified per action. Where a JSON report is embedded, it is `json.dumps(report, separators=(",", ":"))` appended after a fixed prefix so callers can `split(": ", 1)[1]` and parse (the bracketed code contains no `": "`, so this parse rule survives revision 10 unchanged).
+- Type/param validation errors: `"[invalid_param] invalid parameter: <name>: <why>"`.
+- **Per-item error strings embedded in results** (`skipped[].reason`, `thumbnails[].error`, `stored[].error`, `cards[].error`, …) are NOT raises and carry **no** code prefix — unchanged from earlier revisions.
 
-### 3.3 Undo conventions
+### 3.3 Undo conventions (amended 2026-08-12, spec revision 9: `undoLabel`)
 
 - Bulk actions use the probe-verified pattern:
   ```python
@@ -145,6 +146,7 @@ Nothing else in `__init__.py` / `web.py` / `edit.py` / `util.py` changes.
   - `bulkAddTags` → `"AnkiConnect Plus: Bulk Tags"`
 - Atomic revert: after merging, a single `col.undo()` reverts the whole batch (probe-verified: one undo reverted 3 adds + 1 update). Guard: only call `col.undo()` if at least one write happened AND `col.undo_status().undo == name`.
 - Reminder: any non-`select` raw SQL wipes the undo queue (probe-verified). This is one of the reasons raw writes are banned.
+- **`undoLabel` (spec revision 9, see §24):** every Plus action that creates an undo entry accepts an optional `undoLabel` (default `null`). When given, `core.sanitize_undo_label` turns it into `"AnkiConnect Plus: " + <label>` (whitespace runs — newlines included — collapsed to single spaces, ends stripped, label capped at 80 chars), and that name replaces the action's default entry name everywhere the name is used: entry creation, merge target, atomic revert, and the response's `undoEntry` field. When `null`, the default names above are byte-for-byte unchanged. The `undoEntry` response field always reports the **actual** final entry name.
 
 ---
 
@@ -189,7 +191,7 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 3. Resolution pass (no writes): resolve model + deck per note; compute `(mid, csum, stripped_first)` per note; batch-select existing csums per mid; mark each note `ok` / skip-reason. Track intra-batch `(mid, stripped_first)` seen-set: a second identical note in the same request is `"duplicate (within batch)"` unless that note allows duplicates. Empty `stripped_first` → `"empty first field"`.
 4. Write pass: for the first `ok` note, `target = col.add_custom_undo_entry("AnkiConnect Plus: Bulk Add")`. For each `ok` note: build Note, set fields/tags, `col.add_note(note, did)`, append `note.id` to `added`, `col.merge_undo_entries(target)`.
 5. Hard error during the write pass (unexpected exception from Anki):
-   - `atomic=true`: ensure entries are merged, then if `added` non-empty and `col.undo_status().undo == "AnkiConnect Plus: Bulk Add"`, call `col.undo()`. Then `raise Exception("bulkAddNotes failed (batch reverted): " + json.dumps({"failedIndex": i, "error": str(e), "addedBeforeRevert": len(added), "skipped": skipped}))`.
+   - `atomic=true`: ensure entries are merged, then if `added` non-empty and `col.undo_status().undo == "AnkiConnect Plus: Bulk Add"`, call `col.undo()`. Then raise `[batch_reverted]` (§25) `"bulkAddNotes failed (batch reverted): " + json.dumps({"failedIndex": i, "error": str(e), "addedBeforeRevert": len(added), "skipped": skipped})`.
    - `atomic=false`: record `{"index": i, "reason": str(e)}` in `skipped`, continue.
    - Validation skips (duplicate/empty/missing model/deck/field) are **never** hard errors in either mode — they always go to `skipped`.
 
@@ -208,7 +210,7 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 - HTML in fields preserved verbatim; unicode fields; tags list applied.
 - 300-note batch completes well under 1 s.
 
-### 4.2 `bulkUpdateNoteFields`
+### 4.2 `bulkUpdateNoteFields` (amended 2026-08-12, spec revision 7: no-op detection; revision 10: `diff` dry-run preview)
 
 **Params**
 
@@ -216,9 +218,13 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 |---|---|---|---|
 | `notes` | array of `{id: int, fields?: {FieldName: html}, tags?: [str]}` | required | `fields` updates only the named fields; `tags`, when present, **replaces** the note's whole tag list. At least one of `fields`/`tags` must be present per entry. |
 | `atomic` | bool | `true` | Same contract as bulkAddNotes. |
-| `dryRun` | bool | `false` | `true`: run the identical per-entry validation, write nothing, return `{wouldUpdate, skipped, undoEntry: null}` — see §15. |
+| `dryRun` | bool | `false` | `true`: run the identical per-entry validation + no-op detection, write nothing, return `{wouldUpdate, unchanged, skipped, undoEntry: null}` — see §15. |
+| `diff` | bool | `false` | Revision 10. **Only valid with `dryRun: true`** — `diff: true` on a real run raises `"[invalid_param] invalid parameter: diff: only valid with dryRun"` (diff is a preview feature; the real run stays lean). When set, the dry response additionally carries `preview` + `previewTruncated` — see §15. |
+| `maxPreview` | int | `20` | Revision 10. Cap on `preview` entries (≥ 0); an entry is one **changed field**, so one note can contribute several. Same knob as §21's. Validated on every call. |
 
-**Returns** `{"updated": [noteIds], "skipped": [{"index", "reason"}], "undoEntry": "AnkiConnect Plus: Bulk Update" | null}`
+**Returns** `{"updated": [noteIds actually written], "unchanged": [noteIds whose requested values already matched], "skipped": [{"index", "reason"}], "undoEntry": "AnkiConnect Plus: Bulk Update" | null}` (`undoEntry` is `null` whenever `updated` is empty — nothing was written).
+
+**Shared no-op rule (revision 7; same rule as 4.3 `bulkAddTags`)** — an entry whose requested `fields` values ALL byte-match the note's current values AND whose `tags` (when present) equal the note's current tag list (exact list comparison, order-sensitive; Anki normalizes/sorts tags on write — probe-verified `["b","a"]` stores as `["a","b"]` — so re-sending the stored list no-ops while a re-ordered list is written and re-normalized) is **not written**: it creates no undo entry and its id is reported in `unchanged` instead of `updated`. Rationale (field feedback): the backend already no-ops byte-identical `update_note` calls physically, so the old behavior reported a write — and pushed an undo entry — that never happened; the response must tell the caller what was done, not what was asked. NOTE this narrows the meaning of `updated` (previously = attempted, revision 1 said "all values identical → still counts as updated"): the one deliberately non-additive change of revision 7.
 
 **Anki API calls**
 
@@ -226,9 +232,9 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 - Field membership: `name in note` (Note supports `__contains__`); unknown → skip `"field was not found in note: <name>"`.
 - `col.update_note(note)` — creates "Update Note" entry (do NOT pass `skip_undo_entry=True`; we merge instead), merged per §3.3.
 
-**Algorithm** — mirror of 4.1: validate → per-entry try: load note, apply fields/tags, detect no-op (all values identical → still counts as updated; simplicity over cleverness), `col.update_note`, merge. Lazy undo entry `"AnkiConnect Plus: Bulk Update"`. Atomic revert + error report identical to 4.1 with prefix `"bulkUpdateNoteFields failed (batch reverted): "`.
+**Algorithm** — mirror of 4.1: validate → per-entry: load note, whole-entry field validation, no-op check (read-only, shared by the dry and real paths — see §15) → try: apply fields/tags, `col.update_note`, merge. Lazy undo entry `"AnkiConnect Plus: Bulk Update"`. Atomic revert + error report identical to 4.1 with prefix `"[batch_reverted] bulkUpdateNoteFields failed (batch reverted): "` (§25).
 
-**Edge cases** — missing note id skipped; unknown field skipped without partial application of that entry's other fields (validate the whole entry before mutating the Note object); tags-only update; fields-only update; entry with neither `fields` nor `tags` → skip `"invalid parameter: notes[i]: fields or tags required"`; atomic revert restores original field values and tags; duplicate ids in one batch (second update wins, both reported in `updated`).
+**Edge cases** — missing note id skipped; unknown field skipped without partial application of that entry's other fields (validate the whole entry before mutating the Note object); tags-only update; fields-only update; entry with neither `fields` nor `tags` → skip `"invalid parameter: notes[i]: fields or tags required"`; atomic revert restores original field values and tags; duplicate ids in one batch (second update wins; a later entry that re-requests values the note already has lands in `unchanged`); batch of only no-op entries → `updated: []`, `undoEntry: null`, undo stack untouched.
 
 ### 4.3 `bulkAddTags`
 
@@ -243,9 +249,9 @@ Add many notes with one undo entry, fast duplicate pre-check, and per-note error
 
 **Returns** `{"updated": [noteIds that actually changed], "skipped": [{"index", "reason"}], "undoEntry": "AnkiConnect Plus: Bulk Tags" | null}`
 
-**Anki API calls** — per note id: `col.get_note(nid)` (NotFoundError → skip `"note was not found: <id>"`); `note.has_tag(t)` / `note.add_tag(t)`; if any tag was actually added, `col.update_note(note)` + merge. Notes already having all tags are not written (and appear in neither list — count them in `updated`? No: spec decision — they are returned in `updated` **only if written**; unchanged notes are simply omitted from both lists; tests assert this).
+**Anki API calls** — per note id: `col.get_note(nid)` (NotFoundError → skip `"note was not found: <id>"`); `note.has_tag(t)` / `note.add_tag(t)`; if any tag was actually added, `col.update_note(note)` + merge. Notes already having all tags are not written (and appear in neither list — count them in `updated`? No: spec decision — they are returned in `updated` **only if written**; unchanged notes are simply omitted from both lists; tests assert this). *(Revision 7 note: this only-write-what-changed rule is now shared with §4.2 `bulkUpdateNoteFields`, which additionally reports its no-op ids in an `unchanged` list; this action's shape is unchanged.)*
 
-Single undo entry `"AnkiConnect Plus: Bulk Tags"` (lazy). Atomic contract identical, prefix `"bulkAddTags failed (batch reverted): "`.
+Single undo entry `"AnkiConnect Plus: Bulk Tags"` (lazy). Atomic contract identical, prefix `"[batch_reverted] bulkAddTags failed (batch reverted): "` (§25).
 
 **Edge cases** — tag already present on all notes → no writes, `undoEntry: null`; mixed present/absent; multi-tag string `"a b"` vs list `["a","b"]` equivalence; nonexistent note id; undo reverts tag additions; tag with `::` hierarchy adds verbatim.
 
@@ -265,7 +271,7 @@ Creates a **native** (built-in "Image Occlusion", `originalStockKind == 6`) IO n
 | `deckName` | str | required | Must exist (`col.decks.id_for_name`); no auto-create. |
 | `hideAllGuessOne` | bool | `true` | `true` appends `:oi=1` to every serialized shape ("Hide all, guess one"); `false` omits it ("Hide one, guess one"). Ignored when `occlusions` is a string. |
 
-**Returns** `{"noteId": int, "cardIds": [int, ...]}` (cardIds ordered by card `ord`).
+**Returns** `{"noteId": int, "cardIds": [int, ...], "undoEntry": str}` (cardIds ordered by card `ord`). `undoEntry` (added 2026-08-12, spec revision 9, §24): the actual top-of-stack undo entry name — the backend's own entry (locale-dependent, e.g. "Image Occlusion") by default, or `"AnkiConnect Plus: <label>"` when `undoLabel` is given (the custom entry then wraps the add AND the deck move; one undo reverts both, probe- and test-verified).
 
 **Anki API calls** (exact)
 
@@ -280,7 +286,7 @@ Creates a **native** (built-in "Image Occlusion", `originalStockKind == 6`) IO n
 
 **Occlusion serialization** — see §5. Array validation: every rect needs all four of `left/top/width/height` as numbers; `0 <= left,top <= 1`, `0 < width,height <= 1` → else `"invalid parameter: occlusions[i]: <why>"`. `ordinal` (int ≥ 0) optional; when absent, ordinals are assigned 1..N in array order. Explicit ordinals may repeat (shapes sharing an ordinal mask together on ONE card — probe-verified) and `0` means annotation-only (generates no card — probe-verified). Empty array → error `"invalid parameter: occlusions: at least one occlusion required"`.
 
-**Error cases** — `"invalid parameter: image: exactly one of path or data required"`; `"image file was not found: <path>"` (checked with `os.path.isfile` before any write); `"invalid parameter: image.data: invalid base64"`; `"invalid parameter: image.filename: required with data"`; `"deck was not found: <name>"`; validation errors above. All validation happens **before** the first write so failures leave no partial state.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: image: exactly one of path or data required"`; `[not_found]` `"image file was not found: <path>"` (checked with `os.path.isfile` before any write); `[invalid_param]` `"invalid parameter: image.data: invalid base64"`; `[invalid_param]` `"invalid parameter: image.filename: required with data"`; `[deck_not_found]` `"deck was not found: <name>"`; validation errors above (all `[invalid_param]`); `[not_found]` `"image occlusion notetype not found"`; `[internal]` `"image occlusion note was not created"`. All validation happens **before** the first write so failures leave no partial state.
 
 **Threading** — main thread; media write + backend add are fast (<50 ms typical).
 
@@ -316,7 +322,7 @@ Creates a **native** (built-in "Image Occlusion", `originalStockKind == 6`) IO n
 - `shape == "rect"`: `left/top/width/height` coerced to float (plus optional `angle`, `fill` passed through in `properties` if present). Non-rect shapes (`ellipse`, `polygon`, `text`): raw `properties` dict of name→string as returned by the backend (Deviation #3).
 - `occludeInactive` = backend's `occlude_inactive` (extension beyond the locked shape; harmless).
 
-**Anki API calls** — `resp = col.get_image_occlusion_note(NoteId(noteId))` (`SP/anki/collection.py:457`). `resp.WhichOneof("value")`: `"error"` → `raise Exception("could not read image occlusion note %d: %s" % (noteId, <error>))`; `"note"` → parse `resp.note`: `image_file_name`, `occlusions[]` (each: `ordinal`, `shapes[]` with `shape` str + `properties[]` name/value pairs), `header`, `back_extra`, `tags`, `occlude_inactive`. `image_data` bytes are **not** returned (use upstream `retrieveMediaFile` for bytes).
+**Anki API calls** — `resp = col.get_image_occlusion_note(NoteId(noteId))` (`SP/anki/collection.py:457`). `resp.WhichOneof("value")`: `"error"` → raise `[not_found]` (§25) `"could not read image occlusion note %d: %s" % (noteId, <error>)`; `"note"` → parse `resp.note`: `image_file_name`, `occlusions[]` (each: `ordinal`, `shapes[]` with `shape` str + `properties[]` name/value pairs), `header`, `back_extra`, `tags`, `occlude_inactive`. `image_data` bytes are **not** returned (use upstream `retrieveMediaFile` for bytes).
 
 **Edge cases** — note created by 4.4 round-trips (ordinals, coords ≈ within 1e-4, header, backExtra, tags, occludeInactive); editor-made note with ellipse/polygon/text parses without loss; non-IO noteId → the backend error path fires; nonexistent noteId → same; escaped `\:` in text values is unescaped by the backend before we see it (probe-verified round-trip).
 
@@ -332,13 +338,13 @@ Creates a **native** (built-in "Image Occlusion", `originalStockKind == 6`) IO n
 | `backExtra` | str | omit = keep | |
 | `tags` | [str] | omit = keep | Replaces the whole tag list when present. |
 
-**Returns** `null` (upstream update-action convention). Errors raise.
+**Returns** (changed 2026-08-12, spec revision 9, §24 — was `null` per the upstream update-action convention; nullability amended spec revision 11) `{"undoEntry": str | null}`: the actual top-of-stack undo entry name — the backend's own entry by default, or `"AnkiConnect Plus: <label>"` when `undoLabel` is given — or `null` when the update is a **no-op**: after omitted-param backfill every resolved value (occlusions string, header, backExtra, tags) already byte-matches the note, the backend performs zero undoable writes (rslib drops its own empty undo step), and the action returns before creating any entry, so it never echoes an unrelated pre-existing entry (revision 11; previously it reported whatever was on top of the stack) and never leaves an empty labeled entry behind. Errors raise.
 
 **Anki API calls** — the backend updater requires all fields, so omitted params are backfilled from current state read **directly from the note's fields** (exact, no lossy re-serialization): `note = col.get_note(nid)`; `idx = col._backend.get_image_occlusion_fields(note.mid)` → `ImageOcclusionFieldIndexes` with `.occlusions/.image/.header/.back_extra` ordinals (probe: 0/1/2/3); current occlusions string = `note.fields[idx.occlusions]`, etc.; current tags = `note.tags`. Then `col.update_image_occlusion_note(note_id, occlusions_str, header, back_extra, tags)` (`SP/anki/collection.py:462`) → `OpChanges`, own undo entry.
 
-**Edge cases** — header-only update leaves occlusion string byte-identical; occlusions array update regenerates cards (adding an ordinal grows card count, removing one empties/deletes — assert via card count after); tags-only; nonexistent note → NotFoundError surfaced as `"note was not found: <id>"`; non-IO note rejected before any write; single undo reverts; no `image` param exists (Deviation #2 — test that passing `image` raises TypeError via dispatch splat, which is acceptable: the enveloped error names the unexpected argument).
+**Edge cases** — header-only update leaves occlusion string byte-identical; occlusions array update regenerates cards (adding an ordinal grows card count, removing one empties/deletes — assert via card count after); tags-only; nonexistent note → NotFoundError surfaced as `"note was not found: <id>"`; non-IO note rejected before any write; single undo reverts; no-op update (values identical to current state — a re-sent unchanged header, or every param omitted) → `{undoEntry: null}` with the undo stack byte-untouched, both with and without `undoLabel` and with an unrelated marker entry already on the stack (revision 11); no `image` param exists (Deviation #2 — test that passing `image` raises TypeError via dispatch splat, which is acceptable: the enveloped error names the unexpected argument).
 
-### 4.7 `queryRevlog`
+### 4.7 `queryRevlog` (amended 2026-08-12, spec revision 7: pagination + truncation signal)
 
 Read-only review-history query. **The only SQL action; SELECT only.**
 
@@ -352,17 +358,23 @@ Read-only review-history query. **The only SQL action; SELECT only.**
 | `sinceMs` | int | omit | `revlog.id >= sinceMs` (inclusive; revlog id IS the review epoch-ms). |
 | `untilMs` | int | omit | `revlog.id < untilMs` (exclusive). |
 | `limit` | int | `5000` | Must be ≥ 1. Applied after ordering. |
+| `offset` | int | `0` | Must be ≥ 0 (revision 7). Rows skipped after ordering, before `limit` — page N is `offset = N·limit`. |
 
 Filters AND-combine; all omitted → whole table (limited).
 
-**Returns**
+**Returns** (revision 7: `total`/`truncated`/`nextOffset` added — the old `{rows}`-only shape could not distinguish "exactly `limit` rows exist" from silent truncation, which produced confidently wrong caller reports in the field)
 
 ```json
 {"rows": [{"id": 1712345678901, "cardId": 1690000000000, "noteId": 1690000000000,
            "ease": 3, "interval": 10, "lastInterval": -600, "factor": 2500,
-           "timeMs": 4200, "type": 1, "reviewedAt": 1712345678901}, ...]}
+           "timeMs": 4200, "type": 1, "reviewedAt": 1712345678901}, ...],
+ "total": 5541, "truncated": true, "nextOffset": 5000}
 ```
-`reviewedAt` duplicates `id` (both epoch-ms) per the locked shape. `noteId` is `null` for orphan revlog rows whose card was deleted. Field semantics (document in README): `interval`/`lastInterval` positive = days, negative = seconds; `factor` = SM-2 ease permille (0 for learning/manual; not scheduling-relevant under FSRS); `type`: 0 learning, 1 review, 2 relearning, 3 filtered/cram, 4 manual/forget, 5 rescheduled — stats-worthy rows are `type NOT IN (4, 5)`.
+- `rows`: unchanged in shape and order (chronological ascending).
+- `total` = full count of **distinct** matching revlog rows, before `offset`/`limit` (one cheap `COUNT(*)` per chunk query under the same WHERE; `cardIds`/`noteIds` are deduplicated before chunking — `dict.fromkeys`, order irrelevant since rows re-sort on `r.id` — so chunk pairs are disjoint and the counts sum exactly even when a duplicated id would otherwise straddle a chunk boundary; duplicate ids never duplicate rows).
+- `truncated` = more matching rows remain beyond this page (`offset + len(rows) < total`).
+- `nextOffset` = `offset + len(rows)` when `truncated`, else `null` — pass it back as `offset` to resume.
+- `reviewedAt` duplicates `id` (both epoch-ms) per the locked shape. `noteId` is `null` for orphan revlog rows whose card was deleted. Field semantics (document in README): `interval`/`lastInterval` positive = days, negative = seconds; `factor` = SM-2 ease permille (0 for learning/manual; not scheduling-relevant under FSRS); `type`: 0 learning, 1 review, 2 relearning, 3 filtered/cram, 4 manual/forget, 5 rescheduled — stats-worthy rows are `type NOT IN (4, 5)`.
 
 **SQL** (exact; ids validated as ints before interpolation of the placeholder list — values themselves always bound with `?`):
 
@@ -375,13 +387,13 @@ WHERE 1=1
   [AND (CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END) IN (?,...)]   -- deck filter; odid = home deck for cards currently in a filtered deck
   [AND r.id >= ?] [AND r.id < ?]
 ORDER BY r.id ASC
-LIMIT ?
+LIMIT ?  -- single chunk pair: LIMIT ? OFFSET ? pages in SQL; multi-chunk: each pair fetches its first offset+limit rows, the union is re-sorted and sliced [offset, offset+limit)
 ```
-via `col.db.all(sql, *args)` (`DBProxy`; plain selects do not touch the undo queue — probe-verified). Caveat to document: the deck filter reflects each card's **current** deck, not the deck at review time (revlog stores no deck).
+plus one `SELECT COUNT(*)` per chunk pair under the same WHERE (revision 7), via `col.db.all`/`col.db.scalar` (`DBProxy`; plain selects do not touch the undo queue — probe-verified). Caveat to document: the deck filter reflects each card's **current** deck, not the deck at review time (revlog stores no deck).
 
-**Error cases** — unknown deck; non-int in id lists → `"invalid parameter: cardIds: ints required"`; `limit < 1` → `"invalid parameter: limit: must be >= 1"`.
+**Error cases** (codes per §25) — unknown deck → `[deck_not_found]`; non-int in id lists → `[invalid_param]` `"invalid parameter: cardIds: ints required"`; `limit < 1` → `[invalid_param]` `"invalid parameter: limit: must be >= 1"`; bad `offset` → `[invalid_param]` `"invalid parameter: offset: int >= 0 required"`.
 
-**Edge cases** — empty result → `{"rows": []}`; limit truncation (insert 10, limit 5 → first 5 chronologically); since/until window boundaries (id == sinceMs included, id == untilMs excluded); deck filter includes subdeck reviews; noteIds filter excludes orphans, bare query includes them with `noteId: null`; learning rows have negative `interval`; undo queue untouched after the action (assert `undo_status()` unchanged).
+**Edge cases** — empty result → `{"rows": [], "total": 0, "truncated": false, "nextOffset": null}` (also the shape for an empty `cardIds`/`noteIds` list); limit truncation (insert 10, limit 5 → first 5 chronologically with `total: 10`, `truncated: true`, `nextOffset: 5`); result count exactly `limit` → `truncated: false`, `nextOffset: null`; `offset` past `total` → empty `rows`, `truncated: false`; `nextOffset` chaining walks the full set with no gaps or overlaps; since/until window boundaries (id == sinceMs included, id == untilMs excluded); deck filter includes subdeck reviews; noteIds filter excludes orphans, bare query includes them with `noteId: null`; learning rows have negative `interval`; undo queue untouched after the action (assert `undo_status()` unchanged).
 
 ### 4.8 `createBackup`
 
@@ -395,9 +407,9 @@ via `col.db.all(sql, *args)` (`DBProxy`; plain selects do not touch the undo que
 
 **Edge cases** — fresh scratch collection with changes → `true` and a `backup-*.colpkg` appears in the sibling `backups/` dir; immediate second call → `false` (probe-verified sequence); `force=false` respects the user's backup-interval config (may return `false`); backup write failure (unwritable folder) → exception surfaced in the envelope.
 
-### 4.9 `plusInfo`
+### 4.9 `plusInfo` (amended 2026-08-12, spec revision 7: `actionDocs`; revision 10: `recipes`)
 
-**Params** — none. Must work with **no profile open** (do not call `self.collection()`); implemented wholly in `plus.py` from `core` constants.
+**Params** — none. Must work with **no profile open** (do not call `self.collection()`); implemented wholly in `plus.py` from `core` constants + wrapper signatures.
 
 **Returns**
 
@@ -409,6 +421,12 @@ via `col.db.all(sql, *args)` (`DBProxy`; plain selects do not touch the undo que
   "actions": ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
               "addImageOcclusionNote", "getImageOcclusionNote", "updateImageOcclusionNote",
               "queryRevlog", "createBackup", "plusInfo"],
+  "actionDocs": {
+    "notesSlim": {
+      "summary": "Compact paginated note reader for LLM consumption: ...",
+      "params": "query=null, noteIds=null, fields=null, stripHtml=true, maxFieldLength=400, offset=0, limit=200"
+    }
+  },
   "docs": {
     "plus": "<DOCS_PLUS>",
     "upstream": "https://foosoft.net/projects/anki-connect/",
@@ -416,7 +434,17 @@ via `col.db.all(sql, *args)` (`DBProxy`; plain selects do not touch the undo que
   }
 }
 ```
-`apiVersion` from `util.setting('apiVersion')`. **Edge cases** — callable before profile load; callable through `multi`; action list exactly matches `core.PLUS_ACTIONS` (single source of truth — test asserts every listed name is a dispatchable `@util.api()` method).
+`apiVersion` from `util.setting('apiVersion')`. `actions` is kept as bare names for compatibility.
+
+**`actionDocs` (revision 7 — the discoverability fix)** — one entry per `PLUS_ACTIONS` name (`actionDocs` example above is elided to one entry): `summary` is the one-liner from `core.PLUS_ACTION_SUMMARIES` (a static dict beside `PLUS_ACTIONS`; keep both in lockstep), `params` is a JSON-flavored signature string generated at call time via `inspect.signature` on the bound `plus.py` wrapper (`self` already excluded on bound methods; defaults rendered with `json.dumps` so booleans/null read as JSON: `atomic=true`, `query=null`; the revision-10 `plus_api` error-code wrapper preserves the real signature via `functools.wraps`/`__wrapped__` — test-guarded). Rationale (field feedback): with bare action names only, an LLM caller could not discover that e.g. `notesSlim` has `stripHtml`/`maxFieldLength` and hand-rolled a worse bulk read. **Required-but-`None`-defaulted params (field feedback)**: the signature string cannot distinguish a genuine optional from a required-with-`None`-sentinel param (`field=null` on `bulkReplaceInFields` looks optional but is hard-required; same for the exactly-one-of `query`/`noteIds` pairs on `notesSlim`/`bulkReplaceInFields`) — so the `PLUS_ACTION_SUMMARIES` one-liner for any action with such params MUST name them as required; keep the summaries honest when adding actions.
+
+**`recipes` (revision 10 — the discoverability LOCK, round-2 field feedback)** — the response gains a top-level `recipes` list (`core.PLUS_RECIPES`, static — plusInfo keeps working before a profile is open) of `{name, description, example}` entries: cross-action call patterns callers repeatedly failed to assemble from per-action docs alone. `example` is a ready-to-send `{action, params}` object. Required minimum set (test-guarded):
+- **`raw field projection`** — the §13 raw-fidelity combination `fields=[...]` + `stripHtml=false` + `maxFieldLength=0` (named in the description with exactly those spellings), as the read-before-edit primitive;
+- **`verified-sync contract`** — §18.2's verified-synced iff `job.state == "done" && required == "no_changes" && mediaSyncing == false`;
+- **`dry-run-then-write pattern`** — §15's preview-first convention incl. `bulkUpdateNoteFields`' `diff: true` and (revision 11) §15's duplicate-note-id parity caveat;
+- **`undo-label convention`** — §24's `undoLabel` naming rule and the `undoEntry` reporting contract.
+
+**Edge cases** — callable before profile load (signature reflection touches no collection); callable through `multi`; action list exactly matches `core.PLUS_ACTIONS` (single source of truth — test asserts every listed name is a dispatchable `@util.api()` method); every `actionDocs` entry has a non-empty `summary` and a `params` string matching the wrapper's real signature.
 
 ---
 
@@ -570,7 +598,7 @@ Caveat (document in README too): passing an image-occlusion note in `noteIds` �
 
 **Order of operations** — all validation (filename, rect, `noteIds` types, and loading of every referenced note) happens **before the first write**. Then: media write, then note rewrites. A hard error during note updates reverts the merged undo entry (all note changes) and raises `"cropImage failed (note updates reverted): <err>"`; the new media file remains (media writes are not undoable; it is a new file only — harmless orphan, Check Media collects it).
 
-**Error cases** — `"invalid parameter: filename: string required"`; `"invalid parameter: filename: bare media filename required"`; `"media file was not found: <filename>"`; `"could not load image: <filename> (unsupported or corrupt format)"`; `"invalid parameter: rect: object required"` / `"... <key> must be a number"` / `"... left and top must be within 0-1"` / `"... width and height must be within 0-1"`; `"invalid parameter: rect: selects an empty area of <filename> (<W>x<H>)"`; `"could not encode cropped image as <fmt>: <filename>"`; `"invalid parameter: noteIds: ints required"`; `"note was not found: <id>"`.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: filename: string required"` / `"invalid parameter: filename: bare media filename required"`; `[not_found]` `"media file was not found: <filename>"`; `[unsupported_format]` `"could not load image: <filename> (unsupported or corrupt format)"`; `[invalid_param]` `"invalid parameter: rect: object required"` / `"... <key> must be a number"` / `"... left and top must be within 0-1"` / `"... width and height must be within 0-1"` / `"invalid parameter: rect: selects an empty area of <filename> (<W>x<H>)"`; `[unsupported_format]` `"could not encode cropped image as <fmt>: <filename>"`; `[invalid_param]` `"invalid parameter: noteIds: ints required"`; `[not_found]` `"note was not found: <id>"`; `[batch_reverted]` `"cropImage failed (note updates reverted): <err>"`.
 
 **Edge cases tests must cover** — crop of a known PNG yields exact pixel dims; original media file still present afterward; `noteIds` rewrite changes `<img src>` and returns the id, single `col.undo()` restores the field; note without any occurrence → untouched, omitted from `notesUpdated`; `banana.png` untouched when cropping `a.png`; rect clamping (`left+width > 1` crops to the image edge, never pads); `left = 1.0` → empty-area error; unknown filename / path-y filename / bad rect types → errors above with no writes; repeat crop with identical params dedups to the same `newFilename`.
 
@@ -599,7 +627,7 @@ Crop the base image of a **built-in IO note** and remap every occlusion rect int
 - Counters: `occlusionsKept` = shapes present in the updated note (**includes** the clipped ones); `occlusionsClipped ⊆ kept`; `kept + dropped` = original shape count.
 - `oi`/occlude-inactive is preserved: re-serialization uses `hide_all_guess_one = <note's occludeInactive>` from the §4.5 read. This is exact only when the per-shape `oi` flags are uniform (all shapes carry `oi=1`, or none do — the only states Anki's own editor produces, since it sets `oi` globally). Mixed per-shape `oi` on a hand-edited field is unrepresentable by the single note-level flag (the backend reports `occludeInactive = true` when ANY cloze carries `:oi=1`) and is refused, never silently homogenized.
 
-**Refusals (clear error, zero changes)**
+**Refusals (clear error, zero changes; all `[validation_error]` per §25)**
 - The crop would drop ALL occlusions → `"crop would remove all occlusions on note <id>"`.
 - The note contains non-rect shapes (`ellipse`/`polygon`/`text`, possible on editor-made notes per Deviation #3) → `"cropImageOcclusionImage supports rect occlusions only; note <id> contains a <shape> shape"`. Rationale: §5's serializer emits rects only; proceeding would silently destroy those shapes.
 - A rect carries properties other than `oi` (e.g. `angle`, `fill`) → `"cropImageOcclusionImage cannot preserve occlusion properties <names> on note <id>"`. Same rationale (v1 serializer does not emit them).
@@ -609,7 +637,7 @@ Crop the base image of a **built-in IO note** and remap every occlusion rect int
 
 **`cardIds`** — current card ids after the update, via the card-id location select (explicitly allowed read-only select, §4.4 precedent). Caveat (research-verified): if every shape of some ordinal was dropped, the backend does **not** delete that ordinal's now-empty card; its id still appears in `cardIds` and Empty Cards is the cleanup path. Document in README.
 
-**Error cases** — `"invalid parameter: noteId: int required"`; `"note was not found: <id>"`; `"note is not an image occlusion note: <id>"`; §4.5 read-error path; `"could not parse rect occlusion on note <id>"` (a backend rect shape whose left/top/width/height failed float parsing, i.e. the §4.5 parser fell back to raw properties); `"image occlusion note has no image file: <id>"`; all §11.1 media/rect/format errors; the refusals above.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: noteId: int required"`; `[not_found]` `"note was not found: <id>"`; `[validation_error]` `"note is not an image occlusion note: <id>"`; §4.5 read-error path (`[not_found]`); `[validation_error]` `"could not parse rect occlusion on note <id>"` (a backend rect shape whose left/top/width/height failed float parsing, i.e. the §4.5 parser fell back to raw properties); `[validation_error]` `"image occlusion note has no image file: <id>"`; all §11.1 media/rect/format errors (their §11.1 codes); the refusals above (`[validation_error]`); `[batch_reverted]` `"cropImageOcclusionImage failed (changes reverted): <err>"`.
 
 **Edge cases tests must cover** — rect fully inside → kept unclipped, coords remap exactly; rect straddling a crop edge → kept + clipped, clipped edge lands on the crop boundary (`left' == 0` etc.); rect fully outside → dropped; all-outside → refusal with note byte-identical; kept ordinals round-trip through §4.5 within 1e-4; empty-card gotcha surfaced in `cardIds`; single undo restores original image filename AND original rects; original media file untouched; mixed per-shape `oi` (hand-built occlusions string, `oi=1` on one cloze only) → refusal with note untouched.
 
@@ -622,7 +650,7 @@ Crop the base image of a **built-in IO note** and remap every occlusion rect int
 
 ---
 
-## 12. `renderCard` (spec revision 3, 2026-08-11)
+## 12. `renderCard` (spec revision 3, 2026-08-11; amended 2026-08-12, spec revision 7: `format` param + style/script clarification)
 
 First of three **read-only** actions (`renderCard`, `notesSlim`, `mediaThumbnails` — §§12–14) bringing the action count to fourteen. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. None of the three performs any collection write, media write, or undo-stack change; tests assert `undo_status()` unchanged after each call.
 
@@ -633,6 +661,7 @@ Render cards' question/answer HTML exactly as Anki's own template pipeline produ
 | name | type | default | notes |
 |---|---|---|---|
 | `cardIds` | [int] | required | Bad ids (and per-card render failures) become per-item `error` entries, never a hard failure. Empty list → `{"cards": []}`. |
+| `format` | str | `"html"` | Revision 7. `"html"` = raw rendered template HTML (byte-identical to pre-revision-7 output). `"body"` = `question`/`answer` with matched `<script>…</script>` and `<style>…</style>` blocks removed (regex, case-insensitive, dot-matches-newline, non-greedy; unclosed blocks are left in place). `"text"` = visible text only via the same backend strip helper `notesSlim` uses (`html_to_text_line`, media filenames preserved, cloze markup verbatim — §13 conventions). Bad value → hard error `"invalid parameter: format: one of html, body, text required"`. Applies to `question`/`answer` only; every other per-card field is unchanged and `css` is always returned separately. |
 
 **Returns**
 
@@ -643,20 +672,22 @@ Render cards' question/answer HTML exactly as Anki's own template pipeline produ
 ]}
 ```
 
-- `question`/`answer` are the rendered template HTML **without** the `<style>` wrapper; `css` is the notetype styling returned separately (clients wanting the `card.question()` equivalent concatenate `"<style>" + css + "</style>" + question`).
+- `question`/`answer` are the rendered template HTML **without** the notetype-CSS `<style>` wrapper; `css` is the notetype styling returned separately (clients wanting the `card.question()` equivalent concatenate `"<style>" + css + "</style>" + question`). **Clarification (revision 7, field-verified):** "without the `<style>` wrapper" refers ONLY to that notetype-CSS wrapper — `<style>`/`<script>` blocks **authored inside the card template itself** are part of the rendered HTML and are returned verbatim under `format: "html"` (on script-heavy notetypes like AnKing they can dominate the payload: a field case measured 76% of a 43 kB answer inside `<script>` tags). Callers that don't want them use `format: "body"` or `"text"` — an LLM consumer almost always wants `"text"`.
 - Audio/TTS: rendered text contains `[anki:play:q:<idx>]` markers in place of `[sound:...]` tags (backend behavior). The referenced filenames live in the render output's `question_av_tags`/`answer_av_tags` and are **not** returned in v1.
 - `deckName` is the card's current home deck (`odid` when in a filtered deck) via `col.decks.name(card.current_deck_id())`.
 - One entry per input id, in input order; duplicate ids render twice.
 
 **Anki API calls** — `col.get_card(cid)` (`NotFoundError` → per-item `"card was not found: <id>"`); `card.render_output()` (`SP/anki/cards.py:161-170`) → `TemplateRenderOutput` (`SP/anki/template.py:280-293`) with `question_text`/`answer_text`/`css`; `col.decks.name(card.current_deck_id())` (`SP/anki/decks.py:384-388`, `SP/anki/cards.py:194-195`); `card.note_type()["name"]` (`SP/anki/cards.py:180-181`, cached lookup). `anki.template` imports zero aqt — probe-verified headless render of Basic + Cloze cards.
 
-**Error cases** — hard (whole action): `"invalid parameter: cardIds: ints required"` (non-list, or any non-int/bool element). Per-item: `"card was not found: <id>"`; any per-card render exception → `"could not render card <id>: <err>"`.
+**Error cases** (codes per §25) — hard (whole action, both `[invalid_param]`): `"invalid parameter: cardIds: ints required"` (non-list, or any non-int/bool element); `"invalid parameter: format: one of html, body, text required"` (revision 7). Per-item (unprefixed, §3.2): `"card was not found: <id>"`; any per-card render exception → `"could not render card <id>: <err>"`.
 
-**Edge cases tests must cover** — Basic card renders (question contains the field text, css non-empty, `ord` 0); cloze question contains `class="cloze"` markup; mixed good/bad ids → per-item errors interleaved in input order with successful renders; a `[sound:...]` field renders with an `[anki:play:` marker in the text; undo queue untouched.
+**Edge cases tests must cover** — Basic card renders (question contains the field text, css non-empty, `ord` 0); cloze question contains `class="cloze"` markup; mixed good/bad ids → per-item errors interleaved in input order with successful renders; a `[sound:...]` field renders with an `[anki:play:` marker in the text; template-authored `<script>`/`<style>` blocks present under `format: "html"`, absent under `"body"` (surrounding HTML kept), and `"text"` returns visible text with no tags; bad `format` → hard error; undo queue untouched.
 
-## 13. `notesSlim` (spec revision 3, 2026-08-11)
+## 13. `notesSlim` (spec revision 3, 2026-08-11; amended 2026-08-12, spec revision 7: per-note `truncatedFields`; revision 10: raw-fidelity field projection named)
 
 Compact, paginated, HTML-stripped note reader designed for LLM consumption: deterministic order, bounded field lengths, one round trip. Read-only; issues no SQL.
+
+**Raw-fidelity field projection (revision 10 — discoverability lock, round-2 field feedback: callers failed to find this combination twice).** The combination `fields=[...]` + `stripHtml: false` + `maxFieldLength: 0` is THE supported way to read chosen fields' **exact stored HTML** — no stripping, no truncation, byte-identical to what `bulkUpdateNoteFields`/`bulkReplaceInFields` operate on. This combination is named ("raw-fidelity field projection") in `notesSlim`'s `PLUS_ACTION_SUMMARIES` one-liner (the §4.9 `actionDocs` surface) and repeated as the §4.9 `recipes` entry `raw field projection`; both are test-guarded so the naming cannot silently regress.
 
 **Params**
 
@@ -666,7 +697,7 @@ Compact, paginated, HTML-stripped note reader designed for LLM consumption: dete
 | `noteIds` | [int] | — | Explicit ids; page order = caller order (duplicates allowed and returned twice). |
 | `fields` | [str] | `null` | Field-name filter; `null` = all fields. Names not present on a note's model are simply absent for that note (a result set may span models) — never an error. |
 | `stripHtml` | bool | `true` | Strips via the backend single-line helper: media filenames preserved, `[sound:...]` tags kept, `<br>`/`<div>` boundaries become single spaces. `false` returns raw field HTML. |
-| `maxFieldLength` | int | `400` | Per-field character cap applied AFTER stripping (or to the raw HTML when `stripHtml: false` — may cut mid-tag; it is a preview); longer values are cut at the cap with `…` appended. `0` = no truncation. |
+| `maxFieldLength` | int | `400` | Per-field character cap applied AFTER stripping (or to the raw HTML when `stripHtml: false` — may cut mid-tag; it is a preview); longer values are cut at the cap with `…` appended. `0` = no truncation. Truncation is also signalled explicitly per note via `truncatedFields` (revision 7) — the `…` marker alone is ambiguous, since a field may genuinely end in `…`. |
 | `offset` | int | `0` | Offset into the full matched id list. |
 | `limit` | int | `200` | Must be ≥ 1; values above 2000 are silently clamped to 2000 (`core.NOTES_SLIM_LIMIT_CAP`). |
 
@@ -675,11 +706,13 @@ Compact, paginated, HTML-stripped note reader designed for LLM consumption: dete
 ```json
 {"total": 812,
  "notes": [{"noteId": 1712345678901, "modelName": "Cloze", "tags": ["HA2::PI7"],
-            "fields": {"Text": "The capital of {{c1::France}} is {{c2::Paris::city hint}}.", "Back Extra": ""}}],
+            "fields": {"Text": "The capital of {{c1::France}} is {{c2::Paris::city hint}}.", "Back Extra": ""},
+            "truncatedFields": []}],
  "nextOffset": 200}
 ```
 
 - `total` = full match count before pagination; `nextOffset` = `offset + limit` while more ids remain, else `null`.
+- `truncatedFields` (revision 7): per-note list of the field names whose returned value was cut by `maxFieldLength` — **always present**, `[]` when nothing was truncated; names appear in the note's model field order. The `…` marker behavior is unchanged; this is the unambiguous signal.
 - **Cloze markup passes through unmodified** under `stripHtml: true`: the backend single-line helper strips HTML only, so `{{c1::...}}` / `{{c2::...::hint}}` markers survive verbatim in the output (probe-verified) — clients must not expect any bracketed-hint conversion.
 - **Deterministic order**: query path returns ascending `noteId` (creation order — ids are sorted in core, `find_notes` is called with `order=False`); noteIds path preserves caller order.
 - The `fields` output dict is in the note's model field order (filtered by the `fields` param when given).
@@ -687,9 +720,9 @@ Compact, paginated, HTML-stripped note reader designed for LLM consumption: dete
 
 **Anki API calls** — `col.find_notes(query, order=False)` (`SP/anki/collection.py:669-683`; result supports `len()` and slicing; `order=False` is the fastest path, ordering is ours) — bad syntax raises `anki.errors.SearchError`, re-raised as `"invalid parameter: query: <backend message>"`; `col.get_note(nid)` (`NotFoundError` → omit, noteIds path only); `note.note_type()` for model name + field order. HTML stripping: `col._backend.html_to_text_line(text=..., preserve_media_filenames=True)` — the module-level `anki.utils.html_to_text_line` routes through the collection-less `current_i18n` backend and raises `CollectionNotOpen` headless (probe-verified gotcha), so the open collection's backend is called directly.
 
-**Error cases** — `"invalid parameter: query: exactly one of query or noteIds required"` (both given or neither); `"invalid parameter: query: string required"`; `"invalid parameter: query: <backend parse error>"`; `"invalid parameter: noteIds: ints required"`; `"invalid parameter: fields: list of strings required"`; `"invalid parameter: stripHtml: boolean required"`; `"invalid parameter: maxFieldLength: int >= 0 required"`; `"invalid parameter: offset: int >= 0 required"`; `"invalid parameter: limit: must be >= 1"`.
+**Error cases** (all `[invalid_param]` per §25) — `"invalid parameter: query: exactly one of query or noteIds required"` (both given or neither); `"invalid parameter: query: string required"`; `"invalid parameter: query: <backend parse error>"`; `"invalid parameter: noteIds: ints required"`; `"invalid parameter: fields: list of strings required"`; `"invalid parameter: stripHtml: boolean required"`; `"invalid parameter: maxFieldLength: int >= 0 required"`; `"invalid parameter: offset: int >= 0 required"`; `"invalid parameter: limit: must be >= 1"`.
 
-**Edge cases tests must cover** — query/noteIds mutual exclusion (both and neither → error); pagination: `total` stable across pages, `nextOffset` chains cover exactly `total`, final page `nextOffset: null`; ascending id order on the query path, caller order on the noteIds path; `stripHtml: true` collapses `<div>` lines to single spaces and keeps media filenames; `stripHtml: false` returns raw HTML; `maxFieldLength` truncates at the cap with `…` appended, `0` disables; `fields` filter returns only the named fields, unknown name absent without error; stale noteId omitted while `total` counts it; empty query string matches all notes; bad search syntax → query error; undo queue untouched.
+**Edge cases tests must cover** — query/noteIds mutual exclusion (both and neither → error); pagination: `total` stable across pages, `nextOffset` chains cover exactly `total`, final page `nextOffset: null`; ascending id order on the query path, caller order on the noteIds path; `stripHtml: true` collapses `<div>` lines to single spaces and keeps media filenames; `stripHtml: false` returns raw HTML; `maxFieldLength` truncates at the cap with `…` appended and the field name listed in `truncatedFields`, `0` disables and `truncatedFields` stays `[]` (also `[]` for untruncated fields genuinely ending in `…`); `fields` filter returns only the named fields, unknown name absent without error; stale noteId omitted while `total` counts it; empty query string matches all notes; bad search syntax → query error; undo queue untouched.
 
 ## 14. `mediaThumbnails` (spec revision 3, 2026-08-11)
 
@@ -720,19 +753,19 @@ Base64 thumbnails of collection media images — aspect-preserved, never upscale
 
 **Order of operations** — batch-level param validation first (hard errors, nothing processed); then per file: bare-name guard → `os.path.isfile` → `QImage` load/null check → conditional scale → encode. Every per-file failure produces a per-item `error` entry and the batch continues.
 
-**Error cases** — hard: `"invalid parameter: filenames: list of strings required"`; `"invalid parameter: maxDim: must be >= 1"`; `"invalid parameter: format: jpeg or png required"`; `"invalid parameter: quality: int 0-100 required"`. Per-item: `"invalid parameter: filenames: bare media filename required"`; `"media file was not found: <filename>"`; `"could not load image: <filename> (unsupported or corrupt format)"`; `"could not encode thumbnail as <format>: <filename>"`.
+**Error cases** (codes per §25) — hard (all `[invalid_param]`): `"invalid parameter: filenames: list of strings required"`; `"invalid parameter: maxDim: must be >= 1"`; `"invalid parameter: format: jpeg or png required"`; `"invalid parameter: quality: int 0-100 required"`. Per-item (unprefixed, §3.2): `"invalid parameter: filenames: bare media filename required"`; `"media file was not found: <filename>"`; `"could not load image: <filename> (unsupported or corrupt format)"`; `"could not encode thumbnail as <format>: <filename>"`.
 
 **Edge cases tests must cover** — wide image (640×160, maxDim 320) → 320×80; tall image scales to the height cap; small image (≤ maxDim both sides) returned at native size, not upscaled; `data` base64 round-trips to a decodable image of the reported dims (verify with QImage in the test); png format preserves the alpha channel; per-item error for a missing and a path-y filename while the rest of the batch succeeds; maxDim clamp at 1024; bad format/quality → hard error, nothing processed; media dir file count identical before/after; undo queue untouched.
 
 ---
 
-## 15. `dryRun` mode on the bulk actions (spec revision 4, 2026-08-11)
+## 15. `dryRun` mode on the bulk actions (spec revision 4, 2026-08-11; amended 2026-08-12, spec revision 7: bulkUpdateNoteFields `unchanged`)
 
 An optional `dryRun: false` parameter on the three existing bulk actions (`bulkAddNotes`, `bulkUpdateNoteFields`, `bulkAddTags` — param rows added to §§4.1–4.3). **No new action names**: `core.PLUS_ACTIONS` is unchanged by this section. Purpose: preview exactly what a batch would do — which entries pass validation, which get skipped and why — before committing anything.
 
 **Shared-validation invariant (the anti-drift rule)** — the dry path is NOT a reimplementation. Each core function runs its normal code and short-circuits at its zero-write boundary, so dry and real validation are the same lines of code by construction:
 - `bulk_add_notes`: the full resolution pass + duplicate precheck (both read-only) run unchanged; the early return sits between the dedup stamping and the write pass.
-- `bulk_update_note_fields`: the whole per-entry validation chain (dict/id/fields-or-tags/type checks, `col.get_note` load, whole-entry field validation) runs unchanged; `dryRun` records the id and `continue`s immediately before the try/write block — before the in-memory `Note` object is ever mutated.
+- `bulk_update_note_fields`: the whole per-entry validation chain (dict/id/fields-or-tags/type checks, `col.get_note` load, whole-entry field validation) runs unchanged, **including the revision-7 no-op check** (read-only comparison against the loaded note, so no-op entries land in `unchanged` identically in both modes); `dryRun` records the id and `continue`s immediately before the try/write block — before the in-memory `Note` object is ever mutated.
 - `bulk_add_tags`: top-level validation, `col.get_note`, and the missing-tag computation run unchanged; the short-circuit sits after the `if not missing: continue` no-op filter, so no-op notes are omitted from both lists exactly as in real mode.
 
 **Returns** (same envelope as the real action; the success key is renamed because its semantics change)
@@ -741,18 +774,21 @@ An optional `dryRun: false` parameter on the three existing bulk actions (`bulkA
 {"wouldAdd": 2, "skipped": [{"index": 1, "reason": "duplicate"}], "undoEntry": null}
 ```
 ```json
-{"wouldUpdate": [1712345678901], "skipped": [{"index": 1, "reason": "note was not found: 42"}], "undoEntry": null}
+{"wouldUpdate": [1712345678901], "unchanged": [], "skipped": [{"index": 1, "reason": "note was not found: 42"}], "undoEntry": null}
 ```
 
 - `bulkAddNotes` → `wouldAdd` is a **count** (note ids do not exist until a real add). `bulkUpdateNoteFields` / `bulkAddTags` → `wouldUpdate` is the **list of note ids** that would be written (ids are known). `skipped` is identical in shape and reason strings to the real path. `undoEntry` is always `null`.
-- `bulkAddTags` dry run: notes already having every tag appear in **neither** list (same as real mode).
+- `bulkUpdateNoteFields` dry run additionally returns `unchanged` (revision 7): the no-op ids, mirroring the real path's `unchanged` list exactly.
+- **`bulkUpdateNoteFields` `diff: true` (revision 10; only with `dryRun: true`, else `[invalid_param]` — §4.2):** the dry response additionally carries `preview: [{noteId, field, before, after}]` — one entry per **changed field** (byte-comparison against the loaded note, the same read the revision-7 no-op check performs), unchanged fields omitted, tags-only changes contributing no entries — capped at `maxPreview` entries, plus `previewTruncated: bool` (more changed-field entries existed than previewed; counted past the cap). Reuses §21 `bulkReplaceInFields`' preview conventions (`before`/`after` are full raw field HTML). Without `diff` the dry response shape is byte-identical to revision 9 (no `preview`/`previewTruncated` keys). Zero-write guarantees unchanged: the preview is built inside the existing read-only pass.
+- `bulkAddTags` dry run: notes already having every tag appear in **neither** list (same as real mode; its shape has no `unchanged` key).
+- **Duplicate-note-id caveat on `bulkUpdateNoteFields` (revision 11)** — the dry pass compares every entry against the note's **stored pre-batch** values, never against an earlier entry's pending write, while the real run re-reads the note after each write. A batch containing the same note id more than once may therefore predict **more** updates than the real sequential run performs, and the `diff` preview may emit duplicate entries whose `before` value is stale for the later occurrence: e.g. two identical entries `{id: n, fields: {Back: "NEW"}}` dry-predict `wouldUpdate: [n, n]` (two identical preview entries) but really yield `updated: [n]`, `unchanged: [n]` (§4.2's duplicate-ids edge case). The final note state still matches the last entry in both modes. De-duplicate ids within a batch for exact dry/real parity.
 - Hard parameter errors (`"invalid parameter: notes: list required"` etc.) raise exactly as in real mode — dryRun only suppresses writes, not validation errors.
 
 **Zero-mutation guarantees (provable)** — under `dryRun: true`: no `col.add_note` / `col.update_note` call; no `add_custom_undo_entry` (the lazy `target` is never reached), so `col.undo_status()` is bit-identical before/after; no media write — the `bulkAddNotes` wrapper **skips `_plusEmbedNoteMedia`** because upstream media embedding stores files (consequence, documented limitation: notes carrying `audio`/`video`/`picture` keys are validated on their fields **as submitted**, without media-filename substitution; the real run's substituted fields could in principle differ for first-field emptiness/duplicate checks). `atomic` is accepted but irrelevant (no write-time hard-error path can fire).
 
 **What a dry run cannot predict** — write-time hard errors (the `atomic=false` skipped entries produced by an exception inside the write block). A dry-run "would" verdict is a validation verdict, not a transaction guarantee.
 
-**Edge cases tests must cover** — mixed batch (valid + duplicate + unknown model + empty first field) → `wouldAdd` counts only the valid ones, `skipped` reasons identical to a real run on the same batch; note count / field values / tags unchanged in the DB after each dry call; `undo_status()` unchanged (no entry created, not even an empty one); dry-then-real sequence: the real run's `added`/`updated` lengths match the dry prediction; `bulkAddTags` dry run omits already-tagged notes from both lists; empty `notes` list → `{wouldAdd: 0, skipped: [], undoEntry: null}`; hard param errors still raise under dryRun.
+**Edge cases tests must cover** — mixed batch (valid + duplicate + unknown model + empty first field) → `wouldAdd` counts only the valid ones, `skipped` reasons identical to a real run on the same batch; note count / field values / tags unchanged in the DB after each dry call; `undo_status()` unchanged (no entry created, not even an empty one); dry-then-real sequence: the real run's `added`/`updated` lengths match the dry prediction (for batches without duplicate note ids — see the duplicate-note-id caveat above); `bulkAddTags` dry run omits already-tagged notes from both lists; empty `notes` list → `{wouldAdd: 0, skipped: [], undoEntry: null}`; hard param errors still raise under dryRun.
 
 ## 16. `bulkSuspend` & `bulkSetDueDate` (spec revision 4, 2026-08-11)
 
@@ -777,7 +813,7 @@ Two scheduler bulk actions, bringing the action count to sixteen. `core.PLUS_ACT
 
 **Anki API calls** — `col.get_card(cid)` precheck (`NotFoundError` → drop); `col.sched.suspend_cards(ids) -> OpChangesWithCount` (`SP/anki/scheduler/base.py:153-156`); `col.sched.unsuspend_cards(ids) -> OpChanges` (`base.py:150-151`, backend `restore_buried_and_suspended_cards`); undo per §3.3: `add_custom_undo_entry` **before** the op (the op must merge into it), `merge_undo_entries` after. Only cards that would change are passed to the op.
 
-**Error cases** — `"invalid parameter: cardIds: ints required"`; `"invalid parameter: suspend: boolean required"`; unexpected op failure → `"bulkSuspend failed (batch reverted): <err>"` (custom entry reverted).
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: cardIds: ints required"`; `[invalid_param]` `"invalid parameter: suspend: boolean required"`; unexpected op failure → `[batch_reverted]` `"bulkSuspend failed (batch reverted): <err>"` (custom entry reverted).
 
 **Edge cases tests must cover** — suspend 2 new cards (+1 bogus id in the list) → `changed: 2`, both queues −1, `undo_status().undo` = the entry name, single `col.undo()` restores both queues and pops the entry; suspending an already-suspended card → `changed: 0`, `undoEntry: null`, undo stack unchanged; unsuspend the suspended pair → `changed: 2`, queues restored; unsuspend with nothing suspended → `changed: 0`, no op; duplicate ids counted once; empty `cardIds` → `{changed: 0, undoEntry: null}`.
 
@@ -799,7 +835,7 @@ Two scheduler bulk actions, bringing the action count to sixteen. `core.PLUS_ACT
 
 **Anki API calls** — `col.get_card` precheck; `col.sched.set_due_date(card_ids, days) -> OpChanges` (`SP/anki/scheduler/base.py:205-227`; the optional `config_key` is not used — no config default is read or written); undo per §3.3 (entry created before the op, merged after). The `days` grammar is pre-validated in core (`re.fullmatch(r'[0-9]+(?:-[0-9]+)?!?', days)` — ASCII digits only, matching what the backend actually accepts) **before** `add_custom_undo_entry`, so a bad string raises `"invalid parameter: days: <bad string>"` with the undo stack genuinely untouched (popping an empty custom entry via `col.undo()` would push a phantom Redo item). The `anki.errors.InvalidInput` handler (message = the bad string; empty custom entry popped, error re-raised house-style) remains as a backstop for grammar drift only.
 
-**Error cases** — `"invalid parameter: cardIds: ints required"`; `"invalid parameter: days: string like \"0\" or \"1-7\" required"` (non-string or empty); `"invalid parameter: days: <bad string>"` (grammar rejected by core's pre-validation — same message shape as the backend's InvalidInput, whose message is the echoed bad string; undo stack left untouched, verified bit-identical `undo_status()`); unexpected op failure → `"bulkSetDueDate failed (batch reverted): <err>"`.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: cardIds: ints required"`; `[invalid_param]` `"invalid parameter: days: string like \"0\" or \"1-7\" required"` (non-string or empty); `[invalid_param]` `"invalid parameter: days: <bad string>"` (grammar rejected by core's pre-validation — same message shape as the backend's InvalidInput, whose message is the echoed bad string; undo stack left untouched, verified bit-identical `undo_status()`); unexpected op failure → `[batch_reverted]` `"bulkSetDueDate failed (batch reverted): <err>"`.
 
 **Edge cases tests must cover** — `"0"` on a new card → due today, `type=2 queue=2`, single `col.undo()` restores the new state and pops the entry; `"1-7"` on several cards → each due within [1,7] days; `"3!"` → due 3 and `ivl` 3; `"bogus"` → `invalid parameter: days:` error AND `undo_status()` unchanged (no empty entry left); only-bogus ids → `{changed: 0, undoEntry: null}`; duplicate ids counted once.
 
@@ -829,7 +865,7 @@ Export one deck (including its subdecks) to an `.apkg` file on disk, bringing th
 
 **Order of operations** — all validation (param types, deck lookup, output-directory existence) before any filesystem write; then collision suffixing; then the export call. The export itself is read-only with respect to the collection: no undo entry is created and `undo_status()` is unchanged (tests assert this).
 
-**Error cases** — `"invalid parameter: deckName: string required"` (non-string or empty); `"deck was not found: <name>"`; `"invalid parameter: outPath: string required"` (non-string or empty string); `"invalid parameter: outPath: is a directory: <path>"` (outPath resolves to an existing directory, or ends in a path separator — outPath must be a file path; without this guard the collision loop would write a surprise sibling like `<dir>-2`); `"invalid parameter: includeScheduling: boolean required"`; `"invalid parameter: includeMedia: boolean required"`; `"output directory was not found: <dir>"`; backend export failures surface through the envelope verbatim.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: deckName: string required"` (non-string or empty); `[deck_not_found]` `"deck was not found: <name>"`; `[invalid_param]` `"invalid parameter: outPath: string required"` (non-string or empty string); `[invalid_param]` `"invalid parameter: outPath: is a directory: <path>"` (outPath resolves to an existing directory, or ends in a path separator — outPath must be a file path; without this guard the collision loop would write a surprise sibling like `<dir>-2`); `[invalid_param]` `"invalid parameter: includeScheduling: boolean required"`; `[invalid_param]` `"invalid parameter: includeMedia: boolean required"`; `[not_found]` `"output directory was not found: <dir>"`; backend export failures surface through the envelope as `[internal]`.
 
 **Edge cases tests must cover** — export of a small deck with a media-bearing note → file exists, `sizeBytes` matches on-disk size, zip members include `media`, `notesExported` correct; subdeck note included when exporting the parent; repeat export to the same path → `-2` (then `-3`) suffix, first file untouched; `includeMedia: false` → smaller file, media member empty; `includeScheduling: false` accepted; unknown deck / bad outPath dir → error with no file written; sanitized default filename for a `::`-nested deck name; undo queue untouched.
 
@@ -889,7 +925,7 @@ Read-only status probe. Never starts a sync, never clears auth (Deviation #9a), 
 
 **Verified-synced contract (for clients)** — the collection is known synced iff `job.state == "done" AND required == "no_changes" AND mediaSyncing == false`. Anything less (job `error`, `required` `normal_sync`/`null`, media still running) means "not verified".
 
-**Error cases** — `"invalid parameter: localOnly: boolean required"`; `"invalid parameter: timeoutSecs: int 1-300 required"`. Everything else is expressed in the return value, never raised.
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: localOnly: boolean required"`; `[invalid_param]` `"invalid parameter: timeoutSecs: int 1-300 required"`. Everything else is expressed in the return value, never raised (the job `error.code` and `required`/`reason` vocabularies are unprefixed and unchanged — §25).
 
 **Edge cases tests must cover (headless, ZERO network)** — `local_sync_dirty` on a fresh scratch collection (`mod > ls` after a write → dirty; `lastSyncMs`/`modMs` ints); `classify_sync_error` over synthetic `SyncError(kind=AUTH)` / `SyncError(kind=OTHER)` / `NetworkError` / `Interrupted` / plain `Exception` → exact code strings; `bounded_sync_auth` clamps `io_timeout_secs`, preserves `hkey`, maps empty-string endpoint to unset; enum maps cover proto values 0–2 / 0–4 and match the installed `sync_pb2` constants; both actions present in `PLUS_ACTIONS`; headless `core.py` import still keeps `aqt`/`PyQt6` out of `sys.modules`. Documented headless edge case (live-Anki behavior, not headless-testable): logged out + `mw.col` None → `required` `not_logged_in` (precedence rule above). The network paths (`sync_status`/`sync_collection` round-trips) are exercised only manually against a live logged-in Anki — never from the test suite.
 
@@ -907,7 +943,7 @@ Read-only status probe. Never starts a sync, never clears auth (Deviation #9a), 
 
 **Media side effect (documented)** — when the note references newly-added media, the add-on content-hash **renames those files across the whole collection** (raw SQL inside the add-on, not undoable) before uploading them to AnkiHub S3 in the background via `media_sync.start_media_upload`. This is the add-on's own standard behavior for every suggestion; it is inherited, not added.
 
-**Error taxonomy** — semantic/flow errors raise `"<CODE>: <message>"` (parse with `error.split(": ", 1)[0]`): `ANKIHUB_ADDON_MISSING`, `ANKIHUB_ADDON_DISABLED`, `ANKIHUB_NOT_LOGGED_IN` (local `is_logged_in()` false, or HTTP 401 = token rejected), `NOT_AN_ANKIHUB_NOTE`, `NOTE_DELETED_ON_ANKIHUB` (HTTP 404 raised outside `suggest_note_update`'s own catch, or a duplicate-conflict whose conflicting note is soft-deleted), `VALIDATION_ERROR` (HTTP 400 body passthrough as compact JSON; when the body contains the server's "don't have any changes to the original note" error the message gets **"sync with AnkiHub first, then re-suggest"** advice appended — the local AnkiHub DB is the diff baseline and may be behind the server revision), `PERMISSION_DENIED` (HTTP 403 `detail`), `RATE_LIMITED` (HTTP 429), `NETWORK_ERROR` (`AnkiHubRequestException` = offline/transport, or any unexpected HTTP status incl. 5xx), `INCOMPATIBLE_ANKIHUB_ADDON`, `SOURCE_REQUIRED`, `RATIONALE_INVALID`. Parameter-shape errors keep §3.2 house style (Deviation #10a).
+**Error taxonomy** (amended, spec revision 10: the §25 machine code is layered IN FRONT of this taxonomy — full form `"[<plus-code>] <CODE>: <message>"`; the taxonomy code and message body are unchanged) — semantic/flow errors raise `"<CODE>: <message>"` (parse the taxonomy code with `error.split("] ", 1)[1].split(": ", 1)[0]`, the machine code per §25): `ANKIHUB_ADDON_MISSING` (`[incompatible_ankihub_addon]`), `ANKIHUB_ADDON_DISABLED` (`[incompatible_ankihub_addon]`), `ANKIHUB_NOT_LOGGED_IN` (local `is_logged_in()` false → `[not_logged_in]`, or HTTP 401 = token rejected → `[auth_failed]` — the machine code is what distinguishes them), `NOT_AN_ANKIHUB_NOTE` (`[not_found]`), `NOTE_DELETED_ON_ANKIHUB` (`[not_found]`; HTTP 404 raised outside `suggest_note_update`'s own catch, or a duplicate-conflict whose conflicting note is soft-deleted), `VALIDATION_ERROR` (`[validation_error]`; HTTP 400 body passthrough as compact JSON; when the body contains the server's "don't have any changes to the original note" error the message gets **"sync with AnkiHub first, then re-suggest"** advice appended — the local AnkiHub DB is the diff baseline and may be behind the server revision), `PERMISSION_DENIED` (`[permission_denied]`; HTTP 403 `detail`), `RATE_LIMITED` (`[rate_limited]`; HTTP 429), `NETWORK_ERROR` (`[network_error]`; `AnkiHubRequestException` = offline/transport, or any unexpected HTTP status incl. 5xx), `INCOMPATIBLE_ANKIHUB_ADDON` (`[incompatible_ankihub_addon]`), `SOURCE_REQUIRED` (`[source_required]`), `RATIONALE_INVALID` (`[rationale_invalid]`). Parameter-shape errors keep §3.2 house style (Deviation #10a) with `[invalid_param]`.
 
 **Core split (§2.1 rules hold)** — pure, aqt-free, addon-free helpers in `core.py`: constants (`ANKIHUB_ADDON_PACKAGE`, `ANKIHUB_TESTED_ADDON_VERSION`, `ANKIHUB_RATIONALE_MAX_LENGTH` = 1024 — the limit lives only in the add-on's dialog widget, so the API enforces it here; the widget's trim loop deletes while `len >= 1024` (`suggestion_dialog.py:676-677`), so the dialog's effective cap — byte-matched by the API — is **1023** characters (server acceptance of a 1024th character is unverified: testing it would need an AnkiHub network call) —, `ANKIHUB_CHANGE_TYPES`, `ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE`, `ANKIHUB_OPTIONAL_SOURCE_TYPES`, `ANKIHUB_SOURCE_REQUIRED_CHANGE_TYPES`, `ANKIHUB_UWORLD_STEPS`, `ANKIHUB_CHANGE_RESULTS`, `ANKIHUB_REQUIRED_SIGNATURES`), `validate_ankihub_change_type`, `validate_ankihub_rationale` (non-empty after strip, ≤1023 — raises at `len >= 1024`, matching the dialog), `ankihub_comment_for_update` / `ankihub_comment_for_new_note` / `_ankihub_source_parts` (the exact dialog Source-line format), `map_ankihub_http_error`, `map_ankihub_change_result`, `ankihub_missing_params`. Everything touching aqt or the add-on lives in `plus.py`.
 
@@ -946,3 +982,194 @@ Submit ONE new-note suggestion via the add-on's `suggest_new_note` (`main/sugges
 **Returns** `{"result": "success"|"noChanges"|"notFoundOnAnkiHub"|"emptyFirstField", "resubmittedAsChange": bool}`. `noChanges` from the direct path = the add-on found nothing to submit; from the resubmit path = server-diff empty.
 
 **Headless test scope (ZERO network, ZERO add-on imports)** — `tests/headless_ankihub_test.py` covers only the pure `core.py` helpers: the three actions in `PLUS_ACTIONS`; constants incl. the nine wire values and the source-type matrix; change-type/rationale validation; the full Source enforcement matrix (AnKing required, non-AnKing rejected, delete optional, UWorld step, unknown keys/shapes); exact folded-comment strings; HTTP error mapping incl. the no-changes advice and 5xx→`NETWORK_ERROR`; result mapping incl. the unknown-member `INCOMPATIBLE_ANKIHUB_ADDON` path; `ankihub_missing_params`; and that neither `aqt` nor the `1322529746` package ever enters `sys.modules`. The live paths (`ankihubStatus` against the running add-on, actual suggestion submission) are manual-only — never from tests (HARD RULE: no AnkiHub network calls from automation).
+
+## 20. `checkDeckIntegrity` (spec revision 8, 2026-08-12)
+
+First of two field-feedback actions (§§20–21) bringing the action count to **twenty-four**. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. **READ-ONLY**: no collection write, no media write, no undo-stack change — tests assert `undo_status()` bit-identical after every call. Rationale (field feedback): after ~1,500 LLM-driven writes the caller had no way to audit what it had broken — media references to files that were never stored, cloze markup it mangled, and cloze notes whose cards no longer match their fields.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `deckName` | str | required | Must exist (`col.decks.id_for_name`). Scope = notes with **any card homed in the deck or its subdecks** (`odid` = home deck for cards currently in a filtered deck — same semantics as §4.7's deck filter). |
+| `includeOrphanMedia` | bool | `false` | `true` additionally runs the **collection-wide** orphan scan (see below). Off by default because it reads every note in the collection, not just the deck. |
+
+**Returns**
+
+```json
+{"missingMedia": [{"noteId": 1712345678901, "field": "Back", "filename": "gone.png"}],
+ "unbalancedCloze": [{"noteId": 1712345678902, "field": "Text"}],
+ "clozeCardMismatch": [{"noteId": 1712345678903, "expectedOrds": [0, 1, 2], "actualOrds": [0, 2]}],
+ "clozeNotesWithoutCloze": [1712345678904],
+ "orphanMedia": ["scratch-unused.png"],
+ "notesChecked": 812}
+```
+
+- `missingMedia`: per-field media references whose file is absent from the media dir. References are extracted with **anki's own `MediaManager.regexps`** (img/audio/source `src`, object `data`, `[sound:...]`) and the same remote-scheme exclusion `files_in_str` applies — but deliberately **without** `files_in_str`'s `render_latex` step, which can WRITE generated latex images into the media folder (read-only action). Consequence, documented: latex-generated images (`[latex]`/`[$]` tags) are **exempt** from `missingMedia` — Anki regenerates them on render. Filename comparison is NFC-normalized on both sides (macOS Finder copies can sit as NFD); no case folding, no HTML-entity decoding (parity with `files_in_str`). One entry per distinct `(noteId, field, filename)`; notes in ascending id order, fields in model order.
+- `unbalancedCloze`: per field, count of `{{cN::` opens (anki's cloze-open marker, lowercase `c` + digits) vs count of `}}` closes; reported when they differ. Simple brace-balance by design — documented limitation: a field containing literal `}}` text (nested LaTeX braces, handlebars snippets) with no cloze opens is reported too. Checked on **every** notetype (cloze markers in a non-cloze note are equally an authoring error worth surfacing).
+- `clozeCardMismatch`: **cloze-type notetypes only** (`model["type"] == MODEL_CLOZE` — includes the Image Occlusion notetype). `expectedOrds` = card ordinals implied by the fields' cloze numbers via the backend's own parser (`col._backend.cloze_numbers_in_note` on a minimal `notes_pb2.Note(fields=...)` proto — the exact code card generation uses; probe-verified pure and collection-free), mapped `{{cN::}}` → ord N−1, `c0` excluded (annotation-only, §5). `actualOrds` = ords of the note's existing cards (all decks, not just the audited one). Reported only when the sorted lists differ — **except the placeholder pair `expectedOrds: []` / `actualOrds: [0]`, which is never reported**: for a cloze note whose fields yield zero effective cloze numbers (no markers, `c0`-only, uppercase `{{C1::…}}` — anki's parser is lowercase-only), anki's own card generation deliberately creates and keeps a single placeholder card ord 0 (rslib cardgen ensure-not-empty rule; the Empty Cards tool keeps it too — empirically verified on 25.09.4), so `[0]` is exactly the correct card set, not drift. Typical hits: a deleted cloze card, or field edits that never regenerated cards.
+- `clozeNotesWithoutCloze` (additive, field-feedback fix to the placeholder false-positive class): note ids of cloze-type notes whose fields yield **zero effective cloze numbers** (ascending). Not card/field drift — anki maintains the placeholder card for them — but precisely the LLM authoring error this audit targets (a "cloze" note that will never cloze anything), surfaced under its own name so it cannot drown `clozeCardMismatch`.
+- `orphanMedia`: `null` when `includeOrphanMedia` is false. When true: media-dir files referenced by **no note field in the whole collection** and no notetype template. Collection-wide by nature — a file unreferenced by this deck may be used elsewhere, so orphan status can only be decided globally. Referenced set = every note's field references (same regexps), **plus** latex-generated filenames via the pure backend `extract_latex` transform (`expand_clozes=True`, per-model `latexsvg`; guarded by a cheap `[latex]`/`[$]`/`[$$]` marker check — this is exactly `files_in_str`'s transform minus its image-generation side effect), **plus** template/CSS static references via `col.media.extract_static_media_files(mid)`. Excluded from the report: leading-`_` files (static-use by Anki's own convention) and dotfiles (`.DS_Store` junk). Sorted.
+- `notesChecked` = number of notes in the deck scope.
+
+**Anki API calls / SQL (read-only; explicitly allowed by the HARD RULES bullet)** — `col.decks.id_for_name` + `col.decks.deck_and_child_ids`; scope select `select distinct nid from cards where (case when odid != 0 then odid else did end) in (...) order by nid`; chunked (`SQL_IN_CHUNK`) `select id, mid, flds from notes where id in (...) order by id` (fields split on `\x1f`, names from `col.models.get(mid)` cached per mid); chunked `select nid, ord from cards where nid in (...) order by nid, ord` for the cloze notes; `col.media.regexps` / `col._backend.cloze_numbers_in_note` / `col._backend.extract_latex` / `col.media.extract_static_media_files` as above; `os.listdir(col.media.dir())` filtered to plain files. Single pass over scope notes (plus one pass over all notes iff `includeOrphanMedia`); target a few seconds on a 30k-note collection.
+
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: deckName: string required"`; `[deck_not_found]` `"deck was not found: <name>"`; `[invalid_param]` `"invalid parameter: includeOrphanMedia: boolean required"`. Everything else is expressed in the return value.
+
+**Edge cases tests must cover** — clean deck → four empty list signals (`missingMedia`, `unbalancedCloze`, `clozeCardMismatch`, `clozeNotesWithoutCloze`), `orphanMedia: null`, `notesChecked` exact, undo snapshot bit-identical; missing `[sound:...]` and `<img src>` each reported with the right field name, duplicate reference in one field reported once, present file and remote URL exempt, subdeck note in scope, other-deck note out of scope; unbalanced `{{c2::b` reported, balanced cloze not, literal `}}` in a Basic field reported (documented limitation); cloze note with a removed card → `expectedOrds`/`actualOrds` drift reported, Basic note with cloze-looking text never in `clozeCardMismatch`; zero-cloze cloze notes (no markers / `{{c0::…}}`-only / uppercase `{{C1::…}}`) each keep anki's placeholder card ord 0 and appear in `clozeNotesWithoutCloze` but **never** in `clozeCardMismatch`, while a genuinely deleted cloze card is still reported; orphan scan: unreferenced file reported sorted, referenced file / `_`-prefixed file / existing latex-generated image all exempt, flag off → `null`.
+
+## 21. `bulkReplaceInFields` (spec revision 8, 2026-08-12)
+
+Second field-feedback action (count: twenty-four, see §20). Find/replace on the **raw field HTML of ONE named field** across many notes, as one undoable batch with a mandatory-preview-friendly dry run. Rationale (field feedback): the caller hand-rolled read-modify-write loops over `notesSlim` + `bulkUpdateNoteFields` for simple text substitutions — slow, and each hand-rolled loop is a fresh chance to mangle fields.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `query` | str | — | Anki search string (verbatim, §13 conventions). Exactly one of `query`/`noteIds` required. Processing order: ascending noteId. |
+| `noteIds` | [int] | — | Explicit ids, caller order, **deduplicated first-occurrence-wins** (§11.1 precedent — processing one note twice would re-match against its own replacement). |
+| `field` | str | required | The single field operated on. Notes lacking it are skipped with a reason, never an error. |
+| `find` | str | required | **Non-empty** (an empty find matches between every character in both modes — never meaningful, always a bug). Literal text, or a python `re` pattern when `isRegex`. |
+| `replace` | str | required (may be `""`) | Literal mode: inserted **verbatim** (callable replacement — no `\`-escape parsing). Regex mode: a python `re` template (`\1`, `\g<name>` expand). |
+| `isRegex` | bool | `false` | Python `re` semantics. **No backtracking-bomb protection** (documented): a pathological pattern can hang the single-threaded server for its duration. The pattern is compiled up front — a non-compiling pattern is a clear parameter error. |
+| `caseSensitive` | bool | `true` | `false` = `re.IGNORECASE` in both modes. |
+| `dryRun` | bool | `false` | Zero-write preview, §15 anti-drift rule: the identical read/compute pass runs and short-circuits before the write pass. |
+| `atomic` | bool | `true` | Same contract as the other bulk actions (§3.3/§4.1). |
+| `maxPreview` | int | `20` | Dry-run only: cap on `preview` entries (≥ 0). |
+
+**Returns** (real run)
+
+```json
+{"changed": [1712345678901], "matchesTotal": 3, "unchanged": [1712345678902],
+ "skipped": [{"noteId": 1712345678903, "reason": "field was not found in note: Front"}],
+ "undoEntry": "AnkiConnect Plus: Replace in Fields"}
+```
+
+**Returns** (`dryRun: true`)
+
+```json
+{"wouldChange": [1712345678901], "matchesTotal": 3, "unchanged": [1712345678902],
+ "skipped": [], "preview": [{"noteId": 1712345678901, "before": "<b>old</b>", "after": "<b>new</b>"}],
+ "previewTruncated": false, "undoEntry": null}
+```
+
+- `changed` / `wouldChange`: ids actually (or would-be) written, in processing order. `matchesTotal`: total pattern matches found across all processed notes — **including** matches whose replacement was byte-identical (see `unchanged`).
+- `unchanged`: ids where the pattern found nothing **or** every match replaced itself byte-identically (`find == replace` etc.) — never written, no undo entry for them (the shared §4.2/§4.3 no-op rule).
+- `skipped`: `{noteId, reason}` — `"note was not found: <id>"` (stale explicit id) or `"field was not found in note: <field>"` (result sets may span models), plus `atomic: false` write-failure reasons. Keyed by **noteId, not index** (deliberate deviation from §4.1's `{index, reason}`: the query path has no meaningful input index).
+- `preview`: dry-run only, first `maxPreview` would-change notes with full raw before/after field HTML; `previewTruncated` = more would-change notes exist than previewed. The dry response also carries `skipped` and `undoEntry: null` (house §15 shape) beyond the locked key list — additive.
+- `undoEntry`: `"AnkiConnect Plus: Replace in Fields"`, `null` when nothing was written. One merged entry; single `col.undo()` reverts the whole batch. Atomic failure raises `"bulkReplaceInFields failed (batch reverted): {json}"` with `{failedNoteId, error, changedBeforeRevert, skipped}` (noteId-keyed for the same reason as `skipped`).
+
+**Algorithm** — validate params → compile pattern (`re.escape` in literal mode) → resolve ids (query: `col.find_notes(query, order=False)` sorted, §13; bad syntax → `"invalid parameter: query: <backend message>"`) → **compute pass, read-only and shared by dry/real by construction (§15)**: per note `col.get_note`, field membership, `pattern.subn` on the raw field value (an invalid regex replacement template — e.g. `\9` with one group — raises `re.error` on the first match, which is always **before any write**, and surfaces as `"invalid parameter: replace: <error>"`) → dry run returns here → write pass: set field, lazy `add_custom_undo_entry` + `merge_undo_entries` per §3.3, atomic revert per §4.1.
+
+**Error cases** (codes per §25) — all `[invalid_param]`: `"invalid parameter: query: exactly one of query or noteIds required"`; `"invalid parameter: query: string required"` / `"invalid parameter: query: <backend parse error>"`; `"invalid parameter: noteIds: ints required"`; `"invalid parameter: field: string required"`; `"invalid parameter: find: non-empty string required"`; `"invalid parameter: find: invalid regex: <error>"`; `"invalid parameter: replace: string required"` / `"invalid parameter: replace: <re template error>"`; `"invalid parameter: isRegex|caseSensitive|dryRun|atomic: boolean required"`; `"invalid parameter: maxPreview: int >= 0 required"`. Plus `[batch_reverted]` `"bulkReplaceInFields failed (batch reverted): <json>"`.
+
+**Edge cases tests must cover** — literal replace across a query: `changed` ascending, per-note multi-match counted in `matchesTotal`, other fields untouched, single undo reverts all; dry run: exact shape incl. capped `preview` + `previewTruncated`, DB and undo snapshot untouched, dry-then-real prediction matches; regex with group backrefs; case-insensitive literal; literal-mode `replace` containing `\1` inserted verbatim; `find == replace` → `unchanged` with `matchesTotal` counted, `undoEntry: null`, undo stack untouched; note lacking the field skipped with the exact reason; stale noteId skipped; duplicate noteIds deduplicated; invalid template → parameter error with zero writes; atomic injected failure → full revert + parseable report; `atomic: false` → partial continue with the failure in `skipped`.
+
+---
+
+## 22. `mediaExists` (spec revision 9, 2026-08-12)
+
+First round-2 field-feedback action (count: twenty-six together with §23). Cheap **read-only membership probe** for media filenames. Rationale (measured in real use): the caller pulled **4.22 MB** via `getMediaFilesNames` to answer a 13-name membership test.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `filenames` | [str] | required | Bare media filenames to test, any length (empty list allowed). **Non-string entries are a hard parameter error**; malformed or path-carrying strings are NOT errors — they simply report `exists: false` (they can never name a stored media file). |
+
+**Returns**
+
+```json
+{"results": [{"filename": "occl-a98591b53359.png", "exists": true},
+             {"filename": "sub/dir.png", "exists": false}]}
+```
+
+- One entry per input name, **input order preserved** (duplicates included).
+- `exists` = the name is non-empty, bare (`os.path.basename(f) == f`), and `os.path.isfile(mediaDir/f)` — the same file test `mediaThumbnails` (§14) uses.
+- Pure read: no writes, no undo entry, media folder untouched.
+
+**Error cases** (codes per §25) — `[invalid_param]` `"invalid parameter: filenames: list of strings required"` (non-list, or any non-string entry).
+
+**Edge cases tests must cover** — present/absent mix in input order; duplicate names; path-y (`sub/a.png`, `/abs/a.png`) and empty-string names → `false`, not errors; non-string entry → hard error; empty list → `{"results": []}`; notes/undo/media-dir snapshots bit-identical.
+
+---
+
+## 23. `storeMediaFilesBulk` (spec revision 9, 2026-08-12)
+
+Second round-2 field-feedback action. Store many media files in one call with **per-item results that surface Anki's dedup/rename decision**, closing the caller's "stored 13 files blind, then pulled 4.22 MB to verify" loop. Stock `storeMediaFile` (upstream code) stays untouched.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `files` | [{filename, data \| path}] | required | Per item: `filename` (bare media filename, required), plus **exactly one** of `data` (base64; MIME line-wrapping tolerated, same lenient rule as §4.4) or `path` (absolute path to a file on disk; `~` expanded). Unknown keys are a per-item error. |
+
+**Returns**
+
+```json
+{"stored": [{"requested": "a.png", "actual": "a.png"},
+            {"requested": "a.png", "actual": "dup-3ba3ff….png"},
+            {"requested": "b.png", "error": "invalid parameter: files[2].data: invalid base64"}]}
+```
+
+- One entry per input item, **input order preserved**; failures are per-item `{requested, error}` (requested `null` when no string filename could be read off the item) and never abort the batch — later items still store.
+- `actual` = the filename Anki actually stored via `col.media.write_data` (§4.4 semantics, probe-verified: same-name+same-bytes dedups to the same name with no new file; same-name+different-bytes renames to `dup-<sha1>.<ext>`; the original file's bytes are never overwritten).
+- Media writes are **not undoable** (upstream `storeMediaFile` precedent): no undo entry, undo stack bit-identical.
+
+**Error cases** (codes per §25) — hard: `[invalid_param]` `"invalid parameter: files: list required"`. Per-item (unprefixed, §3.2): `"invalid parameter: files[i]: object required"`, `"invalid parameter: files[i]: unknown key(s): <keys>"`, `"invalid parameter: files[i].filename: string required"`, `"invalid parameter: files[i].filename: bare media filename required"`, `"invalid parameter: files[i]: exactly one of data or path required"`, `"invalid parameter: files[i].data: string required"` / `"… invalid base64"`, `"invalid parameter: files[i].path: string required"` / `"… absolute path required"`, `"media source file was not found: <path>"`, `"could not read file: <path>: <err>"`, `"could not store media file <name>: <err>"`.
+
+**Edge cases tests must cover** — data and path variants store byte-exact; dedup (same bytes → same `actual`, no new file); rename (different bytes → `actual != requested`, original preserved); relative path rejected; every per-item error shape above with a later valid item still succeeding; empty list; undo snapshot bit-identical throughout.
+
+---
+
+## 24. `undoLabel` on write actions (spec revision 9, 2026-08-12)
+
+Cross-cutting param (amends §3.3; return-shape amendments in §4.4 and §4.6). Rationale (measured in real use): three same-named entries in the Undo menu made selective undo a coin flip.
+
+- **Actions**: every Plus action that creates an undo entry — `bulkAddNotes`, `bulkUpdateNoteFields`, `bulkAddTags`, `bulkSuspend`, `bulkSetDueDate`, `bulkReplaceInFields`, `cropImage`, `cropImageOcclusionImage`, `updateImageOcclusionNote`, `addImageOcclusionNote` — gains `undoLabel` (str, default `null`).
+- **Sanitization** (`core.sanitize_undo_label`, raised **before any write**): whitespace runs (newlines included) collapse to single spaces, ends stripped, label capped at **80 chars**; final name = `"AnkiConnect Plus: " + <label>`. Non-string → `"invalid parameter: undoLabel: string required"`; empty after sanitizing → `"invalid parameter: undoLabel: non-empty string required"`.
+- **Threading**: the sanitized name replaces the action's default entry name (§3.3 table) at every use site — lazy `add_custom_undo_entry`, `merge_undo_entries` target, atomic revert / empty-entry pop, and the `undoEntry` response field. With `undoLabel: null` every default name and behavior is byte-for-byte unchanged.
+- **IO actions** (`addImageOcclusionNote`, `updateImageOcclusionNote`) have no custom entry by default (the backend op's own entry). With a label, a custom entry wraps the backend op(s) — for the add, the deck move too — via the §3.3 add/merge pattern, and a failure after entry creation pops/reverts it. Their responses now always carry `undoEntry` (§4.4 additive; §4.6 was `null` → **deliberate contract change**), reporting the ACTUAL top-of-stack name (`col.undo_status().undo`) so the default path stays honest about the backend's own (locale-dependent) entry name. A **no-op** `updateImageOcclusionNote` (every backfilled value byte-matches the note — §4.6) short-circuits before any entry is created and returns `undoEntry: null` per the reporting rule below (revision 11 — previously the unlabeled path echoed whatever unrelated entry was on top of the stack, and the labeled path left an empty do-nothing custom entry, violating Deviation #7).
+- **`undoEntry` reporting rule** (all ten actions): the actual final entry name when at least one undoable write happened, else `null` (§3.3 lazy-entry rule; dry runs always `null`). `cropImageOcclusionImage` always writes, so its response (which gains `undoEntry`, additive) always names the entry; `cropImage`'s is `null` when no notes were rewritten (the media write alone is not undoable).
+
+**Edge cases tests must cover** — labeled entry name on top of the undo stack + single undo reverts (bulk add, replace, IO add incl. deck move, IO update, both crops); defaults byte-identical with `undoLabel` omitted; sanitize (collapse/strip/80-cap); bad labels raise before any write; dry run with a label → `undoEntry: null`, undo snapshot untouched; nothing-written paths (`bulkReplaceInFields` no-match, `cropImage` without note rewrites, no-op `updateImageOcclusionNote` with an unrelated marker entry on the stack) → `undoEntry: null` even with a label, marker entry untouched.
+
+---
+
+## 25. Stable error codes (spec revision 10, 2026-08-12)
+
+Cross-cutting contract on **all 26 Plus actions** (amends §3.2; every action's error list now shows its codes). Rationale (round-2 field feedback, measured in real use): callers pattern-matched free-text error messages to decide whether to retry, fix params, or give up — brittle and English-locked.
+
+**Format** — every error **raised** by a Plus wrapper or by `core` carries a machine-parseable prefix: `"[<code>] <message>"`. The `<message>` body is byte-identical to the pre-revision-10 text (including, for AnkiHub actions, the §19 `CODE:` taxonomy prefix — two layers, coarse machine code + fine taxonomy code, both stable). Codes never contain `]` or whitespace; parse with `error.split("] ", 1)[0].lstrip("[")`. Implementation: `core.PlusError(code, message)` (`.code`, `.message`, `.retryable` attributes; `str()` renders the prefixed form; an unknown code is a `ValueError` at raise time — an add-on bug, never a caller error) + the `plus_api` wrapper on every action, which passes `PlusError` through and re-raises anything unexpected as `[internal]` with the original message body. **Per-item error strings embedded in results are NOT prefixed** (§3.2).
+
+**Code vocabulary** (`core.PLUS_ERROR_CODES`, closed set; *retryable* = the same call may succeed later without the caller changing anything):
+
+| code | retryable | meaning / current raise sites |
+|---|---|---|
+| `not_found` | no | note/card/media file/IO notetype/output directory absent; AnkiHub note not on AnkiHub (`NOT_AN_ANKIHUB_NOTE`) or deleted there (`NOTE_DELETED_ON_ANKIHUB`, incl. HTTP 404) |
+| `invalid_param` | no | the whole `"invalid parameter: …"` house family (§3.2), plus a dispatch-splat `TypeError` (unexpected/missing argument in the request) |
+| `deck_not_found` | no | `"deck was not found: <name>"` everywhere (decks are never auto-created) |
+| `duplicate` | no | **reserved** — duplicates are per-item `skipped[].reason` strings today, never raised |
+| `unsupported_format` | no | crop load/encode failures: `"could not load image: …"`, `"could not encode cropped image as …"` |
+| `io_error` | no | **reserved** — disk read/write failures surface as per-item errors today (`stored[].error`), never raised |
+| `batch_reverted` | no | every `"… failed (batch reverted): {json}"` / `"cropImage failed (note updates reverted): …"` / `"cropImageOcclusionImage failed (changes reverted): …"`; the JSON report parse rule (§3.2) is unchanged |
+| `collection_unavailable` | **yes** | upstream `self.collection()`'s `"collection is not available"` (profile screen), mapped at the `plus_api` boundary |
+| `sync_in_progress` | **yes** | **reserved** — `syncNow` reports busy states via `{started: false, reason}`, never raises |
+| `not_logged_in` | no | a login this add-on cannot perform is required: AnkiHub `is_logged_in()` false (`ANKIHUB_NOT_LOGGED_IN:` local check) |
+| `auth_failed` | no | stored credential **rejected by the server**: AnkiHub HTTP 401 (message keeps its `ANKIHUB_NOT_LOGGED_IN:` taxonomy prefix — the two are distinguished by machine code, deliberately) |
+| `offline` | **yes** | **reserved** — sync network failures surface in `job.error.code` / `required`, never raised |
+| `full_sync_required` | no | **reserved** — surfaced via the sync job error, never raised |
+| `network_error` | **yes** | `AnkiHubRequestException` transport failures and unexpected HTTP statuses incl. 5xx (`NETWORK_ERROR:` taxonomy) |
+| `rate_limited` | **yes** | AnkiHub HTTP 429 (`RATE_LIMITED:` taxonomy) |
+| `permission_denied` | no | AnkiHub HTTP 403 (`PERMISSION_DENIED:` taxonomy) |
+| `validation_error` | no | well-formed request refused on semantic grounds: not-an-IO-note, IO note without an image, non-rect/unpreservable/mixed-oi occlusions, crop-drops-all-occlusions, AnkiHub HTTP 400 (`VALIDATION_ERROR:` taxonomy) and note-already-on-AnkiHub |
+| `incompatible_ankihub_addon` | no | AnkiHub add-on missing / disabled / not loaded this session (`ANKIHUB_ADDON_MISSING:` / `ANKIHUB_ADDON_DISABLED:` taxonomy) or drifted from the tested version (`INCOMPATIBLE_ANKIHUB_ADDON:`) — the bridge is unusable either way |
+| `source_required` | no | `SOURCE_REQUIRED:` taxonomy (§19 Source rules) |
+| `rationale_invalid` | no | `RATIONALE_INVALID:` taxonomy (§19 rationale rules) |
+| `internal` | no | anything unexpected escaping an action (backend exception, add-on bug): `"image occlusion note was not created"`, unhandled `col.*` failures, … |
+
+**AnkiHub taxonomy mapping** (`core.ANKIHUB_CODE_TO_PLUS_CODE`): `VALIDATION_ERROR→validation_error`, `ANKIHUB_NOT_LOGGED_IN` (HTTP 401) `→auth_failed`, `PERMISSION_DENIED→permission_denied`, `NOTE_DELETED_ON_ANKIHUB→not_found`, `RATE_LIMITED→rate_limited`, `NETWORK_ERROR→network_error`. The §19 message-level taxonomy is unchanged and remains authoritative for AnkiHub-specific detail.
+
+**Non-raise channels are untouched**: `syncNow`/`syncStatus` job `error.code` values (§18: `auth_failed`, `offline`, `aborted`, `full_sync_required`, `media_sync_failed`, `error`) and refusal `reason` strings, and all per-item result errors, keep their existing unprefixed vocabularies.
+
+**Edge cases tests must cover** — vocabulary exact-match incl. retryable flags; `str(PlusError)` format and attribute surface; unknown code → `ValueError`; one raise-site spot check per code family (invalid_param, deck_not_found, not_found, validation_error, unsupported_format, batch_reverted with the JSON report still parsing after the prefix, rationale_invalid, source_required, incompatible_ankihub_addon); wrapper boundary: `collection is not available` → `[collection_unavailable]`, dispatch-splat TypeError → `[invalid_param]` — including a params object carrying a `"self"` key (revision 11: the wrapper declares `self` positional-only so the bound-method collision fails inside the wrapper, not before it, and maps to `[invalid_param]` instead of escaping unprefixed) — deeper TypeError and any unexpected exception → `[internal]` with the message body unchanged, PlusError pass-through byte-identical; per-item error strings unprefixed; `actionDocs` params strings still reflect the real signatures through the `plus_api` wrapper.

@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+import functools
 import importlib
 import inspect
 import json
@@ -28,6 +29,68 @@ import anki.notes
 import aqt.gui_hooks
 
 from . import core, util
+
+
+def _signature_string(method):
+    """Render a bound wrapper's signature as a JSON-flavored one-liner for
+    plusInfo's actionDocs, e.g. "notes, atomic=true, dryRun=false" (bound
+    methods already exclude self)."""
+    parts = []
+    for param in inspect.signature(method).parameters.values():
+        if param.default is inspect.Parameter.empty:
+            parts.append(param.name)
+        else:
+            try:
+                default = json.dumps(param.default)
+            except (TypeError, ValueError):
+                default = repr(param.default)
+            parts.append('{}={}'.format(param.name, default))
+    return ', '.join(parts)
+
+
+def plus_api():
+    """@util.api() plus the SPEC 25 stable-error-code guarantee.
+
+    Wraps the action so every exception leaving it is a core.PlusError whose
+    str() is '[code] message'. core/plus raise PlusError directly with the
+    right code; anything else is unexpected and leaves as '[internal] ' with
+    the original message body unchanged, except two recognized boundaries:
+    upstream self.collection()'s 'collection is not available' maps to
+    [collection_unavailable] (retryable — open a profile), and a TypeError
+    from the dispatch splat failing to bind the request's params to the
+    action's real signature (unexpected/missing argument) maps to
+    [invalid_param] — that one is a caller mistake, not an add-on bug.
+
+    functools.wraps keeps the wrapped signature reachable (__wrapped__), so
+    plusInfo's actionDocs still reflect the real parameter list.
+
+    self is declared positional-only so a request whose params object carries
+    a "self" key cannot fail bound-method binding BEFORE this wrapper runs
+    (which would let the raw TypeError escape unprefixed); it lands in
+    **kwargs instead, and the binding failure moves to the inner func(...)
+    call, where the tb_next-is-None branch maps it to [invalid_param].
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, /, *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except core.PlusError:
+                raise
+            except TypeError as e:
+                if e.__traceback__ is not None and e.__traceback__.tb_next is None:
+                    # raised AT our call expression (no deeper frame): the
+                    # params failed to bind — unexpected keyword / missing
+                    # required argument from the JSON request
+                    raise core.PlusError('invalid_param', str(e)) from None
+                raise core.PlusError('internal', str(e)) from e
+            except Exception as e:
+                if str(e) == 'collection is not available':
+                    # upstream self.collection() before a profile is open
+                    raise core.PlusError('collection_unavailable', str(e)) from e
+                raise core.PlusError('internal', str(e)) from e
+        return util.api()(wrapper)
+    return decorator
 
 
 #
@@ -71,10 +134,11 @@ class PlusMixin:
         return prepared
 
 
-    @util.api()
-    def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False, dryRun=False):
+    @plus_api()
+    def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False, dryRun=False,
+                     undoLabel=None):
         if not isinstance(notes, list):
-            raise Exception('invalid parameter: notes: list required')
+            raise core.PlusError('invalid_param', 'invalid parameter: notes: list required')
         if dryRun:
             # dry run writes NOTHING: media embedding stores files, so it is
             # skipped and fields are validated as submitted (SPEC 15)
@@ -82,23 +146,28 @@ class PlusMixin:
         else:
             prepared = [self._plusEmbedNoteMedia(note) for note in notes]
         return core.bulk_add_notes(self.collection(), prepared, atomic=atomic,
-                                   allow_duplicates=allowDuplicates, dry_run=dryRun)
+                                   allow_duplicates=allowDuplicates, dry_run=dryRun,
+                                   undo_label=undoLabel)
 
 
-    @util.api()
-    def bulkUpdateNoteFields(self, notes, atomic=True, dryRun=False):
-        return core.bulk_update_note_fields(self.collection(), notes, atomic=atomic, dry_run=dryRun)
+    @plus_api()
+    def bulkUpdateNoteFields(self, notes, atomic=True, dryRun=False, diff=False,
+                             maxPreview=20, undoLabel=None):
+        return core.bulk_update_note_fields(self.collection(), notes, atomic=atomic,
+                                            dry_run=dryRun, diff=diff,
+                                            max_preview=maxPreview, undo_label=undoLabel)
 
 
-    @util.api()
-    def bulkAddTags(self, noteIds, tags, atomic=True, dryRun=False):
-        return core.bulk_add_tags(self.collection(), noteIds, tags, atomic=atomic, dry_run=dryRun)
+    @plus_api()
+    def bulkAddTags(self, noteIds, tags, atomic=True, dryRun=False, undoLabel=None):
+        return core.bulk_add_tags(self.collection(), noteIds, tags, atomic=atomic,
+                                  dry_run=dryRun, undo_label=undoLabel)
 
 
-    @util.api()
-    def addImageOcclusionNote(self, image, occlusions, deckName, header='', backExtra='', tags=None, hideAllGuessOne=True):
+    @plus_api()
+    def addImageOcclusionNote(self, image, occlusions, deckName, header='', backExtra='', tags=None, hideAllGuessOne=True, undoLabel=None):
         if not isinstance(image, dict):
-            raise Exception('invalid parameter: image: object required')
+            raise core.PlusError('invalid_param', 'invalid parameter: image: object required')
         return core.add_image_occlusion_note(
             self.collection(),
             image_path=image.get('path'),
@@ -109,17 +178,18 @@ class PlusMixin:
             back_extra=backExtra,
             tags=tags,
             deck_name=deckName,
-            hide_all_guess_one=hideAllGuessOne
+            hide_all_guess_one=hideAllGuessOne,
+            undo_label=undoLabel
         )
 
 
-    @util.api()
+    @plus_api()
     def getImageOcclusionNote(self, noteId):
         return core.get_image_occlusion_note(self.collection(), noteId)
 
 
-    @util.api()
-    def updateImageOcclusionNote(self, noteId, occlusions=None, header=None, backExtra=None, tags=None, hideAllGuessOne=True):
+    @plus_api()
+    def updateImageOcclusionNote(self, noteId, occlusions=None, header=None, backExtra=None, tags=None, hideAllGuessOne=True, undoLabel=None):
         return core.update_image_occlusion_note(
             self.collection(),
             noteId,
@@ -127,22 +197,25 @@ class PlusMixin:
             header=header,
             back_extra=backExtra,
             tags=tags,
-            hide_all_guess_one=hideAllGuessOne
+            hide_all_guess_one=hideAllGuessOne,
+            undo_label=undoLabel
         )
 
 
-    @util.api()
-    def cropImage(self, filename, rect, noteIds=None):
-        return core.crop_image(self.collection(), filename, rect, note_ids=noteIds)
+    @plus_api()
+    def cropImage(self, filename, rect, noteIds=None, undoLabel=None):
+        return core.crop_image(self.collection(), filename, rect, note_ids=noteIds,
+                               undo_label=undoLabel)
 
 
-    @util.api()
-    def cropImageOcclusionImage(self, noteId, rect):
-        return core.crop_image_occlusion_image(self.collection(), noteId, rect)
+    @plus_api()
+    def cropImageOcclusionImage(self, noteId, rect, undoLabel=None):
+        return core.crop_image_occlusion_image(self.collection(), noteId, rect,
+                                               undo_label=undoLabel)
 
 
-    @util.api()
-    def queryRevlog(self, cardIds=None, noteIds=None, deckName=None, sinceMs=None, untilMs=None, limit=5000):
+    @plus_api()
+    def queryRevlog(self, cardIds=None, noteIds=None, deckName=None, sinceMs=None, untilMs=None, limit=5000, offset=0):
         return core.query_revlog(
             self.collection(),
             card_ids=cardIds,
@@ -150,21 +223,22 @@ class PlusMixin:
             deck_name=deckName,
             since_ms=sinceMs,
             until_ms=untilMs,
-            limit=limit
+            limit=limit,
+            offset=offset
         )
 
 
-    @util.api()
+    @plus_api()
     def createBackup(self, force=True):
         return core.create_backup(self.collection(), force=force)
 
 
-    @util.api()
-    def renderCard(self, cardIds):
-        return core.render_card(self.collection(), cardIds)
+    @plus_api()
+    def renderCard(self, cardIds, format='html'):
+        return core.render_card(self.collection(), cardIds, render_format=format)
 
 
-    @util.api()
+    @plus_api()
     def notesSlim(self, query=None, noteIds=None, fields=None, stripHtml=True,
                   maxFieldLength=400, offset=0, limit=200):
         return core.notes_slim(
@@ -179,23 +253,35 @@ class PlusMixin:
         )
 
 
-    @util.api()
+    @plus_api()
     def mediaThumbnails(self, filenames, maxDim=320, format='jpeg', quality=70):
         return core.media_thumbnails(self.collection(), filenames, max_dim=maxDim,
                                      image_format=format, quality=quality)
 
 
-    @util.api()
-    def bulkSuspend(self, cardIds, suspend=True):
-        return core.bulk_suspend(self.collection(), cardIds, suspend=suspend)
+    @plus_api()
+    def mediaExists(self, filenames):
+        return core.media_exists(self.collection(), filenames)
 
 
-    @util.api()
-    def bulkSetDueDate(self, cardIds, days):
-        return core.bulk_set_due_date(self.collection(), cardIds, days)
+    @plus_api()
+    def storeMediaFilesBulk(self, files):
+        return core.store_media_files_bulk(self.collection(), files)
 
 
-    @util.api()
+    @plus_api()
+    def bulkSuspend(self, cardIds, suspend=True, undoLabel=None):
+        return core.bulk_suspend(self.collection(), cardIds, suspend=suspend,
+                                 undo_label=undoLabel)
+
+
+    @plus_api()
+    def bulkSetDueDate(self, cardIds, days, undoLabel=None):
+        return core.bulk_set_due_date(self.collection(), cardIds, days,
+                                      undo_label=undoLabel)
+
+
+    @plus_api()
     def exportDeckApkg(self, deckName, outPath=None, includeScheduling=True, includeMedia=True):
         return core.export_deck_apkg(
             self.collection(),
@@ -203,6 +289,32 @@ class PlusMixin:
             out_path=outPath,
             include_scheduling=includeScheduling,
             include_media=includeMedia
+        )
+
+
+    @plus_api()
+    def checkDeckIntegrity(self, deckName, includeOrphanMedia=False):
+        return core.check_deck_integrity(self.collection(), deckName,
+                                         include_orphan_media=includeOrphanMedia)
+
+
+    @plus_api()
+    def bulkReplaceInFields(self, query=None, noteIds=None, field=None, find=None,
+                            replace=None, isRegex=False, caseSensitive=True,
+                            dryRun=False, atomic=True, maxPreview=20, undoLabel=None):
+        return core.bulk_replace_in_fields(
+            self.collection(),
+            query=query,
+            note_ids=noteIds,
+            field=field,
+            find=find,
+            replace=replace,
+            is_regex=isRegex,
+            case_sensitive=caseSensitive,
+            dry_run=dryRun,
+            atomic=atomic,
+            max_preview=maxPreview,
+            undo_label=undoLabel
         )
 
 
@@ -328,7 +440,7 @@ class PlusMixin:
         self._plusSyncFinishGui()
 
 
-    @util.api()
+    @plus_api()
     def syncNow(self):
         mw = self.window()
         if mw.col is None:
@@ -355,13 +467,13 @@ class PlusMixin:
         return {'started': True, 'mediaSync': syncMedia}
 
 
-    @util.api()
+    @plus_api()
     def syncStatus(self, localOnly=False, timeoutSecs=8):
         if not isinstance(localOnly, bool):
-            raise Exception('invalid parameter: localOnly: boolean required')
+            raise core.PlusError('invalid_param', 'invalid parameter: localOnly: boolean required')
         if isinstance(timeoutSecs, bool) or not isinstance(timeoutSecs, int) \
                 or not (1 <= timeoutSecs <= 300):
-            raise Exception('invalid parameter: timeoutSecs: int 1-300 required')
+            raise core.PlusError('invalid_param', 'invalid parameter: timeoutSecs: int 1-300 required')
 
         mw = self.window()
         job = self._plusSyncJob()
@@ -442,7 +554,8 @@ class PlusMixin:
 
 
     def _plusAnkiHubIncompatible(self, problems):
-        raise Exception(
+        raise core.PlusError(
+            'incompatible_ankihub_addon',
             'INCOMPATIBLE_ANKIHUB_ADDON: installed AnkiHub add-on version {} '
             'does not match what this bridge was built against (tested: {}): '
             '{}'.format(self._plusAnkiHubVersion(),
@@ -457,15 +570,18 @@ class PlusMixin:
         pkg = core.ANKIHUB_ADDON_PACKAGE
         manager = self.window().addonManager
         if pkg not in manager.allAddons():
-            raise Exception('ANKIHUB_ADDON_MISSING: the AnkiHub add-on ({}) '
-                            'is not installed'.format(pkg))
+            raise core.PlusError('incompatible_ankihub_addon',
+                                 'ANKIHUB_ADDON_MISSING: the AnkiHub add-on ({}) '
+                                 'is not installed'.format(pkg))
         if not manager.isEnabled(pkg):
-            raise Exception('ANKIHUB_ADDON_DISABLED: the AnkiHub add-on is '
-                            'installed but disabled')
+            raise core.PlusError('incompatible_ankihub_addon',
+                                 'ANKIHUB_ADDON_DISABLED: the AnkiHub add-on is '
+                                 'installed but disabled')
         if pkg not in sys.modules:
-            raise Exception('ANKIHUB_ADDON_DISABLED: the AnkiHub add-on is '
-                            'enabled but was not loaded this session - '
-                            'restart Anki')
+            raise core.PlusError('incompatible_ankihub_addon',
+                                 'ANKIHUB_ADDON_DISABLED: the AnkiHub add-on is '
+                                 'enabled but was not loaded this session - '
+                                 'restart Anki')
         modules = {}
         try:
             for alias, name in (('suggestions', '.main.suggestions'),
@@ -562,17 +678,20 @@ class PlusMixin:
 
     def _plusAnkiHubNote(self, note):
         if isinstance(note, bool) or not isinstance(note, int):
-            raise Exception('invalid parameter: note: int note id required')
+            raise core.PlusError('invalid_param', 'invalid parameter: note: int note id required')
         try:
             return self.collection().get_note(anki.notes.NoteId(note))
         except anki.errors.NotFoundError:
-            raise Exception('note was not found: {}'.format(note))
+            raise core.PlusError('not_found', 'note was not found: {}'.format(note))
 
 
     def _plusAnkiHubLoginCheck(self, modules):
         if not modules['settings'].config.is_logged_in():
-            raise Exception('ANKIHUB_NOT_LOGGED_IN: log in through the '
-                            'AnkiHub add-on first')
+            # local logged-out state -> not_logged_in; a server 401 (stored
+            # token rejected) maps to auth_failed instead (SPEC 25)
+            raise core.PlusError('not_logged_in',
+                                 'ANKIHUB_NOT_LOGGED_IN: log in through the '
+                                 'AnkiHub add-on first')
 
 
     def _plusAnkiHubHttpError(self, err):
@@ -581,10 +700,13 @@ class PlusMixin:
         except Exception:
             body = (err.response.text or '')[:500]
         code, message = core.map_ankihub_http_error(err.response.status_code, body)
-        return Exception('{}: {}'.format(code, message))
+        # message keeps the SPEC 19 taxonomy code verbatim; the SPEC 25
+        # machine prefix is layered on top via ANKIHUB_CODE_TO_PLUS_CODE
+        return core.PlusError(core.ANKIHUB_CODE_TO_PLUS_CODE[code],
+                              '{}: {}'.format(code, message))
 
 
-    @util.api()
+    @plus_api()
     def ankihubStatus(self):
         # read-only probe: NEVER network, never raises for a missing/disabled
         # add-on, never imports an add-on Anki did not load itself
@@ -637,11 +759,11 @@ class PlusMixin:
         return status
 
 
-    @util.api()
+    @plus_api()
     def ankihubSuggestNoteUpdate(self, note, changeType, rationale, source=None,
                                  autoAccept=False):
         if not isinstance(autoAccept, bool):
-            raise Exception('invalid parameter: autoAccept: boolean required')
+            raise core.PlusError('invalid_param', 'invalid parameter: autoAccept: boolean required')
         changeType = core.validate_ankihub_change_type(changeType)
         core.validate_ankihub_rationale(rationale)
         modules = self._plusAnkiHubModules()
@@ -649,9 +771,10 @@ class PlusMixin:
         ankiNote = self._plusAnkiHubNote(note)
         database = modules['db'].ankihub_db
         if database.ankihub_nid_for_anki_nid(ankiNote.id) is None:
-            raise Exception('NOT_AN_ANKIHUB_NOTE: note {} is not on AnkiHub '
-                            '(or is deleted there) - use ankihubSuggestNewNote '
-                            'for brand-new notes'.format(note))
+            raise core.PlusError('not_found',
+                                 'NOT_AN_ANKIHUB_NOTE: note {} is not on AnkiHub '
+                                 '(or is deleted there) - use ankihubSuggestNewNote '
+                                 'for brand-new notes'.format(note))
         deckId = database.ankihub_did_for_anki_nid(ankiNote.id)
         forAnking = (deckId is not None
                      and deckId == modules['settings'].config.anking_deck_id)
@@ -673,7 +796,7 @@ class PlusMixin:
         except client.AnkiHubHTTPError as err:
             raise self._plusAnkiHubHttpError(err)
         except client.AnkiHubRequestException as err:
-            raise Exception('NETWORK_ERROR: {}'.format(err))
+            raise core.PlusError('network_error', 'NETWORK_ERROR: {}'.format(err))
         return {'result': core.map_ankihub_change_result(result.name),
                 'comment': comment}
 
@@ -696,8 +819,9 @@ class PlusMixin:
             return None
         conflictingId, wasDeleted = parsed
         if wasDeleted:
-            raise Exception('NOTE_DELETED_ON_ANKIHUB: this note was deleted '
-                            'on AnkiHub - no new suggestions can be made for it')
+            raise core.PlusError('not_found',
+                                 'NOTE_DELETED_ON_ANKIHUB: this note was deleted '
+                                 'on AnkiHub - no new suggestions can be made for it')
         if conflictingId is None or not allowResubmit:
             return None
         client = modules['client']
@@ -713,18 +837,18 @@ class PlusMixin:
         except client.AnkiHubHTTPError as resubmitErr:
             raise self._plusAnkiHubHttpError(resubmitErr)
         except client.AnkiHubRequestException as resubmitErr:
-            raise Exception('NETWORK_ERROR: {}'.format(resubmitErr))
+            raise core.PlusError('network_error', 'NETWORK_ERROR: {}'.format(resubmitErr))
         return {'result': core.map_ankihub_change_result(result.name),
                 'resubmittedAsChange': True}
 
 
-    @util.api()
+    @plus_api()
     def ankihubSuggestNewNote(self, note, rationale, source=None, deckId=None,
                               autoAccept=False, resubmitAsChangeOnDuplicate=True):
         if not isinstance(autoAccept, bool):
-            raise Exception('invalid parameter: autoAccept: boolean required')
+            raise core.PlusError('invalid_param', 'invalid parameter: autoAccept: boolean required')
         if not isinstance(resubmitAsChangeOnDuplicate, bool):
-            raise Exception('invalid parameter: resubmitAsChangeOnDuplicate: '
+            raise core.PlusError('invalid_param', 'invalid parameter: resubmitAsChangeOnDuplicate: '
                             'boolean required')
         core.validate_ankihub_rationale(rationale)
         modules = self._plusAnkiHubModules()
@@ -732,23 +856,25 @@ class PlusMixin:
         ankiNote = self._plusAnkiHubNote(note)
         database = modules['db'].ankihub_db
         if database.ankihub_nid_for_anki_nid(ankiNote.id) is not None:
-            raise Exception('VALIDATION_ERROR: note {} is already on AnkiHub '
-                            '- use ankihubSuggestNoteUpdate'.format(note))
+            raise core.PlusError('validation_error',
+                                 'VALIDATION_ERROR: note {} is already on AnkiHub '
+                                 '- use ankihubSuggestNoteUpdate'.format(note))
         if deckId is not None:
             if not isinstance(deckId, str):
-                raise Exception('invalid parameter: deckId: AnkiHub deck uuid '
+                raise core.PlusError('invalid_param', 'invalid parameter: deckId: AnkiHub deck uuid '
                                 'string required')
             try:
                 targetDeck = uuid.UUID(deckId)
             except ValueError:
-                raise Exception('invalid parameter: deckId: AnkiHub deck uuid '
+                raise core.PlusError('invalid_param', 'invalid parameter: deckId: AnkiHub deck uuid '
                                 'string required')
         else:
             targetDeck = database.ankihub_did_for_note_type(ankiNote.mid)
             if targetDeck is None:
-                raise Exception("NOT_AN_ANKIHUB_NOTE: the note's notetype is "
-                                'not linked to any AnkiHub deck - pass deckId '
-                                'explicitly')
+                raise core.PlusError('not_found',
+                                     "NOT_AN_ANKIHUB_NOTE: the note's notetype is "
+                                     'not linked to any AnkiHub deck - pass deckId '
+                                     'explicitly')
         comment = core.ankihub_comment_for_new_note(rationale, source)
         if modules['suggestions'].has_empty_first_field(ankiNote):
             # mirrors the dialog's pre-submit check (suggestion_dialog.py:368)
@@ -770,18 +896,32 @@ class PlusMixin:
                 return handled
             raise self._plusAnkiHubHttpError(err)
         except client.AnkiHubRequestException as err:
-            raise Exception('NETWORK_ERROR: {}'.format(err))
+            raise core.PlusError('network_error', 'NETWORK_ERROR: {}'.format(err))
         return {'result': 'success' if submitted else 'noChanges',
                 'resubmittedAsChange': False}
 
 
-    @util.api()
+    @plus_api()
     def plusInfo(self):
+        # actionDocs = the discoverability surface (SPEC 4.9): one-line summary
+        # from core.PLUS_ACTION_SUMMARIES + params read live off the wrapper
+        # signatures at call time. No collection access — plusInfo must keep
+        # working before a profile is open.
+        actionDocs = {}
+        for name in core.PLUS_ACTIONS:
+            actionDocs[name] = {
+                'summary': core.PLUS_ACTION_SUMMARIES.get(name, ''),
+                'params': _signature_string(getattr(self, name)),
+            }
         return {
             'name': 'AnkiConnect Plus',
             'version': core.PLUS_VERSION,
             'apiVersion': util.setting('apiVersion'),
             'actions': list(core.PLUS_ACTIONS),
+            'actionDocs': actionDocs,
+            # named call patterns callers repeatedly failed to discover from
+            # per-action docs alone (SPEC 4.9, revision 10)
+            'recipes': [dict(recipe) for recipe in core.PLUS_RECIPES],
             'docs': {
                 'plus': core.DOCS_PLUS,
                 'upstream': core.DOCS_UPSTREAM,

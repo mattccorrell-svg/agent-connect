@@ -161,7 +161,7 @@ def test3_atomicity():
 
     assert raised is not None, "atomic hard error did not raise"
     msg = str(raised)
-    prefix = "bulkAddNotes failed (batch reverted): "
+    prefix = "[batch_reverted] bulkAddNotes failed (batch reverted): "
     assert msg.startswith(prefix), msg
     report = json.loads(msg[len(prefix):])
     assert report["failedIndex"] == 9, report
@@ -494,9 +494,10 @@ def test6_query_revlog():
         " values (?, ?, -1, 3, 1, -600, 2500, 4200, 1)",
         [(rid, cid) for rid, cid in rows])
 
-    # no filters
+    # no filters; spec revision 7 pagination keys on the untruncated shape
     r = core.query_revlog(col)
     assert len(r["rows"]) == 5, r
+    assert r["total"] == 5 and r["truncated"] is False and r["nextOffset"] is None, r
     ids = [row["id"] for row in r["rows"]]
     assert ids == sorted(ids) == [rid for rid, _ in rows], ids
     for row in r["rows"]:
@@ -522,9 +523,50 @@ def test6_query_revlog():
     r = core.query_revlog(col, since_ms=base + 2000, until_ms=base + 4000)
     assert [row["id"] for row in r["rows"]] == [base + 2000, base + 3000], r
 
-    # limit: first N chronologically
+    # limit: first N chronologically; spec revision 7: truncation is signalled
     r = core.query_revlog(col, limit=2)
     assert [row["id"] for row in r["rows"]] == [base, base + 1000], r
+    assert r["total"] == 5 and r["truncated"] is True and r["nextOffset"] == 2, r
+
+    # offset resumes where nextOffset pointed; exact-tail page -> not truncated
+    r = core.query_revlog(col, limit=3, offset=2)
+    assert [row["id"] for row in r["rows"]] == [base + 2000, base + 3000, base + 4000], r
+    assert r["total"] == 5 and r["truncated"] is False and r["nextOffset"] is None, r
+    # offset past total -> empty page, never "truncated"
+    r = core.query_revlog(col, limit=2, offset=9)
+    assert r == {"rows": [], "total": 5, "truncated": False, "nextOffset": None}, r
+    # "exactly limit rows exist" is now distinguishable from truncation
+    r = core.query_revlog(col, limit=5)
+    assert len(r["rows"]) == 5 and r["truncated"] is False and r["nextOffset"] is None, r
+    # filters + pagination combine: RevA has 3 rows, page 2 of size 2
+    r = core.query_revlog(col, deck_name="RevA", limit=2, offset=2)
+    assert [row["id"] for row in r["rows"]] == [base + 3000], r
+    assert r["total"] == 3 and r["truncated"] is False, r
+    expect_error(lambda: core.query_revlog(col, offset=-1),
+                 "invalid parameter: offset: int >= 0 required")
+
+    # duplicate ids never duplicate rows or inflate total — within one chunk...
+    r = core.query_revlog(col, card_ids=[cidA, cidA])
+    assert [row["id"] for row in r["rows"]] == [base, base + 1000, base + 3000], r
+    assert r["total"] == 3, r
+    # ...and across chunk boundaries (SQL_IN_CHUNK forced to 1 so every id is
+    # its own chunk): ids are deduped before chunking, keeping chunk pairs
+    # disjoint, so the union has no duplicate rows and the COUNTs sum exactly
+    saved_chunk = core.SQL_IN_CHUNK
+    core.SQL_IN_CHUNK = 1
+    try:
+        r = core.query_revlog(col, card_ids=[cidA, cidA, cidB, cidA])
+        assert [row["id"] for row in r["rows"]] == [rid for rid, _ in rows], r
+        assert r["total"] == 5 and r["truncated"] is False and r["nextOffset"] is None, r
+        # pagination stays consistent on the multi-chunk union path
+        r = core.query_revlog(col, card_ids=[cidA, cidA, cidB], limit=2)
+        assert [row["id"] for row in r["rows"]] == [base, base + 1000], r
+        assert r["total"] == 5 and r["truncated"] is True and r["nextOffset"] == 2, r
+        r = core.query_revlog(col, note_ids=[nidA, nidA])
+        assert [row["id"] for row in r["rows"]] == [base, base + 1000, base + 3000], r
+        assert r["total"] == 3, r
+    finally:
+        core.SQL_IN_CHUNK = saved_chunk
 
 
 # ---------------------------------------------------------------- test 7

@@ -164,6 +164,22 @@ def test1_render_card():
     assert c["modelName"] == "Cloze" and c["deckName"] == "RenderDeck", c
     assert c["css"].strip(), c
 
+    # spec revision 7: format='text' returns visible text only (notesSlim
+    # conventions), format='body' strips script/style blocks but keeps HTML
+    out = core.render_card(col, [cid_basic], render_format="text")
+    t = out["cards"][0]
+    assert "render-front-XYZ" in t["question"], t["question"]
+    assert "<" not in t["question"] and "<" not in t["answer"], t
+    assert "render-back-QRS" in t["answer"], t["answer"]
+    assert t["css"].strip(), t
+    scripted = ('<script>var leak = 1;</script>front-kept'
+                '<style>.x { color: red }</style>')
+    assert core._render_format_text(col, scripted, "body") == "front-kept", \
+        core._render_format_text(col, scripted, "body")
+    assert core._render_format_text(col, scripted, "html") == scripted
+    expect_error(lambda: core.render_card(col, [cid_basic], render_format="raw"),
+                 "invalid parameter: format: one of html, body, text required")
+
     # empty list
     assert core.render_card(col, []) == {"cards": []}
     # hard error: non-int element
@@ -231,13 +247,16 @@ def test2_notes_slim_query_and_fields():
     assert out["notes"][0]["fields"]["Front"] == \
         'slim-html <b>bold</b><div>second line</div><img src="ancp-six-pic.png">', out
 
-    # maxFieldLength truncates AFTER stripping, with the … marker; 0 disables
+    # maxFieldLength truncates AFTER stripping, with the … marker; 0 disables;
+    # spec revision 7: truncatedFields names the cut fields explicitly
     out = core.notes_slim(col, note_ids=[hid], max_field_length=9)
     front = out["notes"][0]["fields"]["Front"]
     assert front == "slim-html…", front
     assert len(front) == 10, front
+    assert out["notes"][0]["truncatedFields"] == ["Front"], out["notes"][0]
     out = core.notes_slim(col, note_ids=[hid], max_field_length=0)
     assert out["notes"][0]["fields"]["Front"].endswith("ancp-six-pic.png"), out
+    assert out["notes"][0]["truncatedFields"] == [], out["notes"][0]
 
 
 # ---------------------------------------------------------------- test 3
@@ -399,14 +418,35 @@ def test6_dry_run_update_and_tags():
     back_before = col.get_note(n1)["Back"]
     snap = undo_snap()
     dry = core.bulk_update_note_fields(col, batch, dry_run=True)
-    assert dry == {"wouldUpdate": [n1], "skipped": want_skipped, "undoEntry": None}, dry
+    # spec revision 7: dry shape gained 'unchanged' (empty here — n1 changes)
+    assert dry == {"wouldUpdate": [n1], "unchanged": [], "skipped": want_skipped,
+                   "undoEntry": None}, dry
     assert col.get_note(n1)["Back"] == back_before, "dry update wrote a field"
     assert undo_snap() == snap, "dry update touched the undo stack"
 
     real = core.bulk_update_note_fields(col, batch)
     assert real["updated"] == dry["wouldUpdate"] == [n1], real
+    assert real["unchanged"] == [], real
     assert real["skipped"] == dry["skipped"], real
     assert col.get_note(n1)["Back"] == "dry-new-back"
+
+    # spec revision 7 no-op rule: re-running the identical batch writes
+    # nothing — n1 lands in 'unchanged', undoEntry is null, and the undo
+    # stack is bit-identical (no phantom entry); dry mirrors exactly
+    snap = undo_snap()
+    rerun_dry = core.bulk_update_note_fields(col, batch, dry_run=True)
+    assert rerun_dry == {"wouldUpdate": [], "unchanged": [n1],
+                         "skipped": want_skipped, "undoEntry": None}, rerun_dry
+    rerun = core.bulk_update_note_fields(col, batch)
+    assert rerun == {"updated": [], "unchanged": [n1], "skipped": want_skipped,
+                     "undoEntry": None}, rerun
+    assert undo_snap() == snap, "no-op update touched the undo stack"
+    # tags-only no-op: replacing the tag list with its current value
+    tags_now = col.get_note(n1).tags
+    rerun = core.bulk_update_note_fields(col, [{"id": n1, "tags": list(tags_now)}])
+    assert rerun == {"updated": [], "unchanged": [n1], "skipped": [],
+                     "undoEntry": None}, rerun
+    assert undo_snap() == snap, "tags-only no-op touched the undo stack"
 
     # hard param error still raises under dryRun
     expect_error(lambda: core.bulk_update_note_fields(col, "nope", dry_run=True),

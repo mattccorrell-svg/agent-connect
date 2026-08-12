@@ -29,9 +29,12 @@ import datetime
 import json
 import os
 import re
+import unicodedata
 
 import anki.collection
+import anki.consts
 import anki.notes
+import anki.notes_pb2
 import anki.sync
 import anki.utils
 from anki.errors import (Interrupted, InvalidInput, NetworkError,
@@ -51,6 +54,10 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "notesSlim",
                 # base64 thumbnails of media images: aspect-preserved, never upscaled (read-only)
                 "mediaThumbnails",
+                # do these bare media filenames exist? membership probe without the full listing (read-only)
+                "mediaExists",
+                # store many media files (base64 data or absolute path) in one call; per-item {requested, actual}
+                "storeMediaFilesBulk",
                 # suspend or unsuspend cards as one undoable batch
                 "bulkSuspend",
                 # reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch
@@ -67,10 +74,168 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "ankihubSuggestNoteUpdate",
                 # submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion
                 "ankihubSuggestNewNote",
+                # READ-ONLY deck audit: missing media, malformed clozes, cloze/card drift, optional orphan-media scan
+                "checkDeckIntegrity",
+                # find/replace (literal or regex) on ONE named field's raw HTML, one undoable batch, dryRun preview
+                "bulkReplaceInFields",
                 "plusInfo"]
+# One-line summaries served by plusInfo's actionDocs (SPEC 4.9): the
+# discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
+# present here; param signatures are read live off the plus.py wrappers.
+PLUS_ACTION_SUMMARIES = {
+    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview).",
+    "bulkUpdateNoteFields": "Update fields and/or replace tags on many notes as one undoable batch; byte-identical no-ops are not written and are reported in 'unchanged'. dryRun=true with diff=true adds a per-field before/after preview capped at maxPreview.",
+    "bulkAddTags": "Add tags to many notes as one undoable batch; only notes actually changed are written and reported in 'updated'.",
+    "addImageOcclusionNote": "Create a native Image Occlusion note from an image path or base64 data plus normalized 0-1 rects.",
+    "getImageOcclusionNote": "Read an IO note's image filename, occlusion shapes, header, backExtra, tags (read-only).",
+    "updateImageOcclusionNote": "Update an IO note's occlusions/header/backExtra/tags; omitted params are kept (the image cannot be changed).",
+    "queryRevlog": "Read-only review-history query with cardIds/noteIds/deckName/sinceMs/untilMs filters; paginated via offset+limit with total/truncated/nextOffset.",
+    "createBackup": "Create a .colpkg backup in the profile's backups folder; created=false means nothing changed since the last backup.",
+    "cropImage": "Crop a media image into a NEW media file (original kept), optionally rewriting notes to reference it.",
+    "cropImageOcclusionImage": "Crop an IO note's base image and remap its occlusion rects into the cropped frame, one undo entry.",
+    "renderCard": "Render cards' question/answer through Anki's template pipeline (read-only); format='html' (verbatim, scripts/styles included), 'body' (script/style blocks removed), or 'text' (visible text only).",
+    "notesSlim": "Compact paginated note reader for LLM consumption; exactly one of query/noteIds is required. stripHtml (default true; false returns raw field HTML), fields projection, maxFieldLength with per-note truncatedFields. Raw-fidelity field projection: fields=[...] + stripHtml=false + maxFieldLength=0 returns the chosen fields' exact stored HTML, untruncated.",
+    "mediaThumbnails": "Base64 thumbnails of media images: aspect-preserved, never upscaled (read-only).",
+    "mediaExists": "Membership probe: which of these bare media filenames exist in the media folder (read-only, input order; malformed/path-y names report exists:false).",
+    "storeMediaFilesBulk": "Store many media files (base64 data or absolute path) in one call; per-item {requested, actual} makes Anki's dedup/rename decision visible, {requested, error} on failures, input order.",
+    "bulkSuspend": "Suspend or unsuspend cards as one undoable batch.",
+    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch.",
+    "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting.",
+    "syncStatus": "Read-only sync probe: login, local dirtiness, server-required kind, async job state.",
+    "syncNow": "Start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus.",
+    "ankihubStatus": "AnkiHub bridge probe: install/enable/login/deck status + add-on compatibility (read-only, never network).",
+    "ankihubSuggestNoteUpdate": "Submit ONE change suggestion for an existing AnkiHub note through the installed AnkiHub add-on.",
+    "ankihubSuggestNewNote": "Submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion.",
+    "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional collection-wide orphan-media scan.",
+    "bulkReplaceInFields": "Find/replace (literal or python-regex) on ONE named field's raw HTML, as one undoable batch; field, find and replace are required, plus exactly one of query/noteIds. dryRun returns a capped before/after preview.",
+    "plusInfo": "Name/version/action list plus per-action actionDocs (summary + params) and a 'recipes' list of named call patterns; works before a profile is open.",
+}
+
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
 DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
 DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"
+
+#
+# Stable error codes (SPEC 25). Every error RAISED by a Plus action carries a
+# machine-parseable '[code] ' prefix before the unchanged message body; the
+# code is one of this closed vocabulary. Per-item error strings embedded in
+# results (skipped[].reason, thumbnails[].error, stored[].error, ...) are NOT
+# prefixed — they never raise. Value = retryable: True means the same call
+# may succeed later without the caller changing anything.
+#
+PLUS_ERROR_CODES = {
+    'not_found': False,               # note/card/media file/IO notetype/output dir absent
+    'invalid_param': False,           # request shape/type/range wrong (house 'invalid parameter:' family)
+    'deck_not_found': False,          # named deck does not exist (decks are never auto-created)
+    'duplicate': False,               # reserved: duplicates are per-item skip reasons today, never raised
+    'unsupported_format': False,      # image failed to load/encode (corrupt or unsupported format)
+    'io_error': False,                # reserved: disk read/write failure (today only per-item errors)
+    'batch_reverted': False,          # atomic batch hit a hard error and was rolled back; JSON report after the prefix
+    'collection_unavailable': True,   # no collection open (profile screen); retry once a profile is open
+    'sync_in_progress': True,         # reserved: syncNow reports busy states via {started:false, reason}
+    'not_logged_in': False,           # a login this add-on cannot perform is required (e.g. AnkiHub add-on logged out)
+    'auth_failed': False,             # stored credential rejected by the server (e.g. AnkiHub 401)
+    'offline': True,                  # reserved: sync network failures surface in job.error / required, not raises
+    'full_sync_required': False,      # reserved: surfaced via the sync job error, never raised
+    'network_error': True,            # transport failure / unexpected HTTP status (5xx included)
+    'rate_limited': True,             # server rate limit (e.g. AnkiHub 429); wait, then retry
+    'permission_denied': False,       # server refused (e.g. AnkiHub 403)
+    'validation_error': False,        # well-formed request refused on semantic grounds (wrong note kind, empty crop, server 400)
+    'incompatible_ankihub_addon': False,  # AnkiHub add-on missing/disabled/unloaded or drifted from the tested version
+    'source_required': False,         # AnkiHub suggestion needs a source object/text it did not get
+    'rationale_invalid': False,       # AnkiHub rationale empty or over the dialog's 1023-char cap
+    'internal': False,                # unexpected failure inside the add-on or Anki (bug, not a caller error)
+}
+
+# AnkiHub HTTP taxonomy code (SPEC 19; kept verbatim in message bodies) ->
+# SPEC 25 machine code for the '[code] ' prefix. Note the 401 mapping:
+# 'ANKIHUB_NOT_LOGGED_IN' from a server 401 means the STORED token was
+# rejected -> auth_failed; the local is_logged_in() check -> not_logged_in.
+ANKIHUB_CODE_TO_PLUS_CODE = {
+    'VALIDATION_ERROR': 'validation_error',
+    'ANKIHUB_NOT_LOGGED_IN': 'auth_failed',
+    'PERMISSION_DENIED': 'permission_denied',
+    'NOTE_DELETED_ON_ANKIHUB': 'not_found',
+    'RATE_LIMITED': 'rate_limited',
+    'NETWORK_ERROR': 'network_error',
+}
+
+
+class PlusError(Exception):
+    """Action error carrying a stable machine-parseable code (SPEC 25).
+
+    str() renders '[code] message' — the message body is byte-identical to
+    the pre-SPEC-25 error text; only the bracketed prefix is new. Callers
+    recover the code with error.split('] ', 1)[0].lstrip('[').
+    """
+
+    def __init__(self, code, message):
+        if code not in PLUS_ERROR_CODES:
+            # a typo'd code is a bug in this add-on, never a caller error
+            raise ValueError('unknown plus error code: {}'.format(code))
+        super().__init__('[{}] {}'.format(code, message))
+        self.code = code
+        self.message = message
+        self.retryable = PLUS_ERROR_CODES[code]
+
+
+# plusInfo 'recipes' (SPEC 4.9, revision 10): named call patterns callers
+# repeatedly failed to discover from per-action docs alone. Static — plusInfo
+# must keep working before a profile is open.
+PLUS_RECIPES = [
+    {
+        'name': 'raw field projection',
+        'description': ("Raw-fidelity field projection: to read a field's EXACT stored HTML "
+                        "(no stripping, no truncation) for chosen fields, call notesSlim with "
+                        "fields=[...] + stripHtml=false + maxFieldLength=0. This is the "
+                        "read-before-edit primitive: what it returns is byte-identical to what "
+                        "bulkUpdateNoteFields/bulkReplaceInFields will operate on."),
+        'example': {'action': 'notesSlim',
+                    'params': {'query': 'deck:current', 'fields': ['Text'],
+                               'stripHtml': False, 'maxFieldLength': 0}},
+    },
+    {
+        'name': 'verified-sync contract',
+        'description': ("The collection is verified synced iff syncStatus reports "
+                        "job.state == 'done' AND required == 'no_changes' AND "
+                        "mediaSyncing == false. Anything less (job error, required "
+                        "normal_sync/null, media still running) means NOT verified. "
+                        "Start a sync with syncNow, then poll syncStatus until the "
+                        "contract holds."),
+        'example': {'action': 'syncStatus', 'params': {'timeoutSecs': 8}},
+    },
+    {
+        'name': 'dry-run-then-write pattern',
+        'description': ("Preview every bulk write before committing: call the bulk action "
+                        "with dryRun=true (bulkUpdateNoteFields also takes diff=true for a "
+                        "per-field before/after preview; bulkReplaceInFields previews on every "
+                        "dry run), inspect wouldAdd/wouldUpdate/wouldChange + skipped, then "
+                        "repeat the identical call with dryRun=false. Dry and real runs share "
+                        "the same validation code by construction, so the real run's writes "
+                        "match the dry prediction — with one caveat: a bulkUpdateNoteFields "
+                        "batch that repeats the same note id may predict MORE updates (and "
+                        "duplicate preview entries) than the real sequential run performs, "
+                        "because the dry pass compares every entry against stored pre-batch "
+                        "values while the real run re-reads the note after each write; the "
+                        "final note state still matches the last entry. De-duplicate ids per "
+                        "batch for exact parity."),
+        'example': {'action': 'bulkUpdateNoteFields',
+                    'params': {'notes': [{'id': 1712345678901,
+                                          'fields': {'Front': 'new value'}}],
+                               'dryRun': True, 'diff': True}},
+    },
+    {
+        'name': 'undo-label convention',
+        'description': ("Pass undoLabel on any write action to name its undo entry "
+                        "'AnkiConnect Plus: <label>' (whitespace collapsed, 80-char cap) so "
+                        "multiple batches stay distinguishable in Anki's Undo menu; the "
+                        "response's undoEntry always reports the ACTUAL final entry name "
+                        "(null when nothing undoable was written)."),
+        'example': {'action': 'bulkAddTags',
+                    'params': {'noteIds': [1712345678901], 'tags': 'reviewed',
+                               'undoLabel': 'PI 7 tag sweep'}},
+    },
+]
 
 UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
 UNDO_BULK_UPDATE = 'AnkiConnect Plus: Bulk Update'
@@ -79,6 +244,13 @@ UNDO_CROP_IMAGE = 'AnkiConnect Plus: Crop Image'
 UNDO_CROP_IO = 'AnkiConnect Plus: Crop IO Image'
 UNDO_BULK_SUSPEND = 'AnkiConnect Plus: Bulk Suspend'
 UNDO_BULK_DUE = 'AnkiConnect Plus: Bulk Due Date'
+UNDO_BULK_REPLACE = 'AnkiConnect Plus: Replace in Fields'
+
+# undoLabel (SPEC 24): every write action takes an optional undoLabel whose
+# sanitized form becomes the undo entry name 'AnkiConnect Plus: <label>', so
+# the Undo menu can distinguish same-action batches. sanitize_undo_label().
+UNDO_LABEL_PREFIX = 'AnkiConnect Plus: '
+UNDO_LABEL_MAX_CHARS = 80
 
 # cards.queue: -1 = suspended; any negative queue (-1 suspended, -2 sibling-
 # buried, -3 manually buried) is restored by the backend unsuspend op (SPEC 16)
@@ -129,31 +301,31 @@ def io_num(v):
 
 def serialize_occlusions(shapes, hide_all_guess_one=True):
     if not isinstance(shapes, list):
-        raise Exception('invalid parameter: occlusions: string or array required')
+        raise PlusError('invalid_param', 'invalid parameter: occlusions: string or array required')
     if not shapes:
-        raise Exception('invalid parameter: occlusions: at least one occlusion required')
+        raise PlusError('invalid_param', 'invalid parameter: occlusions: at least one occlusion required')
 
     clozes = []
     for i, shape in enumerate(shapes):
         if not isinstance(shape, dict):
-            raise Exception('invalid parameter: occlusions[{}]: object required'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: object required'.format(i))
         for key in ('left', 'top', 'width', 'height'):
             value = shape.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise Exception('invalid parameter: occlusions[{}]: {} must be a number'.format(i, key))
+                raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: {} must be a number'.format(i, key))
         left, top = shape['left'], shape['top']
         width, height = shape['width'], shape['height']
         if not (0 <= left <= 1) or not (0 <= top <= 1):
-            raise Exception('invalid parameter: occlusions[{}]: left and top must be within 0-1'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: left and top must be within 0-1'.format(i))
         if not (0 < width <= 1) or not (0 < height <= 1):
-            raise Exception('invalid parameter: occlusions[{}]: width and height must be within 0-1'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: width and height must be within 0-1'.format(i))
         # io_num serializes at 4 decimal places; reject sizes that would
         # round to a zero-width/zero-height rect despite passing the range check
         if float('{:.4f}'.format(float(width))) == 0 or float('{:.4f}'.format(float(height))) == 0:
-            raise Exception('invalid parameter: occlusions[{}]: width and height must be at least 0.00005'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: width and height must be at least 0.00005'.format(i))
         ordinal = shape.get('ordinal', i + 1)
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
-            raise Exception('invalid parameter: occlusions[{}]: ordinal must be a non-negative integer'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: occlusions[{}]: ordinal must be a non-negative integer'.format(i))
 
         properties = 'left={}:top={}:width={}:height={}'.format(
             io_num(left), io_num(top), io_num(width), io_num(height))
@@ -193,7 +365,23 @@ def find_io_notetype_id(col):
     notetype = col.models.by_name('Image Occlusion')
     if notetype is not None:
         return notetype['id']
-    raise Exception('image occlusion notetype not found')
+    raise PlusError('not_found', 'image occlusion notetype not found')
+
+
+def sanitize_undo_label(label):
+    """None -> None (the action keeps its default undo entry name). A string
+    -> 'AnkiConnect Plus: <label>' with whitespace runs (newlines included)
+    collapsed to single spaces, ends stripped, and the label capped at 80
+    characters (SPEC 24). Anything else — or a label that sanitizes to
+    nothing — is a parameter error, raised before any write."""
+    if label is None:
+        return None
+    if not isinstance(label, str):
+        raise PlusError('invalid_param', 'invalid parameter: undoLabel: string required')
+    cleaned = ' '.join(label.split())[:UNDO_LABEL_MAX_CHARS].rstrip()
+    if not cleaned:
+        raise PlusError('invalid_param', 'invalid parameter: undoLabel: non-empty string required')
+    return UNDO_LABEL_PREFIX + cleaned
 
 
 def _revert_batch(col, undo_name):
@@ -214,28 +402,31 @@ def _pop_empty_undo(col, target, written, undo_name):
 
 def _batch_error(action, undo_name, count_key, index, error, count, skipped):
     report = {'failedIndex': index, 'error': str(error), count_key: count, 'skipped': skipped}
-    return Exception('{} failed (batch reverted): {}'.format(action, json.dumps(report, separators=(',', ':'))))
+    return PlusError('batch_reverted', '{} failed (batch reverted): {}'.format(
+        action, json.dumps(report, separators=(',', ':'))))
 
 
 def _validate_tag_list(tags, name):
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
-        raise Exception('invalid parameter: {}: list of strings required'.format(name))
+        raise PlusError('invalid_param', 'invalid parameter: {}: list of strings required'.format(name))
 
 
 #
 # Bulk actions
 #
 
-def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=False):
+def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=False,
+                   undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_ADD
     if not isinstance(notes, list):
-        raise Exception('invalid parameter: notes: list required')
+        raise PlusError('invalid_param', 'invalid parameter: notes: list required')
     if not notes:
         if dry_run:
             return {'wouldAdd': 0, 'skipped': [], 'undoEntry': None}
         return {'added': [], 'skipped': [], 'undoEntry': None}
     for i, note in enumerate(notes):
         if not isinstance(note, dict):
-            raise Exception('invalid parameter: notes[{}]: object required'.format(i))
+            raise PlusError('invalid_param', 'invalid parameter: notes[{}]: object required'.format(i))
 
     # resolution pass: no writes
     resolved = []
@@ -353,26 +544,39 @@ def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=Fals
                 ankiNote[name] = value
             ankiNote.tags = list(entry['tags'])
             if target is None:
-                target = col.add_custom_undo_entry(UNDO_BULK_ADD)
+                target = col.add_custom_undo_entry(undo_name)
             col.add_note(ankiNote, entry['did'])
             col.merge_undo_entries(target)
             added.append(ankiNote.id)
         except Exception as e:
             if atomic:
-                _revert_batch(col, UNDO_BULK_ADD)
-                raise _batch_error('bulkAddNotes', UNDO_BULK_ADD, 'addedBeforeRevert', i, e, len(added), skipped)
+                _revert_batch(col, undo_name)
+                raise _batch_error('bulkAddNotes', undo_name, 'addedBeforeRevert', i, e, len(added), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
-    _pop_empty_undo(col, target, added, UNDO_BULK_ADD)
-    return {'added': added, 'skipped': skipped, 'undoEntry': UNDO_BULK_ADD if added else None}
+    _pop_empty_undo(col, target, added, undo_name)
+    return {'added': added, 'skipped': skipped, 'undoEntry': undo_name if added else None}
 
 
-def bulk_update_note_fields(col, notes, atomic=True, dry_run=False):
+def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
+                            max_preview=20, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_UPDATE
     if not isinstance(notes, list):
-        raise Exception('invalid parameter: notes: list required')
+        raise PlusError('invalid_param', 'invalid parameter: notes: list required')
+    if not isinstance(diff, bool):
+        raise PlusError('invalid_param', 'invalid parameter: diff: boolean required')
+    if isinstance(max_preview, bool) or not isinstance(max_preview, int) or max_preview < 0:
+        raise PlusError('invalid_param', 'invalid parameter: maxPreview: int >= 0 required')
+    if diff and not dry_run:
+        # diff is a preview feature (SPEC 4.2, revision 10); the real run
+        # stays lean — reading before-values back would double its cost
+        raise PlusError('invalid_param', 'invalid parameter: diff: only valid with dryRun')
 
     updated = []
+    unchanged = []
     skipped = []
+    preview = []       # dryRun+diff only: [{noteId, field, before, after}], capped
+    diffTotal = 0      # changed-field entries found, INCLUDING those past the cap
     target = None
     for i, entry in enumerate(notes):
         if not isinstance(entry, dict):
@@ -411,10 +615,32 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False):
                 skipped.append({'index': i, 'reason': 'invalid parameter: notes[{}].fields.{}: string required'.format(i, badValue)})
                 continue
 
+        # no-op detection (shared rule with bulkAddTags, SPEC 4.2/4.3): an
+        # entry whose requested fields AND tags all byte-match the note's
+        # current values is never written — it lands in 'unchanged', creates
+        # no undo entry, and the check is read-only so the dry and real paths
+        # share it by construction (SPEC 15)
+        if ((fields is None or all(ankiNote[name] == value for name, value in fields.items()))
+                and (tags is None or list(tags) == ankiNote.tags)):
+            unchanged.append(nid)
+            continue
+
         # dry run: full per-entry validation done, nothing read past this point
         # touches the collection or the in-memory Note (SPEC 15)
         if dry_run:
             updated.append(nid)
+            if diff and fields is not None:
+                # one preview entry PER CHANGED FIELD, unchanged fields
+                # omitted (byte comparison against the loaded note — the
+                # same read the no-op check above already performs);
+                # tags-only changes contribute no preview entries
+                for name, value in fields.items():
+                    if ankiNote[name] == value:
+                        continue
+                    diffTotal += 1
+                    if len(preview) < max_preview:
+                        preview.append({'noteId': nid, 'field': name,
+                                        'before': ankiNote[name], 'after': value})
             continue
 
         try:
@@ -424,35 +650,43 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False):
             if tags is not None:
                 ankiNote.tags = list(tags)
             if target is None:
-                target = col.add_custom_undo_entry(UNDO_BULK_UPDATE)
+                target = col.add_custom_undo_entry(undo_name)
             col.update_note(ankiNote)
             col.merge_undo_entries(target)
             updated.append(nid)
         except Exception as e:
             if atomic:
-                _revert_batch(col, UNDO_BULK_UPDATE)
-                raise _batch_error('bulkUpdateNoteFields', UNDO_BULK_UPDATE, 'updatedBeforeRevert', i, e, len(updated), skipped)
+                _revert_batch(col, undo_name)
+                raise _batch_error('bulkUpdateNoteFields', undo_name, 'updatedBeforeRevert', i, e, len(updated), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
     if dry_run:
-        return {'wouldUpdate': updated, 'skipped': skipped, 'undoEntry': None}
-    _pop_empty_undo(col, target, updated, UNDO_BULK_UPDATE)
-    return {'updated': updated, 'skipped': skipped, 'undoEntry': UNDO_BULK_UPDATE if updated else None}
+        result = {'wouldUpdate': updated, 'unchanged': unchanged, 'skipped': skipped,
+                  'undoEntry': None}
+        if diff:
+            # additive keys, present only when diff was requested (SPEC 4.2)
+            result['preview'] = preview
+            result['previewTruncated'] = diffTotal > len(preview)
+        return result
+    _pop_empty_undo(col, target, updated, undo_name)
+    return {'updated': updated, 'unchanged': unchanged, 'skipped': skipped,
+            'undoEntry': undo_name if updated else None}
 
 
-def bulk_add_tags(col, note_ids, tags, atomic=True, dry_run=False):
+def bulk_add_tags(col, note_ids, tags, atomic=True, dry_run=False, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_TAGS
     if not isinstance(note_ids, list):
-        raise Exception('invalid parameter: noteIds: list required')
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: list required')
     if not all(isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids):
-        raise Exception('invalid parameter: noteIds: ints required')
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
     if isinstance(tags, str):
         tagList = tags.split()
     elif isinstance(tags, list) and all(isinstance(t, str) for t in tags):
         tagList = [t for tag in tags for t in tag.split()]
     else:
-        raise Exception('invalid parameter: tags: string or list of strings required')
+        raise PlusError('invalid_param', 'invalid parameter: tags: string or list of strings required')
     if not tagList:
-        raise Exception('invalid parameter: tags: at least one tag required')
+        raise PlusError('invalid_param', 'invalid parameter: tags: at least one tag required')
 
     updated = []
     skipped = []
@@ -474,20 +708,20 @@ def bulk_add_tags(col, note_ids, tags, atomic=True, dry_run=False):
             for t in missing:
                 ankiNote.add_tag(t)
             if target is None:
-                target = col.add_custom_undo_entry(UNDO_BULK_TAGS)
+                target = col.add_custom_undo_entry(undo_name)
             col.update_note(ankiNote)
             col.merge_undo_entries(target)
             updated.append(nid)
         except Exception as e:
             if atomic:
-                _revert_batch(col, UNDO_BULK_TAGS)
-                raise _batch_error('bulkAddTags', UNDO_BULK_TAGS, 'updatedBeforeRevert', i, e, len(updated), skipped)
+                _revert_batch(col, undo_name)
+                raise _batch_error('bulkAddTags', undo_name, 'updatedBeforeRevert', i, e, len(updated), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
     if dry_run:
         return {'wouldUpdate': updated, 'skipped': skipped, 'undoEntry': None}
-    _pop_empty_undo(col, target, updated, UNDO_BULK_TAGS)
-    return {'updated': updated, 'skipped': skipped, 'undoEntry': UNDO_BULK_TAGS if updated else None}
+    _pop_empty_undo(col, target, updated, undo_name)
+    return {'updated': updated, 'skipped': skipped, 'undoEntry': undo_name if updated else None}
 
 
 #
@@ -496,45 +730,47 @@ def bulk_add_tags(col, note_ids, tags, atomic=True, dry_run=False):
 
 def add_image_occlusion_note(col, image_path=None, image_data_b64=None, image_filename=None,
                              occlusions=None, header="", back_extra="",
-                             tags=None, deck_name=None, hide_all_guess_one=True):
+                             tags=None, deck_name=None, hide_all_guess_one=True,
+                             undo_label=None):
+    undo_name = sanitize_undo_label(undo_label)
     if (image_path is None) == (image_data_b64 is None):
-        raise Exception('invalid parameter: image: exactly one of path or data required')
+        raise PlusError('invalid_param', 'invalid parameter: image: exactly one of path or data required')
 
     if isinstance(occlusions, str):
         occlusionsStr = occlusions
     elif isinstance(occlusions, list):
         occlusionsStr = serialize_occlusions(occlusions, hide_all_guess_one)
     else:
-        raise Exception('invalid parameter: occlusions: string or array required')
+        raise PlusError('invalid_param', 'invalid parameter: occlusions: string or array required')
 
     if not isinstance(header, str):
-        raise Exception('invalid parameter: header: string required')
+        raise PlusError('invalid_param', 'invalid parameter: header: string required')
     if not isinstance(back_extra, str):
-        raise Exception('invalid parameter: backExtra: string required')
+        raise PlusError('invalid_param', 'invalid parameter: backExtra: string required')
     tags = tags or []
     _validate_tag_list(tags, 'tags')
 
     if deck_name is not None and not isinstance(deck_name, str):
-        raise Exception('invalid parameter: deckName: string required')
+        raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
     did = col.decks.id_for_name(deck_name) if deck_name else None
     if did is None:
-        raise Exception('deck was not found: {}'.format(deck_name))
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
 
     imageData = None
     if image_data_b64 is not None:
         if not image_filename or not isinstance(image_filename, str):
-            raise Exception('invalid parameter: image.filename: required with data')
+            raise PlusError('invalid_param', 'invalid parameter: image.filename: required with data')
         if not isinstance(image_data_b64, str):
-            raise Exception('invalid parameter: image.data: string required')
+            raise PlusError('invalid_param', 'invalid parameter: image.data: string required')
         try:
             # tolerate MIME/RFC-2045 line-wrapped base64 (as upstream's lenient
             # media path does) while still rejecting garbage via validate=True
             imageData = base64.b64decode(''.join(image_data_b64.split()), validate=True)
         except (binascii.Error, ValueError):
-            raise Exception('invalid parameter: image.data: invalid base64')
+            raise PlusError('invalid_param', 'invalid parameter: image.data: invalid base64')
     else:
         if not isinstance(image_path, str) or not os.path.isfile(image_path):
-            raise Exception('image file was not found: {}'.format(image_path))
+            raise PlusError('not_found', 'image file was not found: {}'.format(image_path))
 
     # all validation done; writes start here
     col.add_image_occlusion_notetype()
@@ -547,28 +783,42 @@ def add_image_occlusion_note(col, image_path=None, image_data_b64=None, image_fi
         imagePath = image_path
 
     before = col.db.scalar('select max(id) from notes') or 0
-    col.add_image_occlusion_note(notetypeId, imagePath, occlusionsStr, header, back_extra, list(tags))
-    nid = col.db.scalar('select id from notes where id > ?', before)
-    if nid is None:
-        raise Exception('image occlusion note was not created')
-    cardIds = col.db.list('select id from cards where nid = ? order by ord', nid)
+    # undoLabel (SPEC 24): the custom entry wraps the backend add AND the deck
+    # move so one relabeled undo reverts both; the media write above is not
+    # undoable either way. Without a label the pre-SPEC-24 path is unchanged
+    # (the backend's own entry, deck move merged into it).
+    target = col.add_custom_undo_entry(undo_name) if undo_name is not None else None
+    try:
+        col.add_image_occlusion_note(notetypeId, imagePath, occlusionsStr, header, back_extra, list(tags))
+        if target is not None:
+            col.merge_undo_entries(target)
+        nid = col.db.scalar('select id from notes where id > ?', before)
+        if nid is None:
+            raise PlusError('internal', 'image occlusion note was not created')
+        cardIds = col.db.list('select id from cards where nid = ? order by ord', nid)
 
-    currentDids = set(col.db.list('select distinct did from cards where nid = ?', nid))
-    if cardIds and currentDids != {did}:
-        target = col.undo_status().last_step
-        col.set_deck(cardIds, did)
-        col.merge_undo_entries(target)
+        currentDids = set(col.db.list('select distinct did from cards where nid = ?', nid))
+        if cardIds and currentDids != {did}:
+            mergeTarget = target if target is not None else col.undo_status().last_step
+            col.set_deck(cardIds, did)
+            col.merge_undo_entries(mergeTarget)
+    except Exception:
+        if target is not None:
+            _revert_batch(col, undo_name)
+        raise
 
-    return {'noteId': nid, 'cardIds': cardIds}
+    # undoEntry always reports the ACTUAL top-of-stack entry name (SPEC 24):
+    # the sanitized label when given, else the backend's own entry name
+    return {'noteId': nid, 'cardIds': cardIds, 'undoEntry': col.undo_status().undo}
 
 
 def get_image_occlusion_note(col, note_id):
     if isinstance(note_id, bool) or not isinstance(note_id, int):
-        raise Exception('invalid parameter: noteId: int required')
+        raise PlusError('invalid_param', 'invalid parameter: noteId: int required')
 
     resp = col.get_image_occlusion_note(note_id)
     if resp.WhichOneof('value') != 'note':
-        raise Exception('could not read image occlusion note {}: {}'.format(note_id, resp.error))
+        raise PlusError('not_found', 'could not read image occlusion note {}: {}'.format(note_id, resp.error))
 
     note = resp.note
     return {
@@ -582,15 +832,17 @@ def get_image_occlusion_note(col, note_id):
 
 
 def update_image_occlusion_note(col, note_id, occlusions=None, header=None,
-                                back_extra=None, tags=None, hide_all_guess_one=True):
+                                back_extra=None, tags=None, hide_all_guess_one=True,
+                                undo_label=None):
+    undo_name = sanitize_undo_label(undo_label)
     if isinstance(note_id, bool) or not isinstance(note_id, int):
-        raise Exception('invalid parameter: noteId: int required')
+        raise PlusError('invalid_param', 'invalid parameter: noteId: int required')
     try:
         ankiNote = col.get_note(note_id)
     except NotFoundError:
-        raise Exception('note was not found: {}'.format(note_id))
+        raise PlusError('not_found', 'note was not found: {}'.format(note_id))
     if ankiNote.note_type().get('originalStockKind') != IO_STOCK_KIND:
-        raise Exception('note is not an image occlusion note: {}'.format(note_id))
+        raise PlusError('validation_error', 'note is not an image occlusion note: {}'.format(note_id))
 
     if occlusions is None:
         occlusionsStr = None
@@ -599,11 +851,11 @@ def update_image_occlusion_note(col, note_id, occlusions=None, header=None,
     elif isinstance(occlusions, list):
         occlusionsStr = serialize_occlusions(occlusions, hide_all_guess_one)
     else:
-        raise Exception('invalid parameter: occlusions: string or array required')
+        raise PlusError('invalid_param', 'invalid parameter: occlusions: string or array required')
     if header is not None and not isinstance(header, str):
-        raise Exception('invalid parameter: header: string required')
+        raise PlusError('invalid_param', 'invalid parameter: header: string required')
     if back_extra is not None and not isinstance(back_extra, str):
-        raise Exception('invalid parameter: backExtra: string required')
+        raise PlusError('invalid_param', 'invalid parameter: backExtra: string required')
     if tags is not None:
         _validate_tag_list(tags, 'tags')
 
@@ -618,7 +870,35 @@ def update_image_occlusion_note(col, note_id, occlusions=None, header=None,
     if tags is None:
         tags = ankiNote.tags
 
-    col.update_image_occlusion_note(note_id, occlusionsStr, header, back_extra, list(tags))
+    # no-op pre-detection (SPEC 4.6/24, revision 11 — same read-only
+    # unchanged-detection convention as SPEC 4.2/4.3): when every resolved
+    # value already byte-matches the note, the backend performs zero undoable
+    # writes and rslib drops its own empty undo step, so reading
+    # undo_status().undo afterwards would report an UNRELATED older entry
+    # (and a labeled call would leave an empty do-nothing custom entry,
+    # violating Deviation #7). Return before any entry is created.
+    if (occlusionsStr == ankiNote.fields[indexes.occlusions]
+            and header == ankiNote.fields[indexes.header]
+            and back_extra == ankiNote.fields[indexes.back_extra]
+            and list(tags) == ankiNote.tags):
+        return {'undoEntry': None}
+
+    # undoLabel (SPEC 24): wrap the backend update in a relabeled custom entry
+    # when a label was given; the default path stays the backend's own entry
+    if undo_name is not None:
+        target = col.add_custom_undo_entry(undo_name)
+        try:
+            col.update_image_occlusion_note(note_id, occlusionsStr, header, back_extra, list(tags))
+            col.merge_undo_entries(target)
+        except Exception:
+            _revert_batch(col, undo_name)
+            raise
+    else:
+        col.update_image_occlusion_note(note_id, occlusionsStr, header, back_extra, list(tags))
+    # contract change (SPEC 24, was null): report the ACTUAL undo entry name.
+    # Safe here: the no-op pre-detection above guarantees the backend wrote
+    # (and pushed) an entry, so the top of the stack is ours.
+    return {'undoEntry': col.undo_status().undo}
 
 
 #
@@ -627,17 +907,17 @@ def update_image_occlusion_note(col, note_id, occlusions=None, header=None,
 
 def _validate_crop_rect(rect):
     if not isinstance(rect, dict):
-        raise Exception('invalid parameter: rect: object required')
+        raise PlusError('invalid_param', 'invalid parameter: rect: object required')
     for key in ('left', 'top', 'width', 'height'):
         value = rect.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise Exception('invalid parameter: rect: {} must be a number'.format(key))
+            raise PlusError('invalid_param', 'invalid parameter: rect: {} must be a number'.format(key))
     left, top = float(rect['left']), float(rect['top'])
     width, height = float(rect['width']), float(rect['height'])
     if not (0 <= left <= 1) or not (0 <= top <= 1):
-        raise Exception('invalid parameter: rect: left and top must be within 0-1')
+        raise PlusError('invalid_param', 'invalid parameter: rect: left and top must be within 0-1')
     if not (0 < width <= 1) or not (0 < height <= 1):
-        raise Exception('invalid parameter: rect: width and height must be within 0-1')
+        raise PlusError('invalid_param', 'invalid parameter: rect: width and height must be within 0-1')
     return left, top, width, height
 
 
@@ -651,19 +931,19 @@ def _crop_media_image(col, filename, rect):
     """
     left, top, width, height = _validate_crop_rect(rect)
     if not isinstance(filename, str) or not filename:
-        raise Exception('invalid parameter: filename: string required')
+        raise PlusError('invalid_param', 'invalid parameter: filename: string required')
     if os.path.basename(filename) != filename:
-        raise Exception('invalid parameter: filename: bare media filename required')
+        raise PlusError('invalid_param', 'invalid parameter: filename: bare media filename required')
     path = os.path.join(col.media.dir(), filename)
     if not os.path.isfile(path):
-        raise Exception('media file was not found: {}'.format(filename))
+        raise PlusError('not_found', 'media file was not found: {}'.format(filename))
 
     from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QRect
     from PyQt6.QtGui import QImage
 
     img = QImage(path)
     if img.isNull() or img.width() < 1 or img.height() < 1:
-        raise Exception('could not load image: {} (unsupported or corrupt format)'.format(filename))
+        raise PlusError('unsupported_format', 'could not load image: {} (unsupported or corrupt format)'.format(filename))
     imgW, imgH = img.width(), img.height()
 
     # QImage.copy PADS (does not clamp) when the rect leaves the image, and
@@ -673,7 +953,7 @@ def _crop_media_image(col, filename, rect):
     cw = min(int(round(width * imgW)), imgW - cx)
     ch = min(int(round(height * imgH)), imgH - cy)
     if cw < 1 or ch < 1:
-        raise Exception('invalid parameter: rect: selects an empty area of {} ({}x{})'.format(
+        raise PlusError('invalid_param', 'invalid parameter: rect: selects an empty area of {} ({}x{})'.format(
             filename, imgW, imgH))
 
     cropped = img.copy(QRect(cx, cy, cw, ch))
@@ -692,21 +972,22 @@ def _crop_media_image(col, filename, rect):
     ok = cropped.save(buf, fmt)
     buf.close()
     if not ok:
-        raise Exception('could not encode cropped image as {}: {}'.format(fmt, filename))
+        raise PlusError('unsupported_format', 'could not encode cropped image as {}: {}'.format(fmt, filename))
     return newName, bytes(ba), (cx, cy, cw, ch), imgW, imgH
 
 
-def crop_image(col, filename, rect, note_ids=None):
+def crop_image(col, filename, rect, note_ids=None, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_CROP_IMAGE
     notes = []
     if note_ids is not None:
         if not isinstance(note_ids, list) or not all(
                 isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids):
-            raise Exception('invalid parameter: noteIds: ints required')
+            raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
         for nid in dict.fromkeys(note_ids):  # dedupe: one Note object per id
             try:
                 notes.append(col.get_note(nid))
             except NotFoundError:
-                raise Exception('note was not found: {}'.format(nid))
+                raise PlusError('not_found', 'note was not found: {}'.format(nid))
 
     newName, data, (_cx, _cy, cw, ch), _imgW, _imgH = _crop_media_image(col, filename, rect)
 
@@ -728,53 +1009,58 @@ def crop_image(col, filename, rect, note_ids=None):
         if not changed:
             continue
         if target is None:
-            target = col.add_custom_undo_entry(UNDO_CROP_IMAGE)
+            target = col.add_custom_undo_entry(undo_name)
         try:
             col.update_note(ankiNote)
             col.merge_undo_entries(target)
         except Exception as e:
-            _revert_batch(col, UNDO_CROP_IMAGE)
-            raise Exception('cropImage failed (note updates reverted): {}'.format(e))
+            _revert_batch(col, undo_name)
+            raise PlusError('batch_reverted', 'cropImage failed (note updates reverted): {}'.format(e))
         updated.append(ankiNote.id)
 
-    return {'newFilename': fname, 'width': cw, 'height': ch, 'notesUpdated': updated}
+    return {'newFilename': fname, 'width': cw, 'height': ch, 'notesUpdated': updated,
+            'undoEntry': undo_name if updated else None}
 
 
-def crop_image_occlusion_image(col, note_id, rect):
+def crop_image_occlusion_image(col, note_id, rect, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_CROP_IO
     if isinstance(note_id, bool) or not isinstance(note_id, int):
-        raise Exception('invalid parameter: noteId: int required')
+        raise PlusError('invalid_param', 'invalid parameter: noteId: int required')
     try:
         ankiNote = col.get_note(note_id)
     except NotFoundError:
-        raise Exception('note was not found: {}'.format(note_id))
+        raise PlusError('not_found', 'note was not found: {}'.format(note_id))
     if ankiNote.note_type().get('originalStockKind') != IO_STOCK_KIND:
-        raise Exception('note is not an image occlusion note: {}'.format(note_id))
+        raise PlusError('validation_error', 'note is not an image occlusion note: {}'.format(note_id))
 
     ioNote = get_image_occlusion_note(col, note_id)
     filename = ioNote['imageFilename']
     if not filename:
-        raise Exception('image occlusion note has no image file: {}'.format(note_id))
+        raise PlusError('validation_error', 'image occlusion note has no image file: {}'.format(note_id))
 
     # refuse anything the rect-only serializer (SPEC 5) cannot re-emit losslessly
     shapes = ioNote['occlusions']
     oiValues = set()
     for entry in shapes:
         if entry['shape'] != 'rect':
-            raise Exception('cropImageOcclusionImage supports rect occlusions only; '
+            raise PlusError('validation_error',
+                            'cropImageOcclusionImage supports rect occlusions only; '
                             'note {} contains a {} shape'.format(note_id, entry['shape']))
         if 'left' not in entry:
-            raise Exception('could not parse rect occlusion on note {}'.format(note_id))
+            raise PlusError('validation_error', 'could not parse rect occlusion on note {}'.format(note_id))
         properties = entry.get('properties') or {}
         extra = sorted(set(properties) - {'oi'})
         if extra:
-            raise Exception('cropImageOcclusionImage cannot preserve occlusion properties {} '
+            raise PlusError('validation_error',
+                            'cropImageOcclusionImage cannot preserve occlusion properties {} '
                             'on note {}'.format(', '.join(extra), note_id))
         oiValues.add(properties.get('oi'))
     # serialize_occlusions applies one note-level oi flag to every shape; mixed
     # per-shape oi (only possible on hand-edited fields -- Anki's editor sets
     # oi globally) cannot be represented, so refuse rather than homogenize
     if len(oiValues) > 1:
-        raise Exception('cropImageOcclusionImage cannot preserve mixed oi flags '
+        raise PlusError('validation_error',
+                        'cropImageOcclusionImage cannot preserve mixed oi flags '
                         'on note {}'.format(note_id))
 
     newName, data, (cx, cy, cw, ch), imgW, imgH = _crop_media_image(col, filename, rect)
@@ -807,7 +1093,7 @@ def crop_image_occlusion_image(col, note_id, rect):
                      'ordinal': entry['ordinal']})
 
     if not kept:
-        raise Exception('crop would remove all occlusions on note {}'.format(note_id))
+        raise PlusError('validation_error', 'crop would remove all occlusions on note {}'.format(note_id))
 
     occlusionsStr = serialize_occlusions(kept, hide_all_guess_one=ioNote['occludeInactive'])
 
@@ -818,7 +1104,7 @@ def crop_image_occlusion_image(col, note_id, rect):
     # media write first: not undoable, but it only ADDS a new file
     fname = col.media.write_data(newName, data)
 
-    target = col.add_custom_undo_entry(UNDO_CROP_IO)
+    target = col.add_custom_undo_entry(undo_name)
     try:
         # same raw format the backend itself writes to the Image field
         ankiNote.fields[indexes.image] = '<img src="{}">'.format(fname)
@@ -827,13 +1113,13 @@ def crop_image_occlusion_image(col, note_id, rect):
         col.update_image_occlusion_note(note_id, occlusionsStr, header, backExtra, list(ankiNote.tags))
         col.merge_undo_entries(target)
     except Exception as e:
-        _revert_batch(col, UNDO_CROP_IO)
-        raise Exception('cropImageOcclusionImage failed (changes reverted): {}'.format(e))
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted', 'cropImageOcclusionImage failed (changes reverted): {}'.format(e))
 
     cardIds = col.db.list('select id from cards where nid = ? order by ord', note_id)
     return {'newFilename': fname, 'occlusionsKept': len(kept),
             'occlusionsClipped': clippedCount, 'occlusionsDropped': droppedCount,
-            'cardIds': cardIds}
+            'cardIds': cardIds, 'undoEntry': undo_name}
 
 
 #
@@ -841,30 +1127,37 @@ def crop_image_occlusion_image(col, note_id, rect):
 #
 
 def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
-                 since_ms=None, until_ms=None, limit=5000):
+                 since_ms=None, until_ms=None, limit=5000, offset=0):
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise Exception('invalid parameter: limit: must be >= 1')
+        raise PlusError('invalid_param', 'invalid parameter: limit: must be >= 1')
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise PlusError('invalid_param', 'invalid parameter: offset: int >= 0 required')
 
     def validated_ids(name, values):
         if not isinstance(values, list) or not all(isinstance(v, int) and not isinstance(v, bool) for v in values):
-            raise Exception('invalid parameter: {}: ints required'.format(name))
+            raise PlusError('invalid_param', 'invalid parameter: {}: ints required'.format(name))
         return values
 
-    # id filters are chunked to stay under SQLite's bound-variable cap; each
-    # (card chunk x note chunk) combination selects a disjoint set of rows,
-    # so the per-query results union cleanly and only need a re-sort + trim.
+    empty = {'rows': [], 'total': 0, 'truncated': False, 'nextOffset': None}
+
+    # id filters are chunked to stay under SQLite's bound-variable cap; ids
+    # are deduped first (dict.fromkeys — order is irrelevant, rows re-sort on
+    # r.id) so each id lands in exactly one chunk and every (card chunk x
+    # note chunk) combination selects a disjoint set of rows: the per-query
+    # results union cleanly (no duplicate rows, COUNTs sum exactly) and only
+    # need a re-sort + trim.
     card_chunks = [None]
     if card_ids is not None:
-        card_ids = validated_ids('cardIds', card_ids)
+        card_ids = list(dict.fromkeys(validated_ids('cardIds', card_ids)))
         if not card_ids:
-            return {'rows': []}
+            return empty
         card_chunks = [card_ids[i:i + SQL_IN_CHUNK] for i in range(0, len(card_ids), SQL_IN_CHUNK)]
 
     note_chunks = [None]
     if note_ids is not None:
-        note_ids = validated_ids('noteIds', note_ids)
+        note_ids = list(dict.fromkeys(validated_ids('noteIds', note_ids)))
         if not note_ids:
-            return {'rows': []}
+            return empty
         note_chunks = [note_ids[i:i + SQL_IN_CHUNK] for i in range(0, len(note_ids), SQL_IN_CHUNK)]
 
     baseConditions = []
@@ -872,10 +1165,10 @@ def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
 
     if deck_name is not None:
         if not isinstance(deck_name, str):
-            raise Exception('invalid parameter: deckName: string required')
+            raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
         did = col.decks.id_for_name(deck_name)
         if did is None:
-            raise Exception('deck was not found: {}'.format(deck_name))
+            raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
         # id-based descendant lookup: immune to the caller's deckName casing
         # (id_for_name matches case-insensitively, stored names may differ)
         dids = sorted(set(col.decks.deck_and_child_ids(did)))
@@ -884,17 +1177,19 @@ def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
 
     if since_ms is not None:
         if isinstance(since_ms, bool) or not isinstance(since_ms, int):
-            raise Exception('invalid parameter: sinceMs: int required')
+            raise PlusError('invalid_param', 'invalid parameter: sinceMs: int required')
         baseConditions.append('r.id >= ?')
         baseArgs.append(since_ms)
 
     if until_ms is not None:
         if isinstance(until_ms, bool) or not isinstance(until_ms, int):
-            raise Exception('invalid parameter: untilMs: int required')
+            raise PlusError('invalid_param', 'invalid parameter: untilMs: int required')
         baseConditions.append('r.id < ?')
         baseArgs.append(until_ms)
 
+    multi = len(card_chunks) * len(note_chunks) > 1
     rawRows = []
+    total = 0
     for cardChunk in card_chunks:
         for noteChunk in note_chunks:
             conditions = list(baseConditions)
@@ -905,19 +1200,27 @@ def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
             if noteChunk is not None:
                 conditions.append('c.nid in ({})'.format(','.join('?' * len(noteChunk))))
                 args.extend(noteChunk)
-            sql = ('select r.id, r.cid, c.nid, r.ease, r.ivl, r.lastIvl, r.factor, r.time, r.type '
-                   'from revlog r left join cards c on c.id = r.cid where 1=1')
+            fromWhere = 'from revlog r left join cards c on c.id = r.cid where 1=1'
             for condition in conditions:
-                sql += ' and ' + condition
-            sql += ' order by r.id asc limit ?'
-            args.append(limit)
+                fromWhere += ' and ' + condition
+            # chunk pairs select disjoint row sets, so the per-pair COUNTs sum
+            # to the full match count (one cheap COUNT per pair, same WHERE)
+            total += col.db.scalar('select count(*) ' + fromWhere, *args) or 0
+            sql = ('select r.id, r.cid, c.nid, r.ease, r.ivl, r.lastIvl, r.factor, r.time, r.type '
+                   + fromWhere + ' order by r.id asc limit ?')
+            if multi:
+                # the global rows [offset, offset+limit) are contained in the
+                # union of each chunk pair's first offset+limit rows
+                args.append(offset + limit)
+            else:
+                # single chunk pair: page directly in SQL
+                sql += ' offset ?'
+                args.extend([limit, offset])
             rawRows.extend(col.db.all(sql, *args))
 
-    if len(card_chunks) * len(note_chunks) > 1:
-        # each chunk query returned its own first `limit` rows; the global
-        # first `limit` rows are contained in their union
+    if multi:
         rawRows.sort(key=lambda row: row[0])
-        del rawRows[limit:]
+        rawRows = rawRows[offset:offset + limit]
 
     rows = []
     for rid, cid, nid, ease, ivl, lastIvl, factor, timeMs, rtype in rawRows:
@@ -933,7 +1236,11 @@ def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
             'type': rtype,
             'reviewedAt': rid,
         })
-    return {'rows': rows}
+    # tell the caller what happened, not just what they asked for: truncated
+    # distinguishes "exactly limit rows exist" from "more rows remain"
+    truncated = offset + len(rows) < total
+    return {'rows': rows, 'total': total, 'truncated': truncated,
+            'nextOffset': offset + len(rows) if truncated else None}
 
 
 #
@@ -942,7 +1249,7 @@ def query_revlog(col, card_ids=None, note_ids=None, deck_name=None,
 
 def create_backup(col, force=True):
     if not isinstance(force, bool):
-        raise Exception('invalid parameter: force: boolean required')
+        raise PlusError('invalid_param', 'invalid parameter: force: boolean required')
 
     folder = os.path.join(os.path.dirname(col.path), 'backups')
     os.makedirs(folder, exist_ok=True)
@@ -954,10 +1261,31 @@ def create_backup(col, force=True):
 # Card rendering (SPEC 12)
 #
 
-def render_card(col, card_ids):
+RENDER_FORMATS = ('html', 'body', 'text')
+
+# matched open/close pairs only, non-greedy, case-insensitive, dot-matches-
+# newline; an unclosed <script>/<style> block is left in place (format 'body')
+_SCRIPT_BLOCK_RE = re.compile(r'(?si)<script\b.*?</script\s*>')
+_STYLE_BLOCK_RE = re.compile(r'(?si)<style\b.*?</style\s*>')
+
+
+def _render_format_text(col, html, render_format):
+    if render_format == 'body':
+        return _STYLE_BLOCK_RE.sub('', _SCRIPT_BLOCK_RE.sub('', html))
+    if render_format == 'text':
+        # same strip helper + conventions as notesSlim (SPEC 13): visible text
+        # only, media filenames preserved, cloze markup verbatim
+        return col._backend.html_to_text_line(text=html, preserve_media_filenames=True)
+    return html
+
+
+def render_card(col, card_ids, render_format='html'):
     if not isinstance(card_ids, list) or not all(
             isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
-        raise Exception('invalid parameter: cardIds: ints required')
+        raise PlusError('invalid_param', 'invalid parameter: cardIds: ints required')
+    if render_format not in RENDER_FORMATS:
+        raise PlusError('invalid_param', 'invalid parameter: format: one of {} required'.format(
+            ', '.join(RENDER_FORMATS)))
 
     cards = []
     for cid in card_ids:
@@ -970,10 +1298,12 @@ def render_card(col, card_ids):
             out = card.render_output()
             cards.append({
                 'cardId': cid,
-                # rendered template HTML WITHOUT the <style> wrapper; css ships
-                # separately so clients can wrap (or not) themselves
-                'question': out.question_text,
-                'answer': out.answer_text,
+                # rendered template HTML WITHOUT the notetype-CSS <style>
+                # wrapper (css ships separately so clients can wrap — or not —
+                # themselves); template-authored <style>/<script> blocks ARE
+                # part of that HTML and survive verbatim under format 'html'
+                'question': _render_format_text(col, out.question_text, render_format),
+                'answer': _render_format_text(col, out.answer_text, render_format),
                 'css': out.css,
                 # current_deck_id() = odid or did: home deck for filtered cards
                 'deckName': col.decks.name(card.current_deck_id()),
@@ -992,22 +1322,22 @@ def render_card(col, card_ids):
 def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
                max_field_length=400, offset=0, limit=200):
     if (query is None) == (note_ids is None):
-        raise Exception('invalid parameter: query: exactly one of query or noteIds required')
+        raise PlusError('invalid_param', 'invalid parameter: query: exactly one of query or noteIds required')
     if query is not None and not isinstance(query, str):
-        raise Exception('invalid parameter: query: string required')
+        raise PlusError('invalid_param', 'invalid parameter: query: string required')
     if note_ids is not None and (not isinstance(note_ids, list) or not all(
             isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids)):
-        raise Exception('invalid parameter: noteIds: ints required')
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
     if fields is not None:
         _validate_tag_list(fields, 'fields')
     if not isinstance(strip_html, bool):
-        raise Exception('invalid parameter: stripHtml: boolean required')
+        raise PlusError('invalid_param', 'invalid parameter: stripHtml: boolean required')
     if isinstance(max_field_length, bool) or not isinstance(max_field_length, int) or max_field_length < 0:
-        raise Exception('invalid parameter: maxFieldLength: int >= 0 required')
+        raise PlusError('invalid_param', 'invalid parameter: maxFieldLength: int >= 0 required')
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise Exception('invalid parameter: offset: int >= 0 required')
+        raise PlusError('invalid_param', 'invalid parameter: offset: int >= 0 required')
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise Exception('invalid parameter: limit: must be >= 1')
+        raise PlusError('invalid_param', 'invalid parameter: limit: must be >= 1')
     limit = min(limit, NOTES_SLIM_LIMIT_CAP)
 
     if query is not None:
@@ -1016,7 +1346,7 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
             # deterministic ascending-noteId (creation) order for pagination
             ids = sorted(col.find_notes(query, order=False))
         except SearchError as e:
-            raise Exception('invalid parameter: query: {}'.format(e))
+            raise PlusError('invalid_param', 'invalid parameter: query: {}'.format(e))
     else:
         ids = list(note_ids)  # caller order preserved, duplicates included
 
@@ -1033,6 +1363,7 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
             continue
         model = ankiNote.note_type()
         outFields = {}
+        truncatedFields = []
         for fld in model['flds']:
             name = fld['name']
             if wanted is not None and name not in wanted:
@@ -1045,12 +1376,16 @@ def notes_slim(col, query=None, note_ids=None, fields=None, strip_html=True,
                 text = col._backend.html_to_text_line(text=text, preserve_media_filenames=True)
             if max_field_length and len(text) > max_field_length:
                 text = text[:max_field_length] + '…'
+                # explicit truncation signal: the trailing '…' alone is
+                # ambiguous (a field may genuinely end in one)
+                truncatedFields.append(name)
             outFields[name] = text
         notes.append({
             'noteId': ankiNote.id,
             'modelName': model['name'],
             'tags': list(ankiNote.tags),
             'fields': outFields,
+            'truncatedFields': truncatedFields,
         })
 
     nextOffset = offset + limit if offset + limit < total else None
@@ -1068,14 +1403,14 @@ def media_thumbnails(col, filenames, max_dim=320, image_format='jpeg', quality=7
     load/scale/save needs no Q(Gui)Application on this build (probe-verified).
     """
     if not isinstance(filenames, list) or not all(isinstance(f, str) for f in filenames):
-        raise Exception('invalid parameter: filenames: list of strings required')
+        raise PlusError('invalid_param', 'invalid parameter: filenames: list of strings required')
     if isinstance(max_dim, bool) or not isinstance(max_dim, int) or max_dim < 1:
-        raise Exception('invalid parameter: maxDim: must be >= 1')
+        raise PlusError('invalid_param', 'invalid parameter: maxDim: must be >= 1')
     max_dim = min(max_dim, THUMBNAIL_DIM_CAP)
     if image_format not in THUMBNAIL_FORMATS:
-        raise Exception('invalid parameter: format: jpeg or png required')
+        raise PlusError('invalid_param', 'invalid parameter: format: jpeg or png required')
     if isinstance(quality, bool) or not isinstance(quality, int) or not (0 <= quality <= 100):
-        raise Exception('invalid parameter: quality: int 0-100 required')
+        raise PlusError('invalid_param', 'invalid parameter: quality: int 0-100 required')
     if not filenames:
         return {'thumbnails': []}
 
@@ -1123,6 +1458,107 @@ def media_thumbnails(col, filenames, max_dim=320, image_format='jpeg', quality=7
 
 
 #
+# Media membership & bulk store (SPEC 22, 23)
+#
+
+def media_exists(col, filenames):
+    """Pure read (SPEC 22): which of these bare filenames exist in the media
+    folder. Results in input order. A malformed or path-carrying name is
+    simply exists:false (it can never name a stored media file); only a
+    non-string entry is a hard parameter error. Rationale (round-2 field
+    feedback): a caller pulled 4.22 MB via getMediaFilesNames to answer a
+    13-name membership test."""
+    if not isinstance(filenames, list) or not all(isinstance(f, str) for f in filenames):
+        raise PlusError('invalid_param', 'invalid parameter: filenames: list of strings required')
+
+    mediaDir = col.media.dir()
+    results = []
+    for filename in filenames:
+        exists = bool(filename) and os.path.basename(filename) == filename \
+            and os.path.isfile(os.path.join(mediaDir, filename))
+        results.append({'filename': filename, 'exists': exists})
+    return {'results': results}
+
+
+def store_media_files_bulk(col, files):
+    """Store many media files in one call (SPEC 23). Per-item results in
+    input order: {requested, actual} on success — actual is the filename anki
+    actually stored, making its dedup/rename decision visible (same-name+
+    same-bytes dedups to the same name, same-name+different-bytes renames) —
+    or {requested, error} on a per-item failure. Media writes are not
+    undoable (upstream storeMediaFile precedent); no undo entry is created.
+    Rationale (round-2 field feedback): callers stored files blind, then
+    pulled the full media listing to verify."""
+    if not isinstance(files, list):
+        raise PlusError('invalid_param', 'invalid parameter: files: list required')
+
+    stored = []
+    for i, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            stored.append({'requested': None,
+                           'error': 'invalid parameter: files[{}]: object required'.format(i)})
+            continue
+        filename = entry.get('filename')
+        requested = filename if isinstance(filename, str) else None
+
+        def item_error(message):
+            return {'requested': requested, 'error': message}
+
+        unknown = sorted(set(entry) - {'filename', 'data', 'path'})
+        if unknown:
+            stored.append(item_error('invalid parameter: files[{}]: unknown key(s): {}'.format(
+                i, ', '.join(str(key) for key in unknown))))
+            continue
+        if not isinstance(filename, str) or not filename:
+            stored.append(item_error('invalid parameter: files[{}].filename: string required'.format(i)))
+            continue
+        if os.path.basename(filename) != filename:
+            stored.append(item_error('invalid parameter: files[{}].filename: bare media filename required'.format(i)))
+            continue
+        data = entry.get('data')
+        path = entry.get('path')
+        if (data is None) == (path is None):
+            stored.append(item_error('invalid parameter: files[{}]: exactly one of data or path required'.format(i)))
+            continue
+
+        if data is not None:
+            if not isinstance(data, str):
+                stored.append(item_error('invalid parameter: files[{}].data: string required'.format(i)))
+                continue
+            try:
+                # same lenient-base64 rule as addImageOcclusionNote (SPEC 4.4)
+                payload = base64.b64decode(''.join(data.split()), validate=True)
+            except (binascii.Error, ValueError):
+                stored.append(item_error('invalid parameter: files[{}].data: invalid base64'.format(i)))
+                continue
+        else:
+            if not isinstance(path, str) or not path:
+                stored.append(item_error('invalid parameter: files[{}].path: string required'.format(i)))
+                continue
+            expanded = os.path.expanduser(path)
+            if not os.path.isabs(expanded):
+                stored.append(item_error('invalid parameter: files[{}].path: absolute path required'.format(i)))
+                continue
+            if not os.path.isfile(expanded):
+                stored.append(item_error('media source file was not found: {}'.format(path)))
+                continue
+            try:
+                with open(expanded, 'rb') as handle:
+                    payload = handle.read()
+            except OSError as e:
+                stored.append(item_error('could not read file: {}: {}'.format(path, e)))
+                continue
+
+        try:
+            actual = col.media.write_data(filename, payload)
+        except Exception as e:
+            stored.append(item_error('could not store media file {}: {}'.format(filename, e)))
+            continue
+        stored.append({'requested': filename, 'actual': actual})
+    return {'stored': stored}
+
+
+#
 # Scheduler bulk ops (SPEC 16)
 #
 
@@ -1132,7 +1568,7 @@ def _existing_cards(col, card_ids):
     ids out of the contract entirely (SPEC 16)."""
     if not isinstance(card_ids, list) or not all(
             isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
-        raise Exception('invalid parameter: cardIds: ints required')
+        raise PlusError('invalid_param', 'invalid parameter: cardIds: ints required')
     existing = []
     for cid in dict.fromkeys(card_ids):
         try:
@@ -1142,9 +1578,10 @@ def _existing_cards(col, card_ids):
     return existing
 
 
-def bulk_suspend(col, card_ids, suspend=True):
+def bulk_suspend(col, card_ids, suspend=True, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_SUSPEND
     if not isinstance(suspend, bool):
-        raise Exception('invalid parameter: suspend: boolean required')
+        raise PlusError('invalid_param', 'invalid parameter: suspend: boolean required')
     existing = _existing_cards(col, card_ids)
 
     if suspend:
@@ -1158,7 +1595,7 @@ def bulk_suspend(col, card_ids, suspend=True):
     if not pending:
         return {'changed': 0, 'undoEntry': None}
 
-    target = col.add_custom_undo_entry(UNDO_BULK_SUSPEND)
+    target = col.add_custom_undo_entry(undo_name)
     try:
         if suspend:
             # OpChangesWithCount: backend-authoritative changed count
@@ -1170,19 +1607,20 @@ def bulk_suspend(col, card_ids, suspend=True):
             changed = len(pending)
         col.merge_undo_entries(target)
     except Exception as e:
-        _revert_batch(col, UNDO_BULK_SUSPEND)
-        raise Exception('bulkSuspend failed (batch reverted): {}'.format(e))
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted', 'bulkSuspend failed (batch reverted): {}'.format(e))
 
     if not changed:
         # data no-op: pop the empty custom entry so the Undo menu stays clean
-        _revert_batch(col, UNDO_BULK_SUSPEND)
+        _revert_batch(col, undo_name)
         return {'changed': 0, 'undoEntry': None}
-    return {'changed': changed, 'undoEntry': UNDO_BULK_SUSPEND}
+    return {'changed': changed, 'undoEntry': undo_name}
 
 
-def bulk_set_due_date(col, card_ids, days):
+def bulk_set_due_date(col, card_ids, days, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_DUE
     if not isinstance(days, str) or not days:
-        raise Exception('invalid parameter: days: string like "0" or "1-7" required')
+        raise PlusError('invalid_param', 'invalid parameter: days: string like "0" or "1-7" required')
     # pre-validate the backend grammar ("0", "5", "1-7", "3!", "1-7!") BEFORE
     # any undo entry exists: if InvalidInput fired after add_custom_undo_entry,
     # popping the empty entry via col.undo() would push a phantom Redo item
@@ -1190,27 +1628,27 @@ def bulk_set_due_date(col, card_ids, days):
     # ASCII digits only: the backend regex accepts unicode digits but its int
     # parse then rejects them, so [0-9] is the true accepted alphabet.
     if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?!?', days):
-        raise Exception('invalid parameter: days: {}'.format(days))
+        raise PlusError('invalid_param', 'invalid parameter: days: {}'.format(days))
     existing = _existing_cards(col, card_ids)
     if not existing:
         return {'changed': 0, 'undoEntry': None}
     ids = [cid for cid, _queue in existing]
 
-    target = col.add_custom_undo_entry(UNDO_BULK_DUE)
+    target = col.add_custom_undo_entry(undo_name)
     try:
         col.sched.set_due_date(ids, days)
         col.merge_undo_entries(target)
     except InvalidInput as e:
         # bad days string: the op never ran, pop the empty custom entry
-        _revert_batch(col, UNDO_BULK_DUE)
-        raise Exception('invalid parameter: days: {}'.format(e))
+        _revert_batch(col, undo_name)
+        raise PlusError('invalid_param', 'invalid parameter: days: {}'.format(e))
     except Exception as e:
-        _revert_batch(col, UNDO_BULK_DUE)
-        raise Exception('bulkSetDueDate failed (batch reverted): {}'.format(e))
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted', 'bulkSetDueDate failed (batch reverted): {}'.format(e))
 
     # set_due_date returns plain OpChanges (no count); it applies to every
     # existing card regardless of state (SPEC Deviation #8)
-    return {'changed': len(ids), 'undoEntry': UNDO_BULK_DUE}
+    return {'changed': len(ids), 'undoEntry': undo_name}
 
 
 #
@@ -1220,16 +1658,16 @@ def bulk_set_due_date(col, card_ids, days):
 def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
                      include_media=True):
     if not isinstance(deck_name, str) or not deck_name:
-        raise Exception('invalid parameter: deckName: string required')
+        raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
     if out_path is not None and (not isinstance(out_path, str) or not out_path):
-        raise Exception('invalid parameter: outPath: string required')
+        raise PlusError('invalid_param', 'invalid parameter: outPath: string required')
     if not isinstance(include_scheduling, bool):
-        raise Exception('invalid parameter: includeScheduling: boolean required')
+        raise PlusError('invalid_param', 'invalid parameter: includeScheduling: boolean required')
     if not isinstance(include_media, bool):
-        raise Exception('invalid parameter: includeMedia: boolean required')
+        raise PlusError('invalid_param', 'invalid parameter: includeMedia: boolean required')
     did = col.decks.id_for_name(deck_name)
     if did is None:
-        raise Exception('deck was not found: {}'.format(deck_name))
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
 
     if out_path is None:
         # sanitize: unicode word chars, dot, dash survive; '::' and anything
@@ -1243,11 +1681,12 @@ def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
         # make splitext see no extension and the collision loop would write a
         # surprise sibling like '<dir>-2' (or a file literally named '-2')
         if os.path.isdir(out_path) or not os.path.basename(out_path):
-            raise Exception(
+            raise PlusError(
+                'invalid_param',
                 'invalid parameter: outPath: is a directory: {}'.format(out_path))
     outDir = os.path.dirname(out_path) or '.'
     if not os.path.isdir(outDir):
-        raise Exception('output directory was not found: {}'.format(outDir))
+        raise PlusError('not_found', 'output directory was not found: {}'.format(outDir))
 
     # never overwrite: append -2, -3, ... before the extension (race-free:
     # handlers are serialized on the main thread, SPEC 3.1)
@@ -1272,6 +1711,316 @@ def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
 
 
 #
+# Deck integrity audit (SPEC 20) — READ-ONLY
+#
+
+# anki's own cloze-open marker (rslib cloze regex: lowercase c, digits, '::');
+# the balance check counts these opens against '}}' closes per field
+_CLOZE_OPEN_RE = re.compile(r'\{\{c\d+::')
+
+# cheap guard before the extract_latex backend call: the three tag pairs the
+# backend's latex extractor recognizes
+_LATEX_MARKERS = ('[latex]', '[$]', '[$$]')
+
+
+def _media_refs_in_field(media_regexps, text):
+    """Filenames referenced by one field's raw HTML, in match order.
+
+    Mirrors anki's MediaManager.files_in_str body (same regexps object, same
+    remote-scheme exclusion) MINUS its render_latex step — render_latex can
+    WRITE generated latex images into the media folder, which a read-only
+    action must never do. Latex handling is done separately with the pure
+    backend extract_latex where needed (orphan scan only, SPEC 20).
+    """
+    files = []
+    for reg in media_regexps:
+        for match in re.finditer(reg, text):
+            fname = match.group('fname')
+            if not re.match('(https?|ftp)://', fname.lower()):
+                files.append(fname)
+    return files
+
+
+def _nfc(name):
+    # media filename comparisons are NFC-normalized on both sides: Anki stores
+    # NFC on macOS, but Finder-copied files can sit on disk as NFD
+    return unicodedata.normalize('NFC', name)
+
+
+def _media_dir_files(col):
+    """Set of NFC-normalized plain-file names in the collection media dir."""
+    mediaDir = col.media.dir()
+    return {_nfc(entry) for entry in os.listdir(mediaDir)
+            if os.path.isfile(os.path.join(mediaDir, entry))}
+
+
+def _cloze_numbers(col, field_values):
+    """Cloze ordinals present in the given field strings, via anki's own
+    backend parser (the exact code card generation uses). Pure: the minimal
+    proto never touches the collection."""
+    if not any('{{c' in value for value in field_values):
+        return []
+    return list(col._backend.cloze_numbers_in_note(
+        anki.notes_pb2.Note(fields=list(field_values))))
+
+
+def check_deck_integrity(col, deck_name, include_orphan_media=False):
+    if not isinstance(deck_name, str) or not deck_name:
+        raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
+    if not isinstance(include_orphan_media, bool):
+        raise PlusError('invalid_param', 'invalid parameter: includeOrphanMedia: boolean required')
+    did = col.decks.id_for_name(deck_name)
+    if did is None:
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+
+    # scope: notes with ANY card homed in the deck or its subdecks (odid =
+    # home deck for cards currently in a filtered deck — same semantics as
+    # queryRevlog's deck filter). Read-only note/card location selects.
+    dids = sorted(set(col.decks.deck_and_child_ids(did)))
+    nids = col.db.list(
+        'select distinct nid from cards where (case when odid != 0 then odid '
+        'else did end) in ({}) order by nid'.format(','.join('?' * len(dids))),
+        *dids)
+
+    mediaFiles = _media_dir_files(col)
+    modelCache = {}  # mid -> (fieldNames, isCloze) ; None for a missing model
+
+    missingMedia = []
+    unbalancedCloze = []
+    clozeNotes = []  # (nid, expectedOrds)
+
+    for start in range(0, len(nids), SQL_IN_CHUNK):
+        chunk = nids[start:start + SQL_IN_CHUNK]
+        placeholders = ','.join('?' * len(chunk))
+        for nid, mid, flds in col.db.all(
+                'select id, mid, flds from notes where id in ({}) order by id'.format(placeholders),
+                *chunk):
+            cached = modelCache.get(mid)
+            if cached is None and mid not in modelCache:
+                model = col.models.get(mid)
+                cached = None if model is None else (
+                    [fld['name'] for fld in model['flds']],
+                    model['type'] == anki.consts.MODEL_CLOZE)
+                modelCache[mid] = cached
+            values = flds.split('\x1f')
+            if cached is not None:
+                fieldNames, isCloze = cached
+            else:
+                # orphaned mid (corrupt collection): index-named fallback
+                fieldNames, isCloze = [], False
+            for i, value in enumerate(values):
+                name = fieldNames[i] if i < len(fieldNames) else '<field {}>'.format(i + 1)
+                seen = set()
+                for fname in _media_refs_in_field(col.media.regexps, value):
+                    normalized = _nfc(fname)
+                    if normalized not in mediaFiles and normalized not in seen:
+                        seen.add(normalized)
+                        missingMedia.append({'noteId': nid, 'field': name,
+                                             'filename': fname})
+                opens = len(_CLOZE_OPEN_RE.findall(value))
+                closes = value.count('}}')
+                if opens != closes:
+                    unbalancedCloze.append({'noteId': nid, 'field': name})
+            if isCloze:
+                numbers = _cloze_numbers(col, values)
+                # c0 is annotation-only (generates no card, SPEC 5)
+                expectedOrds = sorted({n - 1 for n in numbers if n >= 1})
+                clozeNotes.append((nid, expectedOrds))
+
+    # one chunked read of the cloze notes' existing card ordinals
+    clozeCardMismatch = []
+    clozeNotesWithoutCloze = []
+    if clozeNotes:
+        ordsByNid = {}
+        clozeNids = [nid for nid, _expected in clozeNotes]
+        for start in range(0, len(clozeNids), SQL_IN_CHUNK):
+            chunk = clozeNids[start:start + SQL_IN_CHUNK]
+            placeholders = ','.join('?' * len(chunk))
+            for nid, ord_ in col.db.all(
+                    'select nid, ord from cards where nid in ({}) order by nid, ord'.format(placeholders),
+                    *chunk):
+                ordsByNid.setdefault(nid, []).append(ord_)
+        for nid, expectedOrds in clozeNotes:
+            actualOrds = ordsByNid.get(nid, [])
+            if not expectedOrds:
+                # zero effective cloze numbers (no markers / c0-only /
+                # uppercase-C only): anki's own card generation creates and
+                # KEEPS a placeholder card ord 0 for such a note (rslib
+                # cardgen ensure-not-empty rule; Empty Cards keeps it too),
+                # so [] vs [0] is anki's maintained state, not drift. Still
+                # an authoring smell — surfaced in clozeNotesWithoutCloze.
+                clozeNotesWithoutCloze.append(nid)
+                if actualOrds == [0]:
+                    continue
+            if expectedOrds != actualOrds:
+                clozeCardMismatch.append({'noteId': nid,
+                                          'expectedOrds': expectedOrds,
+                                          'actualOrds': actualOrds})
+
+    orphanMedia = None
+    if include_orphan_media:
+        # COLLECTION-WIDE by nature: a file unreferenced by this deck may be
+        # used by any other note or notetype template, so orphan status can
+        # only be decided against every reference in the collection.
+        referenced = set()
+        for mid, flds in col.db.all('select mid, flds from notes'):
+            model = col.models.get(mid)
+            svg = bool(model.get('latexsvg', False)) if model else False
+            for value in flds.split('\x1f'):
+                if any(marker in value for marker in _LATEX_MARKERS):
+                    # pure backend text transform (verified: writes nothing):
+                    # maps latex tags to their generated image filenames so a
+                    # rendered latex png is never reported as an orphan — the
+                    # exact transform files_in_str applies, minus its
+                    # image-generation side effect
+                    value = col._backend.extract_latex(
+                        text=value, svg=svg, expand_clozes=True).text
+                for fname in _media_refs_in_field(col.media.regexps, value):
+                    referenced.add(_nfc(fname))
+        for model in col.models.all():
+            # template/CSS-referenced static media, via anki's own extractor
+            for fname in col.media.extract_static_media_files(model['id']):
+                referenced.add(_nfc(fname))
+        # leading-underscore files are static-use by Anki convention (never
+        # reported unused by Anki's own media check); dotfiles are junk like
+        # .DS_Store, not media
+        orphanMedia = sorted(
+            fname for fname in mediaFiles - referenced
+            if not fname.startswith('_') and not fname.startswith('.'))
+
+    return {'missingMedia': missingMedia,
+            'unbalancedCloze': unbalancedCloze,
+            'clozeCardMismatch': clozeCardMismatch,
+            'clozeNotesWithoutCloze': clozeNotesWithoutCloze,
+            'orphanMedia': orphanMedia,
+            'notesChecked': len(nids)}
+
+
+#
+# Bulk field replace (SPEC 21)
+#
+
+def bulk_replace_in_fields(col, query=None, note_ids=None, field=None,
+                           find=None, replace=None, is_regex=False,
+                           case_sensitive=True, dry_run=False, atomic=True,
+                           max_preview=20, undo_label=None):
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_REPLACE
+    if (query is None) == (note_ids is None):
+        raise PlusError('invalid_param', 'invalid parameter: query: exactly one of query or noteIds required')
+    if query is not None and not isinstance(query, str):
+        raise PlusError('invalid_param', 'invalid parameter: query: string required')
+    if note_ids is not None and (not isinstance(note_ids, list) or not all(
+            isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids)):
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
+    if not isinstance(field, str) or not field:
+        raise PlusError('invalid_param', 'invalid parameter: field: string required')
+    # an empty find would match between every character (regex and literal
+    # alike) and inject `replace` everywhere: never meaningful, always a bug
+    if not isinstance(find, str) or not find:
+        raise PlusError('invalid_param', 'invalid parameter: find: non-empty string required')
+    if not isinstance(replace, str):
+        raise PlusError('invalid_param', 'invalid parameter: replace: string required')
+    for flagName, flagValue in (('isRegex', is_regex), ('caseSensitive', case_sensitive),
+                                ('dryRun', dry_run), ('atomic', atomic)):
+        if not isinstance(flagValue, bool):
+            raise PlusError('invalid_param', 'invalid parameter: {}: boolean required'.format(flagName))
+    if isinstance(max_preview, bool) or not isinstance(max_preview, int) or max_preview < 0:
+        raise PlusError('invalid_param', 'invalid parameter: maxPreview: int >= 0 required')
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    if is_regex:
+        # python re semantics; no backtracking-bomb protection (SPEC 21) —
+        # a pathological pattern can hang the single-threaded server
+        try:
+            pattern = re.compile(find, flags)
+        except re.error as e:
+            raise PlusError('invalid_param', 'invalid parameter: find: invalid regex: {}'.format(e))
+        repl = replace  # re template: backrefs like \1 / \g<name> expand
+    else:
+        pattern = re.compile(re.escape(find), flags)
+        repl = lambda match: replace  # callable: inserted literally, no \-escape parsing
+
+    if query is not None:
+        try:
+            # ascending noteId, deterministic (notesSlim precedent, SPEC 13)
+            ids = sorted(col.find_notes(query, order=False))
+        except SearchError as e:
+            raise PlusError('invalid_param', 'invalid parameter: query: {}'.format(e))
+    else:
+        # dedupe, first occurrence wins (cropImage precedent): processing one
+        # note twice in a batch would re-match against its own replacement
+        ids = list(dict.fromkeys(note_ids))
+
+    # compute pass — read-only; shared by the dry and real paths by
+    # construction (SPEC 15 anti-drift rule)
+    changed_ids = []
+    unchanged = []
+    skipped = []
+    preview = []
+    pending = []  # (ankiNote, newValue)
+    matchesTotal = 0
+    for nid in ids:
+        try:
+            ankiNote = col.get_note(nid)
+        except NotFoundError:
+            skipped.append({'noteId': nid, 'reason': 'note was not found: {}'.format(nid)})
+            continue
+        if field not in ankiNote:
+            skipped.append({'noteId': nid, 'reason': 'field was not found in note: {}'.format(field)})
+            continue
+        before = ankiNote[field]
+        try:
+            after, count = pattern.subn(repl, before)
+        except re.error as e:
+            # bad regex replacement template (e.g. \9 with one group); raises
+            # on the first match, before any write in this batch
+            raise PlusError('invalid_param', 'invalid parameter: replace: {}'.format(e))
+        matchesTotal += count
+        if count == 0 or after == before:
+            # nothing matched, or every match replaced itself byte-identically:
+            # not written (shared no-op rule, SPEC 4.2/4.3)
+            unchanged.append(nid)
+            continue
+        changed_ids.append(nid)
+        if dry_run and len(preview) < max_preview:
+            preview.append({'noteId': nid, 'before': before, 'after': after})
+        if not dry_run:
+            pending.append((ankiNote, after))
+
+    if dry_run:
+        return {'wouldChange': changed_ids, 'matchesTotal': matchesTotal,
+                'unchanged': unchanged, 'skipped': skipped,
+                'preview': preview,
+                'previewTruncated': len(changed_ids) > len(preview),
+                'undoEntry': None}
+
+    # write pass
+    changed = []
+    target = None
+    for ankiNote, after in pending:
+        try:
+            ankiNote[field] = after
+            if target is None:
+                target = col.add_custom_undo_entry(undo_name)
+            col.update_note(ankiNote)
+            col.merge_undo_entries(target)
+            changed.append(ankiNote.id)
+        except Exception as e:
+            if atomic:
+                _revert_batch(col, undo_name)
+                report = {'failedNoteId': ankiNote.id, 'error': str(e),
+                          'changedBeforeRevert': len(changed), 'skipped': skipped}
+                raise PlusError('batch_reverted', 'bulkReplaceInFields failed (batch reverted): {}'.format(
+                    json.dumps(report, separators=(',', ':'))))
+            skipped.append({'noteId': ankiNote.id, 'reason': str(e)})
+
+    _pop_empty_undo(col, target, changed, undo_name)
+    return {'changed': changed, 'matchesTotal': matchesTotal,
+            'unchanged': unchanged, 'skipped': skipped,
+            'undoEntry': undo_name if changed else None}
+
+
+#
 # Sync helpers (SPEC 18) — pure logic; the job state machine lives in plus.py
 #
 
@@ -1283,7 +2032,7 @@ def bounded_sync_auth(auth, timeout_secs):
     as '' when unset; that maps back to unset (None) here.
     """
     if isinstance(timeout_secs, bool) or not isinstance(timeout_secs, int) or timeout_secs < 1:
-        raise Exception('invalid parameter: timeoutSecs: int >= 1 required')
+        raise PlusError('invalid_param', 'invalid parameter: timeoutSecs: int >= 1 required')
     return anki.sync.SyncAuth(hkey=auth.hkey,
                               endpoint=auth.endpoint or None,
                               io_timeout_secs=timeout_secs)
@@ -1392,17 +2141,18 @@ ANKIHUB_SYNC_FIRST_ADVICE = (' (the note may already match the AnkiHub revision'
 
 def validate_ankihub_change_type(change_type):
     if not isinstance(change_type, str) or change_type not in ANKIHUB_CHANGE_TYPES:
-        raise Exception('invalid parameter: changeType: one of {} required'.format(
+        raise PlusError('invalid_param', 'invalid parameter: changeType: one of {} required'.format(
             ', '.join(ANKIHUB_CHANGE_TYPES)))
     return change_type
 
 
 def validate_ankihub_rationale(rationale):
     if not isinstance(rationale, str) or not rationale.strip():
-        raise Exception('RATIONALE_INVALID: rationale must be a non-empty string')
+        raise PlusError('rationale_invalid', 'RATIONALE_INVALID: rationale must be a non-empty string')
     if len(rationale) >= ANKIHUB_RATIONALE_MAX_LENGTH:
         # >= matches the dialog widget's trim loop: max 1023 characters
-        raise Exception('RATIONALE_INVALID: rationale is {} characters; the '
+        raise PlusError('rationale_invalid',
+                        'RATIONALE_INVALID: rationale is {} characters; the '
                         'AnkiHub dialog caps it at {}'.format(
                             len(rationale), ANKIHUB_RATIONALE_MAX_LENGTH - 1))
     return rationale
@@ -1418,28 +2168,28 @@ def _ankihub_source_parts(source, allowed_types):
     dialog only folds a source whose text carries content.
     """
     if not isinstance(source, dict):
-        raise Exception('invalid parameter: source: object {type, text} required')
+        raise PlusError('invalid_param', 'invalid parameter: source: object {type, text} required')
     unknown = sorted(set(source) - {'type', 'text', 'step'})
     if unknown:
-        raise Exception('invalid parameter: source: unknown key(s): {}'.format(
+        raise PlusError('invalid_param', 'invalid parameter: source: unknown key(s): {}'.format(
             ', '.join(str(key) for key in unknown)))
     source_type = source.get('type')
     if not isinstance(source_type, str) or source_type not in allowed_types:
-        raise Exception('invalid parameter: source.type: one of {} required '
+        raise PlusError('invalid_param', 'invalid parameter: source.type: one of {} required '
                         'here'.format(', '.join(allowed_types)))
     text = source.get('text', '')
     if not isinstance(text, str):
-        raise Exception('invalid parameter: source.text: string required')
+        raise PlusError('invalid_param', 'invalid parameter: source.text: string required')
     step = source.get('step')
     if source_type == 'UWorld':
         if isinstance(step, bool) or not isinstance(step, int) \
                 or step not in ANKIHUB_UWORLD_STEPS:
-            raise Exception('invalid parameter: source.step: 1, 2 or 3 '
+            raise PlusError('invalid_param', 'invalid parameter: source.step: 1, 2 or 3 '
                             'required for UWorld sources')
         folded_text = 'Step {} {}'.format(step, text)
     else:
         if step is not None:
-            raise Exception('invalid parameter: source.step: only valid for '
+            raise PlusError('invalid_param', 'invalid parameter: source.step: only valid for '
                             'UWorld sources')
         folded_text = text
     if not text.strip():
@@ -1464,14 +2214,15 @@ def ankihub_comment_for_update(rationale, change_type, source, for_anking_deck):
     source_shown = anking_source or change_type == 'delete'
     if source is None:
         if anking_source:
-            raise Exception("SOURCE_REQUIRED: the AnKing deck requires a "
+            raise PlusError('source_required',
+                            "SOURCE_REQUIRED: the AnKing deck requires a "
                             "source {{type, text}} for changeType '{}' "
                             "(types: {})".format(
                                 change_type,
                                 ', '.join(ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE[change_type])))
         return rationale
     if not source_shown:
-        raise Exception("invalid parameter: source: not accepted for "
+        raise PlusError('invalid_param', "invalid parameter: source: not accepted for "
                         "changeType '{}'{} - the AnkiHub dialog offers a "
                         "Source only for new_content/updated_content on the "
                         "AnKing deck and for delete".format(
@@ -1481,7 +2232,8 @@ def ankihub_comment_for_update(rationale, change_type, source, for_anking_deck):
     source_type, raw_text, line = _ankihub_source_parts(
         source, ANKIHUB_SOURCE_TYPES_BY_CHANGE_TYPE[change_type])
     if source_type not in ANKIHUB_OPTIONAL_SOURCE_TYPES and not raw_text.strip():
-        raise Exception('SOURCE_REQUIRED: source.text must be non-empty for '
+        raise PlusError('source_required',
+                        'SOURCE_REQUIRED: source.text must be non-empty for '
                         '{} sources'.format(source_type))
     return rationale + line
 
@@ -1541,7 +2293,8 @@ def map_ankihub_change_result(result_name):
     """ChangeSuggestionResult member NAME -> locked API result string."""
     mapped = ANKIHUB_CHANGE_RESULTS.get(result_name)
     if mapped is None:
-        raise Exception('INCOMPATIBLE_ANKIHUB_ADDON: unknown '
+        raise PlusError('incompatible_ankihub_addon',
+                        'INCOMPATIBLE_ANKIHUB_ADDON: unknown '
                         'ChangeSuggestionResult member {!r} (this bridge was '
                         'tested against add-on version {})'.format(
                             result_name, ANKIHUB_TESTED_ADDON_VERSION))
