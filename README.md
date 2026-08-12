@@ -1,6 +1,6 @@
 # AnkiConnect Plus
 
-A personal fork of AnkiConnect adding bulk, image-occlusion, revlog, and backup actions, served on port **8766**.
+A personal fork of AnkiConnect adding bulk, image-occlusion, image-crop, revlog, and backup actions, served on port **8766**.
 
 ## Credit and license
 
@@ -37,7 +37,9 @@ curl localhost:8766 -d '{"action":"plusInfo","version":6}'
 | `bulkAddTags` | Add tags (`str` split on whitespace, or list) to many notes by id. Only notes actually changed are written and reported in `updated`. Returns `{updated, skipped, undoEntry}`. |
 | `addImageOcclusionNote` | Create a native (built-in) Image Occlusion note from an image `{path}` or `{data, filename}` plus `occlusions` (native string, or array of normalized 0–1 rects with optional `ordinal`), `header`, `backExtra`, `tags`, `deckName`, `hideAllGuessOne`. Returns `{noteId, cardIds}`. |
 | `getImageOcclusionNote` | Read an IO note: `{imageFilename, occlusions[] (one entry per shape with ordinal; rects as floats, other shapes as raw properties), header, backExtra, tags, occludeInactive}`. |
-| `updateImageOcclusionNote` | Update any subset of `occlusions` / `header` / `backExtra` / `tags` on an IO note (omitted params are kept exactly). Returns `null`. The image itself cannot be changed. |
+| `updateImageOcclusionNote` | Update any subset of `occlusions` / `header` / `backExtra` / `tags` on an IO note (omitted params are kept exactly). Returns `null`. The image itself cannot be changed here — `cropImageOcclusionImage` is the supported way to change (crop) it. |
+| `cropImage` | Crop a media image into a **new** media file (the original is kept). Params: `filename` (bare media filename), `rect` `{left, top, width, height}` as normalized 0–1 floats (clamped to the image, never padded), optional `noteIds` (every occurrence of the old filename in those notes' fields is rewritten to the new one, one undo entry). Returns `{newFilename, width, height, notesUpdated}`. Not for IO base images — see semantics below. |
+| `cropImageOcclusionImage` | Crop a native IO note's base image and remap every occlusion rect into the cropped frame, atomically (one undo restores both the image and the rects). Params: `noteId`, `rect` (same normalized shape). Rects falling fully outside the crop are dropped; straddling rects are clipped to the crop edge; dropping all rects is refused. Returns `{newFilename, occlusionsKept, occlusionsClipped, occlusionsDropped, cardIds}`. |
 | `queryRevlog` | Read-only review-history query filtered by `cardIds` / `noteIds` / `deckName` (incl. subdecks) / `sinceMs` (inclusive) / `untilMs` (exclusive), `limit` default 5000. Returns `{rows}`. |
 | `createBackup` | Trigger a `.colpkg` backup into the profile's `backups/` folder. `{force}` default `true`. Returns `{created: bool}` — `false` means nothing changed since the last backup, not a failure. |
 | `plusInfo` | Version/action/docs metadata for this add-on. Works with no profile open. |
@@ -49,6 +51,7 @@ curl localhost:8766 -d '{"action":"plusInfo","version":6}'
 - **`queryRevlog` field semantics:** `interval` / `lastInterval` positive = days, negative = seconds. `factor` = SM-2 ease permille (0 for learning/manual rows; not scheduling-relevant under FSRS). `type`: 0 learning, 1 review, 2 relearning, 3 filtered/cram, 4 manual/forget, 5 rescheduled — stats-worthy rows are `type NOT IN (4, 5)`. `noteId` is `null` for orphan rows whose card was deleted. Caveat: the deck filter reflects each card's *current* deck (home deck for cards in a filtered deck), not the deck at review time.
 - **Image occlusion ordinals:** shapes sharing an ordinal mask together on one card; `ordinal: 0` is annotation-only (generates no card); omitted ordinals are assigned 1..N in array order. `getImageOcclusionNote` does not return image bytes — use upstream `retrieveMediaFile`.
 - **Deck placement / IO deviations:** IO cards are moved to the requested `deckName` as part of the same undo step; `createBackup` may return `{created: false}` even with `force: true` when the collection is unchanged; `updateImageOcclusionNote` has no `image` parameter.
+- **Crop semantics:** both crop actions write the result as a new media file and never delete or overwrite the original (use `deleteMediaFile` for cleanup). Do **not** point `cropImage`'s `noteIds` at an image-occlusion note's base image: the filename is rewritten but the occlusion rects are NOT remapped, so every mask misaligns — `cropImageOcclusionImage` is the IO-safe path. Empty-card gotcha: if `cropImageOcclusionImage` drops every shape of some ordinal, the backend does not delete that ordinal's now-empty card; its id still appears in `cardIds`, and Tools → Empty Cards is the cleanup path.
 
 ## UI freeze
 

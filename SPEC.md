@@ -526,3 +526,90 @@ Repo root `LICENSE` file = the **full, unmodified GNU GPLv3 text** (from https:/
 - Every `col` is a scratch collection in a throwaway dir (media folder + backups dir are siblings, auto-created). Never touch `~/Library/Application Support/Anki2/`.
 - Coverage: every edge-case list in §4 (they are the test matrix), plus §5 round-trip tests, plus the undo invariants in §3.3.
 - `plus.py`/dispatch/rebrand items are covered by a separate live smoke checklist (manual, after installing into a **test** Anki profile): `plusInfo` before profile load; one call per action against a disposable profile; stock-AnkiConnect coexistence (both ports up, Edit dialog opens from both, `guiEditNote` on each); banner strings on 8765 vs 8766; permission prompt title. The smoke test must also verify `Collection.set_deck` exists (per §4.4 note).
+
+---
+
+## 11. Image crop actions (spec revision 2, 2026-08-11)
+
+Two additional actions: **`cropImage`** and **`cropImageOcclusionImage`**, bringing the action count to eleven. `core.PLUS_ACTIONS` remains the single source of truth for the `plusInfo` action list. A `padImage` action was considered and **explicitly rejected** — nothing in this section may ever emit padded output. Directly relevant Qt gotcha (probe-verified on this venv, PyQt6 6.9.1 / Qt 6.9.0): `QImage.copy(QRect)` does **not clamp** a rect that extends past the image — it **pads** the result to the requested size. The pixel crop rect is therefore always clamped to image bounds *before* `copy()` (§11.3), so padding can never occur.
+
+Both actions are non-destructive to media: the cropped result is always written as a **new** media file; the original file is never deleted or overwritten (clients that want cleanup can use upstream `deleteMediaFile` explicitly).
+
+### 11.1 `cropImage`
+
+Crop an existing media image into a new media file, optionally rewriting notes to reference it.
+
+Caveat (document in README too): passing an image-occlusion note in `noteIds` — or cropping an IO note's base image at all — rewrites the filename reference but does **NOT** remap the note's occlusion rects, which stay normalized to the original frame, so every mask will silently misalign (probe-confirmed). Use `cropImageOcclusionImage` (§11.2) for IO notes. No code guard is imposed: an IO note may legitimately reference a non-base image in its Header/Back Extra fields, and rejecting every IO note id would break that case.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `filename` | str | required | Bare filename of an existing file in the collection media dir (no path separators — `os.path.basename(filename) == filename`). |
+| `rect` | `{left, top, width, height}` | required | **Normalized 0–1 floats** (fractions of image width/height), consistent with the IO endpoints: `0 <= left,top <= 1`, `0 < width,height <= 1`. Mapped to pixels and clamped per §11.3; a rect that clamps to an empty area is an error. |
+| `noteIds` | [int] | omit | If given, every occurrence of the old filename in those notes' fields is rewritten to the new filename via `col.update_note`, all merged into ONE undo entry `"AnkiConnect Plus: Crop Image"` (lazy, per §3.3). Duplicate ids are deduplicated. |
+
+**Returns**
+
+```json
+{"newFilename": "diagram-crop.png", "width": 512, "height": 384, "notesUpdated": [1712345678901]}
+```
+- `newFilename`: the **actual stored name** — the derived name (§11.3 naming) possibly renamed by Anki's media dedup (`<stem>-<40-hex-sha1>.<ext>` on same-name/different-bytes collision; returned by `col.media.write_data`).
+- `width`/`height`: pixel dimensions of the cropped image (= the clamped pixel rect's `cw`/`ch`).
+- `notesUpdated`: ids of notes whose fields actually changed. Notes passed in `noteIds` that contain no occurrence are left untouched and omitted (not an error).
+
+**Filename rewrite semantics (exact)** — occurrences are matched with `re` using boundary guards so a short filename never matches inside a longer one (`a.png` must not match inside `banana.png`): pattern `(?<![\w./\\-])<escaped filename>(?![\w.-])`, replacement done with a callable so the new name is inserted literally. This rewrites `src="..."`/`src='...'` references as well as bare-text occurrences, in every field of the note.
+
+**Anki/Qt API calls** — PyQt6 (`QImage`, `QRect`, `QBuffer`, `QByteArray`, `QIODevice`) is imported **lazily inside the core function** so `import core` stays Qt-free and headless tests never load Qt unless a crop runs. No `QApplication`/`QGuiApplication` is required for load/crop/save on this build (probe-verified, PNG + JPEG). Encode to bytes via `QBuffer` (no temp files); store via `fname = col.media.write_data(newName, data)` accepting the returned (possibly renamed) name. Note updates: `col.get_note` → field rewrite → `col.update_note` + `merge_undo_entries` into the lazy custom entry.
+
+**Order of operations** — all validation (filename, rect, `noteIds` types, and loading of every referenced note) happens **before the first write**. Then: media write, then note rewrites. A hard error during note updates reverts the merged undo entry (all note changes) and raises `"cropImage failed (note updates reverted): <err>"`; the new media file remains (media writes are not undoable; it is a new file only — harmless orphan, Check Media collects it).
+
+**Error cases** — `"invalid parameter: filename: string required"`; `"invalid parameter: filename: bare media filename required"`; `"media file was not found: <filename>"`; `"could not load image: <filename> (unsupported or corrupt format)"`; `"invalid parameter: rect: object required"` / `"... <key> must be a number"` / `"... left and top must be within 0-1"` / `"... width and height must be within 0-1"`; `"invalid parameter: rect: selects an empty area of <filename> (<W>x<H>)"`; `"could not encode cropped image as <fmt>: <filename>"`; `"invalid parameter: noteIds: ints required"`; `"note was not found: <id>"`.
+
+**Edge cases tests must cover** — crop of a known PNG yields exact pixel dims; original media file still present afterward; `noteIds` rewrite changes `<img src>` and returns the id, single `col.undo()` restores the field; note without any occurrence → untouched, omitted from `notesUpdated`; `banana.png` untouched when cropping `a.png`; rect clamping (`left+width > 1` crops to the image edge, never pads); `left = 1.0` → empty-area error; unknown filename / path-y filename / bad rect types → errors above with no writes; repeat crop with identical params dedups to the same `newFilename`.
+
+### 11.2 `cropImageOcclusionImage`
+
+Crop the base image of a **built-in IO note** and remap every occlusion rect into the cropped frame, as one atomic, undoable operation.
+
+**Params**
+
+| name | type | default | notes |
+|---|---|---|---|
+| `noteId` | int | required | Must be a native-IO note (`originalStockKind == 6`, same guard as §4.6). |
+| `rect` | `{left, top, width, height}` | required | Same normalized shape, validation, and pixel mapping as §11.1. |
+
+**Returns**
+
+```json
+{"newFilename": "anatomy-crop.png", "occlusionsKept": 4, "occlusionsClipped": 1, "occlusionsDropped": 2, "cardIds": [...]}
+```
+
+**Remap semantics (exact)** — all in pixel space of the ORIGINAL `W×H` image, with `(cx, cy, cw, ch)` the clamped pixel crop rect from §11.3. For each occlusion rect (normalized to the original image): `x0 = left·W`, `y0 = top·H`, `x1 = x0 + width·W`, `y1 = y0 + height·H`; intersect with the crop: `nx0 = max(x0, cx)`, `ny0 = max(y0, cy)`, `nx1 = min(x1, cx+cw)`, `ny1 = min(y1, cy+ch)`.
+- Empty intersection (`nx1 ≤ nx0` or `ny1 ≤ ny0`) → the rect is **dropped**.
+- A surviving rect whose remapped `width` or `height` would serialize to zero at §5's 4-decimal precision (< 0.00005 normalized) is unrepresentable → also **dropped**.
+- Otherwise the rect is kept, renormalized against the cropped frame: `left' = (nx0−cx)/cw`, `top' = (ny0−cy)/ch`, `width' = (nx1−nx0)/cw`, `height' = (ny1−ny0)/ch`, **ordinal preserved**.
+- A kept rect counts as **clipped** when its original pixel box extended beyond the crop by more than `1e-6` px on any side (tolerance absorbs float noise from the 4-decimal stored coords).
+- Counters: `occlusionsKept` = shapes present in the updated note (**includes** the clipped ones); `occlusionsClipped ⊆ kept`; `kept + dropped` = original shape count.
+- `oi`/occlude-inactive is preserved: re-serialization uses `hide_all_guess_one = <note's occludeInactive>` from the §4.5 read. This is exact only when the per-shape `oi` flags are uniform (all shapes carry `oi=1`, or none do — the only states Anki's own editor produces, since it sets `oi` globally). Mixed per-shape `oi` on a hand-edited field is unrepresentable by the single note-level flag (the backend reports `occludeInactive = true` when ANY cloze carries `:oi=1`) and is refused, never silently homogenized.
+
+**Refusals (clear error, zero changes)**
+- The crop would drop ALL occlusions → `"crop would remove all occlusions on note <id>"`.
+- The note contains non-rect shapes (`ellipse`/`polygon`/`text`, possible on editor-made notes per Deviation #3) → `"cropImageOcclusionImage supports rect occlusions only; note <id> contains a <shape> shape"`. Rationale: §5's serializer emits rects only; proceeding would silently destroy those shapes.
+- A rect carries properties other than `oi` (e.g. `angle`, `fill`) → `"cropImageOcclusionImage cannot preserve occlusion properties <names> on note <id>"`. Same rationale (v1 serializer does not emit them).
+- The rects carry **mixed** per-shape `oi` flags (some have `oi=1`, some don't) → `"cropImageOcclusionImage cannot preserve mixed oi flags on note <id>"`. Same rationale (§5 serialization is all-or-nothing per note; see the oi bullet above).
+
+**Atomicity / undo (probe-verified pattern)** — read via the §4.5 path; `header`/`backExtra`/`tags` backfilled from the note's own fields via `col._backend.get_image_occlusion_fields` exactly as §4.6. Media write first (not undoable; new file only). Then `target = col.add_custom_undo_entry("AnkiConnect Plus: Crop IO Image")` → write 1: `note.fields[idx.image] = '<img src="<newFilename>">'` (raw filename, double quotes — byte-identical format to what the backend itself writes) via `col.update_note` + merge → write 2: `col.update_image_occlusion_note(noteId, remappedOcclusions, header, backExtra, tags)` + merge. A single `col.undo()` restores BOTH the image field and the occlusion string. Failure between the writes reverts the merged entry and raises `"cropImageOcclusionImage failed (changes reverted): <err>"`.
+
+**`cardIds`** — current card ids after the update, via the card-id location select (explicitly allowed read-only select, §4.4 precedent). Caveat (research-verified): if every shape of some ordinal was dropped, the backend does **not** delete that ordinal's now-empty card; its id still appears in `cardIds` and Empty Cards is the cleanup path. Document in README.
+
+**Error cases** — `"invalid parameter: noteId: int required"`; `"note was not found: <id>"`; `"note is not an image occlusion note: <id>"`; §4.5 read-error path; `"could not parse rect occlusion on note <id>"` (a backend rect shape whose left/top/width/height failed float parsing, i.e. the §4.5 parser fell back to raw properties); `"image occlusion note has no image file: <id>"`; all §11.1 media/rect/format errors; the refusals above.
+
+**Edge cases tests must cover** — rect fully inside → kept unclipped, coords remap exactly; rect straddling a crop edge → kept + clipped, clipped edge lands on the crop boundary (`left' == 0` etc.); rect fully outside → dropped; all-outside → refusal with note byte-identical; kept ordinals round-trip through §4.5 within 1e-4; empty-card gotcha surfaced in `cardIds`; single undo restores original image filename AND original rects; original media file untouched; mixed per-shape `oi` (hand-built occlusions string, `oi=1` on one cloze only) → refusal with note untouched.
+
+### 11.3 Shared crop mechanics
+
+- **Pixel mapping + clamp** (shared by both actions): `cx = clamp(round(left·W), 0, W)`, `cy = clamp(round(top·H), 0, H)`, `cw = min(round(width·W), W−cx)`, `ch = min(round(height·H), H−cy)`. If `cw < 1` or `ch < 1` → empty-area error. Guarantees `copy(QRect(...))` stays within bounds, so Qt's pad behavior is unreachable.
+- **Derived naming**: `<stem>-crop.<ext>` keeping the source extension when Qt can encode it; otherwise (readable-but-not-writable formats: `gif`, `svg`, `svgz`, `pdf`, `tga`, or an unknown extension) the crop is re-encoded as PNG under `<stem>-crop.png`. Name collisions are resolved by `col.media.write_data`'s dedup (same bytes → same name reused; different bytes → sha1-renamed) and the returned name is authoritative.
+- **Write-format allowlist** (probe-verified on this build): `bmp cur heic heif icns ico jfif jp2 jpeg jpg pbm pgm png ppm tif tiff wbmp webp xbm xpm` (`core.CROP_WRITE_FORMATS`).
+- **Headless rule**: all Qt imports live inside the core function bodies (lazy), keeping `core.py`'s module import aqt-free AND Qt-free; no application object is created. Pillow is not a dependency (not installed in the venv).

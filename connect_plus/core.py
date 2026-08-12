@@ -27,6 +27,7 @@ import base64
 import binascii
 import json
 import os
+import re
 
 import anki.collection
 import anki.notes
@@ -36,7 +37,12 @@ from anki.errors import NotFoundError
 PLUS_VERSION = "1.0.0"
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
-                "updateImageOcclusionNote", "queryRevlog", "createBackup", "plusInfo"]
+                "updateImageOcclusionNote", "queryRevlog", "createBackup",
+                # crop a media image into a NEW media file (original kept), optionally rewriting notes to reference it
+                "cropImage",
+                # crop an IO note's base image and remap its occlusion rects into the cropped frame, one undo entry
+                "cropImageOcclusionImage",
+                "plusInfo"]
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
 DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
 DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"
@@ -44,8 +50,20 @@ DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"
 UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
 UNDO_BULK_UPDATE = 'AnkiConnect Plus: Bulk Update'
 UNDO_BULK_TAGS = 'AnkiConnect Plus: Bulk Tags'
+UNDO_CROP_IMAGE = 'AnkiConnect Plus: Crop Image'
+UNDO_CROP_IO = 'AnkiConnect Plus: Crop IO Image'
 
 IO_STOCK_KIND = 6
+
+# Formats QImageWriter can encode on this Qt build (probe-verified, SPEC 11.3).
+# QImage can READ more (gif/svg/svgz/pdf/tga); crops of those re-encode as PNG.
+CROP_WRITE_FORMATS = {'bmp', 'cur', 'heic', 'heif', 'icns', 'ico', 'jfif', 'jp2',
+                      'jpeg', 'jpg', 'pbm', 'pgm', 'png', 'ppm', 'tif', 'tiff',
+                      'wbmp', 'webp', 'xbm', 'xpm'}
+
+# pixel tolerance when deciding whether a remapped occlusion rect was actually
+# trimmed by the crop (absorbs float noise from the 4-decimal stored coords)
+CLIP_EPS_PX = 1e-6
 
 # SQLite allows at most 32766 bound variables per statement; chunk IN-lists
 # well below that so fixed parameters (mid, dids, since/until, limit) still fit.
@@ -531,6 +549,221 @@ def update_image_occlusion_note(col, note_id, occlusions=None, header=None,
         tags = ankiNote.tags
 
     col.update_image_occlusion_note(note_id, occlusionsStr, header, back_extra, list(tags))
+
+
+#
+# Image cropping (SPEC 11)
+#
+
+def _validate_crop_rect(rect):
+    if not isinstance(rect, dict):
+        raise Exception('invalid parameter: rect: object required')
+    for key in ('left', 'top', 'width', 'height'):
+        value = rect.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise Exception('invalid parameter: rect: {} must be a number'.format(key))
+    left, top = float(rect['left']), float(rect['top'])
+    width, height = float(rect['width']), float(rect['height'])
+    if not (0 <= left <= 1) or not (0 <= top <= 1):
+        raise Exception('invalid parameter: rect: left and top must be within 0-1')
+    if not (0 < width <= 1) or not (0 < height <= 1):
+        raise Exception('invalid parameter: rect: width and height must be within 0-1')
+    return left, top, width, height
+
+
+def _crop_media_image(col, filename, rect):
+    """Load a media image, crop it per the normalized rect, and encode the
+    result. Pure read: returns (newName, data, (cx, cy, cw, ch), imgW, imgH)
+    without writing anything; callers store data via col.media.write_data.
+
+    PyQt6 is imported lazily so importing this module stays Qt-free; QImage
+    load/crop/save needs no Q(Gui)Application on this build (probe-verified).
+    """
+    left, top, width, height = _validate_crop_rect(rect)
+    if not isinstance(filename, str) or not filename:
+        raise Exception('invalid parameter: filename: string required')
+    if os.path.basename(filename) != filename:
+        raise Exception('invalid parameter: filename: bare media filename required')
+    path = os.path.join(col.media.dir(), filename)
+    if not os.path.isfile(path):
+        raise Exception('media file was not found: {}'.format(filename))
+
+    from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QRect
+    from PyQt6.QtGui import QImage
+
+    img = QImage(path)
+    if img.isNull() or img.width() < 1 or img.height() < 1:
+        raise Exception('could not load image: {} (unsupported or corrupt format)'.format(filename))
+    imgW, imgH = img.width(), img.height()
+
+    # QImage.copy PADS (does not clamp) when the rect leaves the image, and
+    # padded output is explicitly forbidden -> clamp the pixel rect ourselves
+    cx = max(0, min(int(round(left * imgW)), imgW))
+    cy = max(0, min(int(round(top * imgH)), imgH))
+    cw = min(int(round(width * imgW)), imgW - cx)
+    ch = min(int(round(height * imgH)), imgH - cy)
+    if cw < 1 or ch < 1:
+        raise Exception('invalid parameter: rect: selects an empty area of {} ({}x{})'.format(
+            filename, imgW, imgH))
+
+    cropped = img.copy(QRect(cx, cy, cw, ch))
+
+    stem, ext = os.path.splitext(filename)
+    fmt = ext[1:].lower()
+    if fmt in CROP_WRITE_FORMATS:
+        newName = '{}-crop{}'.format(stem, ext)
+    else:
+        fmt = 'png'  # readable but not writable format (gif/svg/pdf/...): re-encode
+        newName = '{}-crop.png'.format(stem)
+
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    ok = cropped.save(buf, fmt)
+    buf.close()
+    if not ok:
+        raise Exception('could not encode cropped image as {}: {}'.format(fmt, filename))
+    return newName, bytes(ba), (cx, cy, cw, ch), imgW, imgH
+
+
+def crop_image(col, filename, rect, note_ids=None):
+    notes = []
+    if note_ids is not None:
+        if not isinstance(note_ids, list) or not all(
+                isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids):
+            raise Exception('invalid parameter: noteIds: ints required')
+        for nid in dict.fromkeys(note_ids):  # dedupe: one Note object per id
+            try:
+                notes.append(col.get_note(nid))
+            except NotFoundError:
+                raise Exception('note was not found: {}'.format(nid))
+
+    newName, data, (_cx, _cy, cw, ch), _imgW, _imgH = _crop_media_image(col, filename, rect)
+
+    # writes start here; the original media file is never touched
+    fname = col.media.write_data(newName, data)
+
+    # boundary-guarded so 'a.png' never matches inside 'banana.png'; the
+    # callable replacement inserts the new name literally (no \-escape parsing)
+    pattern = re.compile(r'(?<![\w./\\-])' + re.escape(filename) + r'(?![\w.-])')
+    updated = []
+    target = None
+    for ankiNote in notes:
+        changed = False
+        for i, value in enumerate(ankiNote.fields):
+            newValue, count = pattern.subn(lambda match: fname, value)
+            if count:
+                ankiNote.fields[i] = newValue
+                changed = True
+        if not changed:
+            continue
+        if target is None:
+            target = col.add_custom_undo_entry(UNDO_CROP_IMAGE)
+        try:
+            col.update_note(ankiNote)
+            col.merge_undo_entries(target)
+        except Exception as e:
+            _revert_batch(col, UNDO_CROP_IMAGE)
+            raise Exception('cropImage failed (note updates reverted): {}'.format(e))
+        updated.append(ankiNote.id)
+
+    return {'newFilename': fname, 'width': cw, 'height': ch, 'notesUpdated': updated}
+
+
+def crop_image_occlusion_image(col, note_id, rect):
+    if isinstance(note_id, bool) or not isinstance(note_id, int):
+        raise Exception('invalid parameter: noteId: int required')
+    try:
+        ankiNote = col.get_note(note_id)
+    except NotFoundError:
+        raise Exception('note was not found: {}'.format(note_id))
+    if ankiNote.note_type().get('originalStockKind') != IO_STOCK_KIND:
+        raise Exception('note is not an image occlusion note: {}'.format(note_id))
+
+    ioNote = get_image_occlusion_note(col, note_id)
+    filename = ioNote['imageFilename']
+    if not filename:
+        raise Exception('image occlusion note has no image file: {}'.format(note_id))
+
+    # refuse anything the rect-only serializer (SPEC 5) cannot re-emit losslessly
+    shapes = ioNote['occlusions']
+    oiValues = set()
+    for entry in shapes:
+        if entry['shape'] != 'rect':
+            raise Exception('cropImageOcclusionImage supports rect occlusions only; '
+                            'note {} contains a {} shape'.format(note_id, entry['shape']))
+        if 'left' not in entry:
+            raise Exception('could not parse rect occlusion on note {}'.format(note_id))
+        properties = entry.get('properties') or {}
+        extra = sorted(set(properties) - {'oi'})
+        if extra:
+            raise Exception('cropImageOcclusionImage cannot preserve occlusion properties {} '
+                            'on note {}'.format(', '.join(extra), note_id))
+        oiValues.add(properties.get('oi'))
+    # serialize_occlusions applies one note-level oi flag to every shape; mixed
+    # per-shape oi (only possible on hand-edited fields -- Anki's editor sets
+    # oi globally) cannot be represented, so refuse rather than homogenize
+    if len(oiValues) > 1:
+        raise Exception('cropImageOcclusionImage cannot preserve mixed oi flags '
+                        'on note {}'.format(note_id))
+
+    newName, data, (cx, cy, cw, ch), imgW, imgH = _crop_media_image(col, filename, rect)
+
+    # remap in pixel space of the ORIGINAL image (SPEC 11.2)
+    kept = []
+    clippedCount = 0
+    droppedCount = 0
+    for entry in shapes:
+        x0 = entry['left'] * imgW
+        y0 = entry['top'] * imgH
+        x1 = x0 + entry['width'] * imgW
+        y1 = y0 + entry['height'] * imgH
+        nx0, ny0 = max(x0, cx), max(y0, cy)
+        nx1, ny1 = min(x1, cx + cw), min(y1, cy + ch)
+        newWidth = (nx1 - nx0) / cw
+        newHeight = (ny1 - ny0) / ch
+        # entirely outside the crop, or a sliver that io_num's 4-decimal
+        # serialization would collapse to zero size: unrepresentable -> drop
+        if (nx1 <= nx0 or ny1 <= ny0
+                or float('{:.4f}'.format(newWidth)) == 0
+                or float('{:.4f}'.format(newHeight)) == 0):
+            droppedCount += 1
+            continue
+        if (x0 < nx0 - CLIP_EPS_PX or y0 < ny0 - CLIP_EPS_PX
+                or x1 > nx1 + CLIP_EPS_PX or y1 > ny1 + CLIP_EPS_PX):
+            clippedCount += 1
+        kept.append({'left': (nx0 - cx) / cw, 'top': (ny0 - cy) / ch,
+                     'width': newWidth, 'height': newHeight,
+                     'ordinal': entry['ordinal']})
+
+    if not kept:
+        raise Exception('crop would remove all occlusions on note {}'.format(note_id))
+
+    occlusionsStr = serialize_occlusions(kept, hide_all_guess_one=ioNote['occludeInactive'])
+
+    indexes = col._backend.get_image_occlusion_fields(ankiNote.mid)
+    header = ankiNote.fields[indexes.header]
+    backExtra = ankiNote.fields[indexes.back_extra]
+
+    # media write first: not undoable, but it only ADDS a new file
+    fname = col.media.write_data(newName, data)
+
+    target = col.add_custom_undo_entry(UNDO_CROP_IO)
+    try:
+        # same raw format the backend itself writes to the Image field
+        ankiNote.fields[indexes.image] = '<img src="{}">'.format(fname)
+        col.update_note(ankiNote)
+        col.merge_undo_entries(target)
+        col.update_image_occlusion_note(note_id, occlusionsStr, header, backExtra, list(ankiNote.tags))
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, UNDO_CROP_IO)
+        raise Exception('cropImageOcclusionImage failed (changes reverted): {}'.format(e))
+
+    cardIds = col.db.list('select id from cards where nid = ? order by ord', note_id)
+    return {'newFilename': fname, 'occlusionsKept': len(kept),
+            'occlusionsClipped': clippedCount, 'occlusionsDropped': droppedCount,
+            'cardIds': cardIds}
 
 
 #

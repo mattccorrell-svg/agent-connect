@@ -116,6 +116,16 @@ class PlusMixin:
 
 
     @util.api()
+    def cropImage(self, filename, rect, noteIds=None):
+        return core.crop_image(self.collection(), filename, rect, note_ids=noteIds)
+
+
+    @util.api()
+    def cropImageOcclusionImage(self, noteId, rect):
+        return core.crop_image_occlusion_image(self.collection(), noteId, rect)
+
+
+    @util.api()
     def queryRevlog(self, cardIds=None, noteIds=None, deckName=None, sinceMs=None, untilMs=None, limit=5000):
         return core.query_revlog(
             self.collection(),
