@@ -79,6 +79,13 @@ DEFAULT_CONFIG = {
     'webCorsOriginList': ['http://localhost'],
     'ignoreOriginList': [],
     'webTimeout': 10000,
+    # SPEC 27 suspension control. Both ship True and are DELIBERATE deviations
+    # from Anki's own behavior; they are held in lockstep with
+    # core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE / core.DEFAULT_SUSPEND_NEW_CARDS
+    # and connect_plus/config.json by a test. Spelled as literals rather than
+    # imported from core so this upstream module keeps its import graph.
+    'preserveSuspendedOnReschedule': True,
+    'suspendNewCards': True,
 }
 
 def setting(key):

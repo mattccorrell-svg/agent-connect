@@ -456,7 +456,11 @@ def test5_dry_run_add():
     media_before = media_count()
     snap = undo_snap()
     dry = core.bulk_add_notes(col, batch, dry_run=True)
-    assert dry == {"wouldAdd": 2, "skipped": want_skipped, "undoEntry": None}, dry
+    # revision 15 (SPEC 27): the dry shape gained 'wouldSuspend' — the RESOLVED
+    # suspend decision (a bool, not a count: card ids do not exist yet), true
+    # here because the shipped default suspends new cards
+    assert dry == {"wouldAdd": 2, "wouldSuspend": True, "skipped": want_skipped,
+                   "undoEntry": None}, dry
     assert note_count() == notes_before, "dry run added notes"
     assert media_count() == media_before, "dry run touched media"
     assert undo_snap() == snap, "dry run touched the undo stack"
@@ -471,7 +475,10 @@ def test5_dry_run_add():
 
     # empty batch dry run
     assert core.bulk_add_notes(col, [], dry_run=True) == \
-        {"wouldAdd": 0, "skipped": [], "undoEntry": None}
+        {"wouldAdd": 0, "wouldSuspend": True, "skipped": [], "undoEntry": None}
+    # ...and the decision is reported for the switched-off case too
+    assert core.bulk_add_notes(col, [], dry_run=True, suspend=False) == \
+        {"wouldAdd": 0, "wouldSuspend": False, "skipped": [], "undoEntry": None}
     # hard param errors still raise under dryRun
     expect_error(lambda: core.bulk_add_notes(col, "nope", dry_run=True),
                  "invalid parameter: notes: list required")
@@ -551,8 +558,11 @@ def test6_dry_run_update_and_tags():
 # ---------------------------------------------------------------- test 7
 def test7_bulk_suspend():
     col.decks.id("SuspDeck")
+    # suspend=False: revision 15 (SPEC 27) makes bulkAddNotes suspend the cards
+    # it creates BY DEFAULT. This test's subject is bulkSuspend, so the fixture
+    # opts out to keep starting from queue 0 — the assertions below are unchanged.
     r = core.bulk_add_notes(col, [basic_note("SuspDeck", "susp-front-%d" % i)
-                                  for i in range(5)])
+                                  for i in range(5)], suspend=False)
     assert len(r["added"]) == 5, r
     cids = [col.card_ids_of_note(nid)[0] for nid in r["added"]]
 
@@ -608,8 +618,10 @@ def test7_bulk_suspend():
 # ---------------------------------------------------------------- test 8
 def test8_bulk_set_due_date():
     col.decks.id("DueDeck")
+    # suspend=False for the same reason as test7: this test is about due dates,
+    # and revision 15 would otherwise hand it four suspended cards.
     r = core.bulk_add_notes(col, [basic_note("DueDeck", "due-front-%d" % i)
-                                  for i in range(4)])
+                                  for i in range(4)], suspend=False)
     assert len(r["added"]) == 4, r
     c0, c1, c2, c3 = [col.card_ids_of_note(nid)[0] for nid in r["added"]]
     today = col.sched.today
@@ -618,8 +630,11 @@ def test8_bulk_set_due_date():
     orig = col.get_card(c0)
     orig_state = (orig.type, orig.queue, orig.due, orig.ivl)
     r = core.bulk_set_due_date(col, [c0], "0")
+    # revision 15 (SPEC 27): additive 'resuspended' key, [] when nothing was
+    # revived (this card was never suspended)
     assert r == {"changed": 1, "changedIds": [c0], "unsuspended": [],
-                 "unburied": [], "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+                 "unburied": [], "resuspended": [],
+                 "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
     card = col.get_card(c0)
     assert card.type == 2 and card.queue == 2, (card.type, card.queue)
     assert card.due == today, (card.due, today)
@@ -632,7 +647,8 @@ def test8_bulk_set_due_date():
     # '1-3' -> each due within [today+1, today+3]; duplicate id counted once
     r = core.bulk_set_due_date(col, [c1, c2, c3, c1], "1-3")
     assert r == {"changed": 3, "changedIds": [c1, c2, c3], "unsuspended": [],
-                 "unburied": [], "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+                 "unburied": [], "resuspended": [],
+                 "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
     for cid in (c1, c2, c3):
         card = col.get_card(cid)
         assert card.type == 2 and card.queue == 2, (cid, card.type, card.queue)
@@ -661,9 +677,15 @@ def test8_bulk_set_due_date():
     col.sched.bury_cards([c2], manual=True)
     assert col.get_card(c1).queue == -1 and col.get_card(c2).queue == -3, \
         (col.get_card(c1).queue, col.get_card(c2).queue)
-    r = core.bulk_set_due_date(col, [c1, c2, c3], "2")
+    # preserve_suspended=False: this block asserts ANKI's own resurrection
+    # behavior, which revision 15 (SPEC 27) now undoes by default. Naming the
+    # opt-out explicitly keeps the alarm below meaningful — it must still fire
+    # if a future Anki stops resurrecting. The preserve-on path is covered by
+    # tests/headless_suspension_test.py.
+    r = core.bulk_set_due_date(col, [c1, c2, c3], "2", preserve_suspended=False)
     assert r["unsuspended"] == [c1], r
     assert r["unburied"] == [c2], r
+    assert r["resuspended"] == [], r
     assert r["changedIds"] == [c1, c2, c3] and r["changed"] == 3, r
     assert col.get_card(c1).queue == 2 and col.get_card(c2).queue == 2, \
         "set_due_date no longer resurrects; the disclosure needs rechecking"
@@ -679,7 +701,7 @@ def test8_bulk_set_due_date():
     # only-bogus ids -> no-op; bad params
     assert core.bulk_set_due_date(col, [999999999999], "0") == \
         {"changed": 0, "changedIds": [], "unsuspended": [], "unburied": [],
-         "undoEntry": None}
+         "resuspended": [], "undoEntry": None}
     expect_error(lambda: core.bulk_set_due_date(col, [c0], 5),
                  "invalid parameter: days: string like")
     expect_error(lambda: core.bulk_set_due_date(col, [c0], ""),

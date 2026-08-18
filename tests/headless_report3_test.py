@@ -23,6 +23,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 import traceback
 import types
 import unicodedata
@@ -363,7 +364,12 @@ def test_ask5_due_date_resurrection_and_changed_ids():
     assert again == {"changed": 0, "changedIds": [], "undoEntry": None}, again
 
     # --- bulkSetDueDate '5' -> the resurrection is DISCLOSED
-    due = core.bulk_set_due_date(col, cids, "5")
+    # preserve_suspended=False throughout this test: revision 15 (SPEC 27) puts
+    # the suspensions back BY DEFAULT, and what ASK 5 locks down is the
+    # DISCLOSURE of anki's native resurrection. Opting out keeps these
+    # assertions testing anki's behavior rather than this add-on's repair of
+    # it; the repair is covered by tests/headless_suspension_test.py.
+    due = core.bulk_set_due_date(col, cids, "5", preserve_suspended=False)
     assert due["unsuspended"] == cids, due["unsuspended"]
     assert due["unburied"] == [], due["unburied"]
     assert due["changedIds"] == cids, due["changedIds"]
@@ -374,7 +380,7 @@ def test_ask5_due_date_resurrection_and_changed_ids():
     assert queues == [2] * 5, queues          # QUEUE_TYPE_REV: really revived
 
     # --- repeat on already-unsuspended cards -> nothing to disclose
-    repeat = core.bulk_set_due_date(col, cids, "5")
+    repeat = core.bulk_set_due_date(col, cids, "5", preserve_suspended=False)
     assert repeat["unsuspended"] == [], repeat
     assert repeat["unburied"] == [], repeat
     assert repeat["changedIds"] == cids and repeat["changed"] == 5, repeat
@@ -383,7 +389,7 @@ def test_ask5_due_date_resurrection_and_changed_ids():
     col.sched.bury_cards(cids[:2], manual=True)
     assert col.db.list("select queue from cards where id in (?,?)", *cids[:2]) == [-3, -3]
     core.bulk_suspend(col, cids[2:4], suspend=True)
-    mixed = core.bulk_set_due_date(col, cids, "3")
+    mixed = core.bulk_set_due_date(col, cids, "3", preserve_suspended=False)
     assert mixed["unburied"] == cids[:2], mixed["unburied"]
     assert mixed["unsuspended"] == cids[2:4], mixed["unsuspended"]
     assert mixed["changedIds"] == cids, mixed
@@ -397,7 +403,7 @@ def test_ask5_due_date_resurrection_and_changed_ids():
     # unknown ids never reach the op, and never appear in changedIds
     ghost = core.bulk_suspend(col, [FAKE_IDS[0]], suspend=True)
     assert ghost == {"changed": 0, "changedIds": [], "undoEntry": None}, ghost
-    ghost_due = core.bulk_set_due_date(col, [FAKE_IDS[0]], "1")
+    ghost_due = core.bulk_set_due_date(col, [FAKE_IDS[0]], "1", preserve_suspended=False)
     assert ghost_due["changedIds"] == [] and ghost_due["unsuspended"] == [], ghost_due
 
     # a bad days string leaves the undo stack untouched (no phantom Redo)
@@ -701,9 +707,13 @@ def test_ask9_tags_preview_rows():
     assert len(out["preview"]) == 2, out["preview"]
     assert out["preview"][0] == {"noteId": n_both, "field": "Front",
                                  "before": "ask9-both", "after": "ask9-both-NEW"}
+    # round-3 review fix: 'after' is what the write will actually STORE, so
+    # the requested ["keepme", "added"] previews CANONIFIED (sorted) as
+    # "added keepme" — it used to echo the raw request, promising a
+    # post-state the write would never produce.
     assert out["preview"][1] == {"noteId": n_both, "field": "__tags__",
                                  "before": " ".join(both_tags_now),
-                                 "after": "keepme added"}
+                                 "after": "added keepme"}, out["preview"]
     assert out["previewTruncated"] is False, out
 
     # --- the __tags__ row COUNTS toward maxPreview
@@ -736,12 +746,18 @@ def test_ask9_tags_preview_rows():
         col, [{"id": n_tag, "fields": {"Front": "ask9-tag-2"}}],
         dry_run=True, diff=True)
     assert [row["field"] for row in field_only["preview"]] == ["Front"], field_only
-    # tag ORDER alone is a change, and the row shows it in list order
+    # round-3 review fix — REVERSED from revision 12, deliberately. This used
+    # to assert "tag ORDER alone is a change, and the row shows it in list
+    # order", which encoded the bug: anki sorts tags on save, so reversing an
+    # already-stored (therefore already-canonical) list is a data no-op. The
+    # old behavior reported it as an update, emitted a preview row promising
+    # a reversed post-state the write could never produce, and then really
+    # wrote — mod/usn bump plus an undo entry for zero net change.
     reordered = core.bulk_update_note_fields(
         col, [{"id": n_tag, "tags": list(reversed(tags_now))}],
         dry_run=True, diff=True)
-    assert reordered["preview"][0]["field"] == "__tags__"
-    assert reordered["preview"][0]["after"] == " ".join(reversed(tags_now))
+    assert reordered["unchanged"] == [n_tag] and reordered["wouldUpdate"] == [], reordered
+    assert reordered["preview"] == [], reordered
     # clearing every tag is representable (empty 'after')
     cleared = core.bulk_update_note_fields(
         col, [{"id": n_tag, "tags": []}], dry_run=True, diff=True)
@@ -843,7 +859,11 @@ def test_ask10_server_checked_local_short_circuit():
         assert out["serverChecked"] is False, out
         col_sync.sync_status = fake_probe
         # (b) a running sync job short-circuits before any collection touch
-        inst._plusSyncJobState = {"state": "syncing", "startedMs": 1,
+        # round-3 review fix: startedMs must be RECENT. The guard now reaps a
+        # job left "syncing" past core.SYNC_JOB_STALE_MS instead of refusing
+        # forever (liveness), and startedMs=1 is 1970 — permanently stale.
+        inst._plusSyncJobState = {"state": "syncing",
+                                  "startedMs": int(time.time() * 1000),
                                   "result": None, "error": None}
         out = inst.syncStatus()
         assert out["serverChecked"] is False, out
@@ -1056,7 +1076,11 @@ def test_ask4_sync_guard_and_envelope():
     assert touched, "the unguarded call never reached the collection"
 
     # --- set the sync job state to IN-FLIGHT (the documented test hook)
-    inst._plusSyncJobState = {"state": "syncing", "startedMs": 1,
+    # round-3 review fix: startedMs must be RECENT. The guard now reaps a
+    # job left "syncing" past core.SYNC_JOB_STALE_MS instead of refusing
+    # forever (liveness), and startedMs=1 is 1970 — permanently stale.
+    inst._plusSyncJobState = {"state": "syncing",
+                              "startedMs": int(time.time() * 1000),
                               "result": None, "error": None}
     touched.clear()
     try:

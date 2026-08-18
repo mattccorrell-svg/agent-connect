@@ -49,6 +49,32 @@ def _signature_string(method):
     return ', '.join(parts)
 
 
+def _resolve_suspension_param(value, config_key, documented_default):
+    """Resolve a SPEC 27 suspension-control parameter to a concrete value.
+
+    Precedence: an explicit parameter ALWAYS wins over config, and config wins
+    over the documented default. A non-None value is passed through untouched
+    — including a bad one (say the string "yes"), so core raises the normal
+    [invalid_param] instead of this layer silently swallowing it.
+
+    None means "nothing said by the caller": read config.json through the same
+    util.setting() accessor webBindPort uses. util.setting already falls back
+    to util.DEFAULT_CONFIG when the key is missing, so an OLDER config.json
+    that predates these keys still resolves to the documented default. The
+    except branch covers the other ways that read can fail (no aqt.mw yet, an
+    unreadable config), and a hand-edited non-boolean value falls back too —
+    a config typo must not fail a write action, and the fallback is documented
+    in SPEC 27 / config.md rather than being a silent surprise.
+    """
+    if value is not None:
+        return value
+    try:
+        configured = util.setting(config_key)
+    except Exception:
+        return documented_default
+    return configured if isinstance(configured, bool) else documented_default
+
+
 #
 # Argument-binding TypeError -> house format (SPEC 25.3, revision 13; round-3
 # field feedback ASK 11b). CPython renders these with the bound method's
@@ -133,8 +159,17 @@ def plus_api(guard_sync=True):
                 # read-only probe: never creates the lazy job slot
                 job = getattr(self, '_plusSyncJobState', None)
                 if job is not None and job.get('state') == 'syncing':
-                    raise core.PlusError('sync_in_progress',
-                                         core.SYNC_IN_PROGRESS_MESSAGE)
+                    # LIVENESS (round-3 review): [sync_in_progress] is
+                    # documented RETRYABLE, so 'syncing' must be a state the
+                    # add-on can always leave. _plusSyncDone guarantees that
+                    # under try/finally; this is the backstop for a
+                    # completion callback that never arrives at all. Reaping
+                    # (not just ignoring) keeps the guard, syncNow and
+                    # syncStatus reading the SAME state, so the documented
+                    # recovery loop terminates.
+                    if not _reap_stale_sync_job(job):
+                        raise core.PlusError('sync_in_progress',
+                                             core.SYNC_IN_PROGRESS_MESSAGE)
             try:
                 return func(self, *args, **kwargs)
             except core.PlusError:
@@ -154,6 +189,40 @@ def plus_api(guard_sync=True):
                 raise core.PlusError('internal', str(e)) from e
         return util.api()(wrapper)
     return decorator
+
+
+def _reap_stale_sync_job(job):
+    """Force a 'syncing' job that outlived core.SYNC_JOB_STALE_MS into a
+    terminal error state, in place; return True iff it reaped.
+
+    Round-3 review fix. The SPEC 25.2 guard refuses 23 actions while the job
+    reads 'syncing', with a code documented as retryable — a promise that is
+    only true if something always clears the state. _plusSyncDone now does
+    (try/finally), but it can only do so if taskman actually delivers the
+    completion callback; this covers the case where it never does. A missing
+    or non-int startedMs on a 'syncing' job is itself unaccountable state and
+    reaps immediately.
+
+    Called from the plus_api guard, syncNow and syncStatus so all three read
+    the same state. Main-thread only, like every other mutation of this dict
+    (SPEC 18).
+    """
+    if job.get('state') != 'syncing':
+        return False
+    started = job.get('startedMs')
+    if isinstance(started, int) and not isinstance(started, bool) \
+            and (time.time() * 1000) - started <= core.SYNC_JOB_STALE_MS:
+        return False
+    job['state'] = 'error'
+    job['error'] = {
+        # 'error' is the SPEC 18 generic job code; the vocabulary is unchanged
+        'code': 'error',
+        'message': 'no sync completion was observed within {} seconds; the '
+                   'job state was reset so it cannot refuse other actions '
+                   'indefinitely - check Anki, then re-run syncNow'.format(
+                       core.SYNC_JOB_STALE_MS // 1000),
+    }
+    return True
 
 
 #
@@ -197,9 +266,12 @@ class PlusMixin:
         return prepared
 
 
+    # suspend=None (SPEC 27) means "use config key 'suspendNewCards'", which
+    # SHIPS TRUE: by default this action leaves the cards it creates suspended,
+    # deviating from Anki on purpose. An explicit true/false wins over config.
     @plus_api()
     def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False, dryRun=False,
-                     undoLabel=None):
+                     suspend=None, undoLabel=None):
         if not isinstance(notes, list):
             raise core.PlusError('invalid_param', 'invalid parameter: notes: list required')
         if dryRun:
@@ -210,6 +282,9 @@ class PlusMixin:
             prepared = [self._plusEmbedNoteMedia(note) for note in notes]
         return core.bulk_add_notes(self.collection(), prepared, atomic=atomic,
                                    allow_duplicates=allowDuplicates, dry_run=dryRun,
+                                   suspend=_resolve_suspension_param(
+                                       suspend, core.CONFIG_SUSPEND_NEW_CARDS,
+                                       core.DEFAULT_SUSPEND_NEW_CARDS),
                                    undo_label=undoLabel)
 
 
@@ -340,9 +415,19 @@ class PlusMixin:
                                  undo_label=undoLabel)
 
 
+    # preserveSuspended=None (SPEC 27) means "use config key
+    # 'preserveSuspendedOnReschedule'", which SHIPS TRUE: by default this
+    # action puts back the suspensions anki's set_due_date clears, deviating
+    # from Anki on purpose. An explicit true/false wins over config.
     @plus_api()
-    def bulkSetDueDate(self, cardIds, days, undoLabel=None):
+    def bulkSetDueDate(self, cardIds, days, preserveSuspended=None, dryRun=False,
+                       undoLabel=None):
         return core.bulk_set_due_date(self.collection(), cardIds, days,
+                                      preserve_suspended=_resolve_suspension_param(
+                                          preserveSuspended,
+                                          core.CONFIG_PRESERVE_SUSPENDED,
+                                          core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE),
+                                      dry_run=dryRun,
                                       undo_label=undoLabel)
 
 
@@ -475,26 +560,67 @@ class PlusMixin:
 
 
     def _plusSyncDone(self, future, syncMedia):
-        # on_done: main thread (marshalled by taskman)
-        mw = self.window()
+        """on_done: main thread (marshalled by taskman).
+
+        LIVENESS (round-3 review). This is the ONLY thing that can move the
+        job out of 'syncing', and the SPEC 25.2 guard refuses 23 actions
+        (with a code documented RETRYABLE) for exactly as long as it sits
+        there. Every statement in the body can raise if the profile is
+        closing mid-sync — self.window()/mw.col._load_scheduler() and the two
+        mw.pm writes most obviously — and a raise inside a taskman on_done
+        callback is swallowed, so an unguarded escape used to strand the job
+        at 'syncing' until Anki restarted: an unsatisfiable retry promise.
+
+        So: the body runs under try/except/finally. Any unexpected escape is
+        recorded as a terminal job error, the finally clause asserts the job
+        is no longer 'syncing' whatever happened, and the GUI bookkeeping
+        (_plusSyncFinishGui, which aqt also runs on error paths) runs on
+        every path instead of being skipped by the raise. The body itself is
+        ordered so the terminal state is assigned BEFORE any statement that
+        can fail, which is what makes the finally clause a backstop rather
+        than the primary mechanism.
+        """
         job = self._plusSyncJob()
-        if mw.col is not None:
-            mw.col._load_scheduler()  # scheduler version may have changed
+        try:
+            self._plusSyncDoneBody(job, future, syncMedia)
+        except Exception as err:
+            job['state'] = 'error'
+            job['error'] = {'code': 'error',
+                            'message': 'sync completion handler failed: {}'.format(err)}
+        finally:
+            if job.get('state') == 'syncing':
+                # unreachable by construction; kept because the cost of being
+                # wrong is a permanent refusal of 23 actions
+                job['state'] = 'error'
+                job['error'] = {'code': 'error',
+                                'message': 'the sync completion handler did not '
+                                           'reach a terminal state'}
+            try:
+                self._plusSyncFinishGui()
+            except Exception:
+                # GUI bookkeeping must never resurrect the liveness bug it is
+                # cleaning up after; the job state above is already terminal
+                pass
+
+
+    def _plusSyncDoneBody(self, job, future, syncMedia):
+        # ORDERING RULE (round-3 review): read the sync OUTCOME and assign the
+        # terminal job state first; only then run the profile/scheduler
+        # bookkeeping that can raise when the profile closed mid-sync.
+        mw = self.window()
         try:
             out = future.result()
         except Exception as err:
             code = core.classify_sync_error(err)
+            job['state'] = 'error'
+            job['error'] = {'code': code, 'message': str(err)}
             if code == 'auth_failed':
                 # mirror aqt.sync.handle_sync_error: stale keys are dropped
                 mw.pm.clear_sync_auth()
-            job['state'] = 'error'
-            job['error'] = {'code': code, 'message': str(err)}
-            self._plusSyncFinishGui()
+            if mw.col is not None:
+                mw.col._load_scheduler()  # scheduler version may have changed
             return
 
-        mw.pm.set_host_number(out.host_number)
-        if out.new_endpoint:
-            mw.pm.set_current_sync_url(out.new_endpoint)
         job['result'] = {'serverMessage': out.server_message,
                          'hostNumber': out.host_number}
         if out.required != out.NO_CHANGES:
@@ -507,14 +633,22 @@ class PlusMixin:
                                core.SYNC_COLLECTION_REQUIRED.get(out.required, out.required)),
             }
         elif syncMedia:
-            # sync_collection already started the backend media sync; watch
-            # it ourselves — plus must be the single consumer of the one-shot
-            # failure signal (see _plusSyncWatchMedia)
             job['state'] = 'media_syncing'
-            self._plusSyncWatchMedia(job)
         else:
             job['state'] = 'done'
-        self._plusSyncFinishGui()
+
+        if mw.col is not None:
+            mw.col._load_scheduler()  # scheduler version may have changed
+        mw.pm.set_host_number(out.host_number)
+        if out.new_endpoint:
+            mw.pm.set_current_sync_url(out.new_endpoint)
+        if job['state'] == 'media_syncing':
+            # sync_collection already started the backend media sync; watch
+            # it ourselves — plus must be the single consumer of the one-shot
+            # failure signal (see _plusSyncWatchMedia). Started last: it can
+            # itself flip the job to 'error', and it must not run before the
+            # bookkeeping above.
+            self._plusSyncWatchMedia(job)
 
 
     # guard_sync=False: syncNow's own busy states are DATA, not errors — it
@@ -529,6 +663,9 @@ class PlusMixin:
         if auth is None:
             return {'started': False, 'reason': 'not_logged_in'}
         job = self._plusSyncJob()
+        # liveness: never report already_syncing for a job that outlived the
+        # ceiling (round-3 review) — the guard reaps it too, so both agree
+        _reap_stale_sync_job(job)
         if job['state'] in ('syncing', 'media_syncing'):
             return {'started': False, 'reason': 'already_syncing'}
         if mw.media_syncer.is_syncing():
@@ -561,6 +698,11 @@ class PlusMixin:
 
         mw = self.window()
         job = self._plusSyncJob()
+        # liveness: syncStatus is the documented way to WAIT OUT a sync, so
+        # the poll loop itself must be what breaks a stuck 'syncing' state
+        # (round-3 review). Reaped before the snapshot below, so the caller
+        # observes the terminal state, not the stale one.
+        _reap_stale_sync_job(job)
         auth = mw.pm.sync_auth()
         status = {
             'loggedIn': auth is not None,
@@ -1048,6 +1190,11 @@ class PlusMixin:
         return {
             'name': 'AnkiConnect Plus',
             'version': core.PLUS_VERSION,
+            # the SPEC revision this build implements (revision 15+). Both
+            # fields move whenever DEFAULT BEHAVIOR changes, so a client that
+            # caches plusInfo has a machine-readable signal instead of having
+            # to diff prose (revision 15 fix pass).
+            'specRevision': core.PLUS_SPEC_REVISION,
             'apiVersion': util.setting('apiVersion'),
             'actions': list(core.PLUS_ACTIONS),
             'actionDocs': actionDocs,

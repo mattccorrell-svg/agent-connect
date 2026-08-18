@@ -40,7 +40,14 @@ import anki.utils
 from anki.errors import (Interrupted, InvalidInput, NetworkError,
                          NotFoundError, SearchError, SyncError, SyncErrorKind)
 
-PLUS_VERSION = "1.0.0"
+PLUS_VERSION = "1.1.0"
+# The SPEC revision this code implements, kept in lockstep with SPEC.md's
+# "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
+# locked). Revision 15 is the first revision that changed what two actions DO
+# to the collection by default rather than only what they return, so plusInfo
+# needs ONE machine-readable field that a caching client can branch on:
+# PLUS_VERSION moves on behavior changes, specRevision names the contract.
+PLUS_SPEC_REVISION = 15
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -85,7 +92,7 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
 # discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
 # present here; param signatures are read live off the plus.py wrappers.
 PLUS_ACTION_SUMMARIES = {
-    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview).",
+    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview). DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'suspend' defaults to TRUE (config key 'suspendNewCards'), so the cards this batch creates are left SUSPENDED inside the same undo entry and listed in 'suspended' — a generated draft never enters review before a human unsuspends it. Pass suspend=false (or flip the config key) for stock behavior.",
     "bulkUpdateNoteFields": "Update fields and/or replace tags on many notes as one undoable batch; byte-identical no-ops are not written and are reported in 'unchanged'. dryRun=true with diff=true adds a per-field before/after preview capped at maxPreview.",
     "bulkAddTags": "Add tags to many notes as one undoable batch; only notes actually changed are written and reported in 'updated'.",
     "addImageOcclusionNote": "Create a native Image Occlusion note from an image path or base64 data plus normalized 0-1 rects.",
@@ -101,7 +108,7 @@ PLUS_ACTION_SUMMARIES = {
     "mediaExists": "Membership probe: which of these bare media filenames exist in the media folder (read-only, input order; malformed/path-y names report exists:false). actualName reveals the true stored spelling when the filesystem matched case-insensitively (macOS/Windows) — a name that only differs in case will 404 on AnkiWeb/Linux/iOS.",
     "storeMediaFilesBulk": "Store many media files (base64 data or absolute path) in one call; per-item {requested, actual} makes Anki's dedup/rename decision visible, {requested, error} on failures, input order.",
     "bulkSuspend": "Suspend or unsuspend cards as one undoable batch; changedIds lists the cards actually written.",
-    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. It also always writes (no no-op suppression: '1-7' is nondeterministic by design).",
+    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'preserveSuspended' defaults to TRUE (config key 'preserveSuspendedOnReschedule'), so the cards it revived are RE-SUSPENDED inside the same undo entry and listed in 'resuspended' (buried cards are deliberately NOT re-buried). Pass preserveSuspended=false (or flip the config key) for stock behavior. It also always writes (no no-op suppression: '1-7' is nondeterministic by design); dryRun=true predicts changedIds and the whole resurrection/re-suspension set without writing anything.",
     "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting.",
     "syncStatus": "Read-only sync probe: login, local dirtiness, server-required kind, async job state.",
     "syncNow": "Start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus.",
@@ -111,7 +118,7 @@ PLUS_ACTION_SUMMARIES = {
     "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional orphan-media scan. Every list is deck-scoped EXCEPT orphanMediaCollectionWide, which is COLLECTION-WIDE (capped by orphanMediaLimit, full size in orphanMediaCount).",
     "bulkReplaceInFields": "Find/replace (literal or python-regex) on ONE named field's raw HTML, as one undoable batch; field, find and replace are required, plus exactly one of query/noteIds. dryRun returns a capped before/after preview.",
     "undoStatus": "Read Anki's undo stack (read-only): what a single undo/redo would do right now, plus lastStep — the observed truth behind every action's undoEntry.",
-    "plusInfo": "Name/version/action list plus per-action actionDocs (summary + params + returns), an 'errorCodes' map and a 'recipes' list of named call patterns; works before a profile is open.",
+    "plusInfo": "Name/version/specRevision/action list plus per-action actionDocs (summary + params + returns), an 'errorCodes' map and a 'recipes' list of named call patterns; works before a profile is open.",
 }
 
 # plusInfo actionDocs 'returns' (SPEC 4.9, revision 13 — round-3 field feedback
@@ -125,8 +132,13 @@ PLUS_ACTION_SUMMARIES = {
 # present (locked by a test alongside PLUS_ACTION_SUMMARIES).
 PLUS_ACTION_RETURNS = {
     "bulkAddNotes":
-        "{added: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
-        "dryRun=true instead returns {wouldAdd: int, skipped: [{index, reason}], undoEntry: null}.",
+        "{added: [noteId], suspended: [cardId], skipped: [{index, reason}], undoEntry: str|null} "
+        "— 'suspended' is ALWAYS present and lists the cards this call left SUSPENDED (SPEC 27: "
+        "the 'suspend' param defaults to true, so a successful add normally returns a non-empty "
+        "list; a non-empty 'added' with 'suspended': [] means suspension was switched off). "
+        "dryRun=true instead returns {wouldAdd: int, wouldSuspend: bool, skipped: [{index, "
+        "reason}], undoEntry: null} — wouldSuspend is the resolved DECISION, not a count, because "
+        "card ids do not exist until a real add.",
     "bulkUpdateNoteFields":
         "{updated: [noteId], unchanged: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
         "dryRun=true returns {wouldUpdate: [noteId], unchanged, skipped, undoEntry: null}, and "
@@ -138,9 +150,14 @@ PLUS_ACTION_RETURNS = {
     "addImageOcclusionNote":
         "{noteId: int, cardIds: [int], undoEntry: str}",
     "getImageOcclusionNote":
-        "{imageFilename: str, occlusions: [{ordinal, shape, left, top, width, height} for rects | "
-        "{ordinal, shape, properties} for ellipse/polygon/text], header: str, backExtra: str, "
-        "tags: [str], occludeInactive: bool}",
+        "{imageFilename: str, occlusions: [{ordinal, shape, left, top, width, height, "
+        "properties?} for rects | {ordinal, shape, properties} for ellipse/polygon/text], "
+        "header: str, backExtra: str, tags: [str], occludeInactive: bool} — DISCRIMINATE ON "
+        "'left', NOT on the absence of 'properties': a rect carries 'properties' too whenever "
+        "the backend returned keys beyond the four geometry ones, and every rect this add-on "
+        "creates with the default hideAllGuessOne=true has properties {\"oi\": \"1\"} "
+        "(editor-made rects may also carry 'angle'/'fill'). left/top/width/height are floats; "
+        "everything inside 'properties' is a raw backend string.",
     "updateImageOcclusionNote":
         "{undoEntry: str|null} — null when nothing actually changed (no write, no undo entry).",
     "queryRevlog":
@@ -166,7 +183,7 @@ PLUS_ACTION_RETURNS = {
         "truncatedFields: [name]}], missing: [noteId], nextOffset: int|null} — under noteIds, "
         "total counts the ids FOUND and missing lists the ids that no longer exist "
         "(len(noteIds) == total + len(missing) on every page); under query, total is the match "
-        "count and missing is always []. nextOffset is null when no further page can return a note.",
+        "count and missing is always []. nextOffset is null when no further page can return a note. COST: total/missing are window-independent, so the noteIds path re-scans the WHOLE id list on EVERY page — a full paged pass is O(N^2/L) (~103 ms added at 5,000 ids / limit 200, ~1.7 s at 20,000). Read total/missing off the first page and carry them.",
     "mediaThumbnails":
         "{thumbnails: [{filename, data, width, height} | {filename, error}]} — data is base64, "
         "per-file failures are {filename, error} entries, never a raised error.",
@@ -183,9 +200,16 @@ PLUS_ACTION_RETURNS = {
         "changed 0, changedIds [] and undoEntry null (nothing is written).",
     "bulkSetDueDate":
         "{changed: int, changedIds: [cardId], unsuspended: [cardId], unburied: [cardId], "
-        "undoEntry: str|null} — unsuspended/unburied are ALWAYS present ([] when empty) and list "
-        "the cards this call RESURRECTED: anki's set_due_date turns suspended and buried cards "
-        "into normal review cards. This action always writes; it never suppresses no-ops.",
+        "resuspended: [cardId], undoEntry: str|null} — all three id lists are ALWAYS present ([] "
+        "when empty). unsuspended/unburied list the cards this call RESURRECTED (anki's "
+        "set_due_date turns suspended and buried cards into normal review cards); 'resuspended' "
+        "lists the ones it then PUT BACK because preserveSuspended was on (SPEC 27, default "
+        "true), re-read from the post-op queues. They are DURING-the-call facts, not final state: "
+        "the cards left revived are unsuspended MINUS resuspended, and buried cards are never "
+        "re-buried. This action always writes; it never suppresses no-ops. dryRun=true instead "
+        "returns {wouldChange: int, wouldChangeIds: [cardId], wouldUnsuspend: [cardId], "
+        "wouldUnbury: [cardId], wouldResuspend: [cardId], undoEntry: null} — a prediction from "
+        "the pre-state that writes nothing.",
     "exportDeckApkg":
         "{path: str, sizeBytes: int, notesExported: int} — path is the file actually written "
         "(never an overwrite; a serial suffix is added if needed), so read it rather than "
@@ -222,16 +246,20 @@ PLUS_ACTION_RETURNS = {
         "(default 100); orphanMediaCount is the true uncapped total. Both orphan fields are null "
         "unless includeOrphanMedia=true.",
     "bulkReplaceInFields":
-        "{changed: [noteId], matchesTotal: int, unchanged: [noteId], skipped: [{index, reason}], "
+        "{changed: [noteId], matchesTotal: int, unchanged: [noteId], skipped: [{noteId, reason}], "
         "undoEntry: str|null} — dryRun=true instead returns {wouldChange: [noteId], matchesTotal, "
-        "unchanged, skipped, preview: [{noteId, before, after}], previewTruncated: bool, "
-        "undoEntry: null}. before/after are raw field HTML.",
+        "unchanged, skipped: [{noteId, reason}], preview: [{noteId, before, after}], "
+        "previewTruncated: bool, undoEntry: null}. before/after are raw field HTML. NOTE the "
+        "deliberate deviation from every other action's skipped[]: entries here are keyed "
+        "noteId, NOT index — the query path has no meaningful input index.",
     "undoStatus":
         "{undo: str|null, redo: str|null, lastStep: int} — null (never '') when there is nothing "
         "to undo/redo. lastStep is anki's monotonic undo-step counter: snapshot it, run a write, "
         "call again — it advances iff an undo entry was really created.",
     "plusInfo":
-        "{name: str, version: str, apiVersion: int, actions: [str], actionDocs: {action: "
+        "{name: str, version: str, specRevision: int (the SPEC revision this build "
+        "implements; version's minor moves whenever DEFAULT BEHAVIOR does, so a cached "
+        "plusInfo can detect it), apiVersion: int, actions: [str], actionDocs: {action: "
         "{summary, params, returns}}, errorCodes: {code: {retryable: bool, reachable: bool, "
         "meaning: str}}, errorPrefixNote: str, recipes: [{name, description, example}], "
         "docs: {plus, upstream, upstreamSource}}",
@@ -351,11 +379,16 @@ PLUS_ERROR_CODE_DOCS = {
 PLUS_ERROR_PREFIX_NOTE = (
     "Prefixing boundary: errors from the 27 Plus actions AND the dispatcher's unknown-action "
     "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
-    "Errors from the ~90 UPSTREAM AnkiConnect actions are passed through verbatim and UNPREFIXED, "
-    "with errorCode: null and retryable: null — so error.split('] ', 1)[0].lstrip('[') is only "
-    "safe when errorCode is non-null. Read errorCode; do not parse the string. Per-item error "
-    "strings embedded inside a successful result (skipped[].reason, thumbnails[].error, "
-    "stored[].error, cards[].error) are never prefixed and never carry these fields."
+    "EVERY OTHER error is passed through verbatim and UNPREFIXED, with errorCode: null and "
+    "retryable: null — that is the ~90 UPSTREAM AnkiConnect actions, the dispatcher's api-key "
+    "refusal ('valid api key must be provided', the first error a misconfigured client hits: "
+    "raised by the dispatcher but deliberately uncoded, since it is not an unknown action and "
+    "predates this contract), and malformed-request/JSON-schema validation failures. So "
+    "error.split('] ', 1)[0].lstrip('[') is only safe when errorCode is non-null, and "
+    "errorCode: null does NOT prove the failure came from an upstream action. Read errorCode; "
+    "do not parse the string. Per-item error strings embedded inside a successful result "
+    "(skipped[].reason, thumbnails[].error, stored[].error, cards[].error) are never prefixed "
+    "and never carry these fields."
 )
 
 # Message body for the SPEC 25.2 sync guard (the prefix is added by PlusError).
@@ -365,6 +398,23 @@ SYNC_IN_PROGRESS_MESSAGE = (
     'a sync is in progress and holds the collection lock; poll syncStatus '
     'until job.state leaves "syncing", then retry'
 )
+
+# Liveness ceiling for the SPEC 25.2 guard (round-3 review fix). The guard
+# refuses 23 actions with the RETRYABLE [sync_in_progress] for as long as the
+# job sits in state 'syncing', so 'syncing' must be a state the add-on can
+# always leave. _plusSyncDone now guarantees that under try/finally, but that
+# only helps if the completion callback runs at all; if taskman never
+# delivers it (Anki bug, killed worker), nothing else would ever clear the
+# state and the retryable promise would be unsatisfiable until a restart.
+# A job still 'syncing' this long after startedMs is therefore REAPED into a
+# terminal job error (code 'error' — the §18 job-error vocabulary is
+# unchanged) by syncStatus/syncNow/the guard alike, so the documented
+# recovery loop (poll syncStatus until state leaves 'syncing') always
+# terminates. Deliberately generous: a real sync that is still running when
+# the ceiling passes goes back to pre-guard behavior (the next guarded action
+# blocks on the collection mutex) — bad, but recoverable, unlike a permanent
+# refusal.
+SYNC_JOB_STALE_MS = 60 * 60 * 1000  # 1 hour
 
 # AnkiHub HTTP taxonomy code (SPEC 19; kept verbatim in message bodies) ->
 # SPEC 25 machine code for the '[code] ' prefix. Note the 401 mapping:
@@ -455,6 +505,32 @@ PLUS_RECIPES = [
                                'undoLabel': 'PI 7 tag sweep'}},
     },
     {
+        'name': 'suspended-draft workflow',
+        'description': ("This fork ships two DELIBERATE deviations from Anki's own "
+                        "behavior, both switchable (SPEC 27). (1) bulkAddNotes leaves the "
+                        "cards it creates SUSPENDED (param 'suspend', config "
+                        "'suspendNewCards', default true) and lists them in 'suspended', "
+                        "so a generated batch lands as a draft: write suspended -> a human "
+                        "reads them in the browser -> that human unsuspends. (2) "
+                        "bulkSetDueDate PUTS BACK the suspensions anki's set_due_date "
+                        "silently clears (param 'preserveSuspended', config "
+                        "'preserveSuspendedOnReschedule', default true), reporting both "
+                        "'unsuspended' (what anki revived mid-call) and 'resuspended' "
+                        "(what this add-on put back) — subtract the second from the first "
+                        "for the cards actually left in review. Both re-suspensions are "
+                        "merged into the action's OWN undo entry, so a single Ctrl+Z "
+                        "reverts the whole thing; buried cards are deliberately NOT re-"
+                        "buried. Set either param explicitly to override the config for "
+                        "one call: suspend=false / preserveSuspended=false restore stock "
+                        "Anki behavior. Preview either with dryRun=true "
+                        "('wouldSuspend' / 'wouldResuspend')."),
+        'example': {'action': 'bulkAddNotes',
+                    'params': {'notes': [{'deckName': 'Draft', 'modelName': 'Basic',
+                                          'fields': {'Front': 'q', 'Back': 'a'}}],
+                               'suspend': True,
+                               'undoLabel': 'PI 7 draft batch'}},
+    },
+    {
         'name': 'lean deck sweep',
         'description': ("Reading a whole deck cheaply: call notesSlim with "
                         "omitEmptyFields=true (empty fields are dropped from every "
@@ -483,11 +559,18 @@ PLUS_RECIPES = [
                         "Everything else needs a different request. plusInfo.errorCodes is "
                         "the full vocabulary with retryable/reachable/meaning, so a client "
                         "can build its retry table at runtime instead of hardcoding one. "
-                        "Inside upstream 'multi', each sub-response is a full envelope "
-                        "carrying the same four keys — check them per sub-response, not on "
-                        "the outer reply, which reports success even when every sub-action "
-                        "failed. Call this example once at startup and build your retry "
-                        "table from the errorCodes map it returns."),
+                        "Inside upstream 'multi' each sub-response is formatted "
+                        "INDEPENDENTLY, and only the failing ones carry the four keys: a "
+                        "FAILING sub-action gets the full {result, error, errorCode, "
+                        "retryable} envelope, while a SUCCEEDING one gets {result, error: "
+                        "null} — or, if that sub-action omitted \"version\", the bare "
+                        "result with no envelope at all (the handler defaults version to 4). "
+                        "So test that the sub-response is a dict and that sub.get('error') is "
+                        "non-null BEFORE reading errorCode; never index errorCode "
+                        "unconditionally. Check per sub-response, never on the outer reply, "
+                        "which reports success even when every sub-action failed. Call this "
+                        "example once at startup and build your retry table from the "
+                        "errorCodes map it returns."),
         'example': {'action': 'plusInfo', 'params': {}},
     },
 ]
@@ -510,6 +593,30 @@ UNDO_LABEL_MAX_CHARS = 80
 # cards.queue: -1 = suspended; any negative queue (-1 suspended, -2 sibling-
 # buried, -3 manually buried) is restored by the backend unsuspend op (SPEC 16)
 QUEUE_SUSPENDED = -1
+
+#
+# Suspension control (SPEC 27, spec revision 15). BOTH defaults are True, which
+# means this fork DELIBERATELY DEVIATES from Anki's native behavior on two
+# actions -- see SPEC 27 and README for the full rationale and the switch-off:
+#   * bulkSetDueDate: anki's own set_due_date turns every targeted card into a
+#     review card, silently RESURRECTING suspended ones. Left alone, one
+#     deck-wide reschedule can revive every leech you ever suspended. With
+#     preserve_suspended the cards that were suspended before the call are put
+#     back afterwards, inside the SAME undo entry.
+#   * bulkAddNotes: new cards are left suspended so a generated draft batch
+#     never enters review before a human has read it.
+# These constants are the documented fallback used whenever the parameter is
+# None AND no usable config value exists; connect_plus/config.json ships the
+# same two values under CONFIG_PRESERVE_SUSPENDED / CONFIG_SUSPEND_NEW_CARDS
+# and util.DEFAULT_CONFIG mirrors them (all three are locked in lockstep by a
+# test). core.py never reads config itself -- it is aqt-free, so plus.py
+# resolves the config and passes an explicit bool down. An explicit parameter
+# always wins over config; config wins over these constants.
+#
+DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE = True
+DEFAULT_SUSPEND_NEW_CARDS = True
+CONFIG_PRESERVE_SUSPENDED = 'preserveSuspendedOnReschedule'
+CONFIG_SUSPEND_NEW_CARDS = 'suspendNewCards'
 
 # reserved 'field' name for the tag row of a bulkUpdateNoteFields dry-run diff
 # preview (SPEC 4.2, revision 12). Anki does NOT forbid a notetype field
@@ -654,8 +761,17 @@ def _revert_batch(col, undo_name):
     # into the entry: undoing an empty custom entry is a data no-op but pops
     # it off the stack, so we never leave a do-nothing item in the Undo menu
     # (SPEC Deviation #7).
+    #
+    # Returns True iff the undo actually fired. Our entry is only ours to pop
+    # while it is still on TOP: if an op succeeded but its merge_undo_entries
+    # raised, anki's own entry ("Suspend", ...) sits above ours, the name check
+    # fails and nothing is reverted. A caller about to TELL the world "batch
+    # reverted" must branch on this — a false 'reverted' makes the caller's
+    # retry duplicate the writes (SPEC 27.4, revision 15 fix pass).
     if col.undo_status().undo == undo_name:
         col.undo()
+        return True
+    return False
 
 
 def _pop_empty_undo(col, target, written, undo_name):
@@ -671,9 +787,93 @@ def _batch_error(action, undo_name, count_key, index, error, count, skipped):
         action, json.dumps(report, separators=(',', ':'))))
 
 
+def resolve_suspension_flag(value, name, default):
+    """Resolve a suspension-control parameter (SPEC 27).
+
+    None -> the documented default (a plus.py wrapper has usually already
+    replaced None with the config value, so None here means "nothing said
+    anywhere"); a real bool -> itself; anything else is a parameter error
+    raised BEFORE any write, so a typo can never half-apply a policy.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}: boolean required'.format(name))
+    return value
+
+
 def _validate_tag_list(tags, name):
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
         raise PlusError('invalid_param', 'invalid parameter: {}: list of strings required'.format(name))
+
+
+def tag_registry_map(col):
+    """{lowercased tag: the spelling the collection has REGISTERED}.
+
+    One col.tags.all() read, hoisted out of per-note loops on purpose: on a
+    real AnKing-sized collection the registry is ~10k strings, so calling it
+    once per note in a bulk batch would dominate the call.
+    """
+    registered = {}
+    for existing in col.tags.all():
+        registered.setdefault(existing.lower(), existing)
+    return registered
+
+
+def canonify_tags(tags, registry):
+    """Predict the tag list anki will actually STORE for a requested list.
+
+    Round-3 review fix. `note.tags = list(tags); col.update_note(note)` does
+    not store `tags` — the backend canonifies on save, and every step of that
+    is observable from the outside. Measured on scratch collections:
+
+        ['beta','alpha']        -> ['alpha','beta']    (sorted)
+        ['alpha','alpha']       -> ['alpha']           (de-duplicated)
+        ['  alpha  ']           -> ['alpha']           (whitespace stripped)
+        ['gamma delta']         -> ['delta','gamma']   (ONE request -> TWO tags)
+        ['Beta','beta']         -> ['Beta']            (case-insensitive dedup,
+                                                        first occurrence wins)
+        ['Zed','apple']         -> ['apple','Zed']     (sort is case-INsensitive)
+        ['BETA'] with 'beta'
+          already registered    -> ['beta']            (registry spelling wins)
+
+    That last rule is why `registry` (from tag_registry_map) is a parameter:
+    the backend matches each tag case-insensitively against the collection's
+    registered tag list and stores the REGISTERED spelling. The match is on
+    the FULL tag — a registered `Parent::Child` does not lend its case to a
+    new `parent::other`, probe-verified. So the prediction is
+    collection-dependent and cannot be a pure string function.
+
+    Used for two things that were both wrong before: the `__tags__` dry-run
+    preview row's `after` (which promised the raw request, a post-state the
+    write would not produce) and the shared no-op comparison (which compared
+    the raw request against already-canonical stored tags, so an identical
+    repeat of any non-canonical request always re-wrote the note — mod/usn
+    bump plus an undo entry for no net change).
+
+    `col.tags.canonify()` is NOT usable: it is a deprecated no-op stub in
+    25.09.4 (SP/anki/tags.py:144, verified — it returns its input unchanged)
+    and there is no canonify RPC to call instead.
+
+    Two documented approximations, neither of which can cause a wrong write —
+    the worst case is a preview row or a no-op suppression that reverts to
+    the old (over-reporting) behavior:
+      * case folding uses python's str.lower(), the backend uses rust
+        unicase. They agree on ASCII and on ordinary accented text (probe:
+        'Ärger'/'ärger' de-duplicate identically); exotic pairs such as
+        'STRASSE'/'straße' could differ.
+      * `registry` is a snapshot. Inside one bulk batch an earlier entry can
+        register a tag that a later entry names with different case; the
+        later entry is canonified against the pre-batch registry.
+    """
+    requested = ' '.join(tags).split()
+    deduped = {}
+    for tag in requested:
+        key = tag.lower()
+        # first occurrence wins, then the registry spelling overrides it
+        deduped.setdefault(key, registry.get(key, tag))
+    return sorted(deduped.values(), key=str.lower)
 
 
 #
@@ -681,14 +881,19 @@ def _validate_tag_list(tags, name):
 #
 
 def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=False,
-                   undo_label=None):
+                   suspend=None, undo_label=None):
     undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_ADD
     if not isinstance(notes, list):
         raise PlusError('invalid_param', 'invalid parameter: notes: list required')
+    # SPEC 27: suspend the cards this batch creates. Resolved (and type-checked)
+    # before the empty-list early return so every return shape below can report
+    # the decision, and before any write so a bad value never lands a half-batch.
+    suspend_new = resolve_suspension_flag(suspend, 'suspend', DEFAULT_SUSPEND_NEW_CARDS)
     if not notes:
         if dry_run:
-            return {'wouldAdd': 0, 'skipped': [], 'undoEntry': None}
-        return {'added': [], 'skipped': [], 'undoEntry': None}
+            return {'wouldAdd': 0, 'wouldSuspend': suspend_new, 'skipped': [],
+                    'undoEntry': None}
+        return {'added': [], 'suspended': [], 'skipped': [], 'undoEntry': None}
     for i, note in enumerate(notes):
         if not isinstance(note, dict):
             raise PlusError('invalid_param', 'invalid parameter: notes[{}]: object required'.format(i))
@@ -793,7 +998,11 @@ def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=Fals
     if dry_run:
         skipped = [{'index': i, 'reason': entry['skip']}
                    for i, entry in enumerate(resolved) if 'skip' in entry]
-        return {'wouldAdd': len(resolved) - len(skipped), 'skipped': skipped, 'undoEntry': None}
+        # 'wouldSuspend' is the resolved DECISION, not a count: card ids (and
+        # even the card COUNT, for a cloze notetype) do not exist until a real
+        # add, so a number here would be a guess (SPEC 15, 27).
+        return {'wouldAdd': len(resolved) - len(skipped), 'wouldSuspend': suspend_new,
+                'skipped': skipped, 'undoEntry': None}
 
     # write pass
     added = []
@@ -819,8 +1028,62 @@ def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=Fals
                 raise _batch_error('bulkAddNotes', undo_name, 'addedBeforeRevert', i, e, len(added), skipped)
             skipped.append({'index': i, 'reason': str(e)})
 
+    # SPEC 27: leave the batch's new cards suspended, INSIDE the same undo
+    # entry (one Ctrl+Z must not leave notes added but unsuspended). Cards are
+    # collected per note via col.card_ids_of_note (no raw SQL) and suspended in
+    # ONE op after the loop; freshly created cards are queue 0, so the op
+    # changes every one of them and 'suspended' == the ids passed to it.
+    suspended = []
+    if suspend_new and added:
+        for nid in added:
+            suspended.extend(col.card_ids_of_note(nid))
+        try:
+            suspendOp = col.sched.suspend_cards(suspended)
+            col.merge_undo_entries(target)
+        except Exception as e:
+            # A failure HERE is always fatal, even under atomic=false: the
+            # caller asked for suspended drafts, and handing back added-but-
+            # live notes while reporting success is exactly the silent
+            # divergence this add-on refuses to ship. 'failedStep' replaces
+            # 'failedIndex' because the step is not per-note.
+            reverted = _revert_batch(col, undo_name)
+            if reverted:
+                report = {'failedStep': 'suspend', 'error': str(e),
+                          'addedBeforeRevert': len(added), 'skipped': skipped}
+                raise PlusError('batch_reverted',
+                                'bulkAddNotes failed (batch reverted): {}'.format(
+                                    json.dumps(report, separators=(',', ':'))))
+            # The revert could NOT run (our entry was no longer on top —
+            # suspend_cards succeeded and only the merge failed, so anki's own
+            # entry is above ours). Say exactly that and name what is still in
+            # the collection: claiming 'reverted' here would make a retry
+            # create the notes twice (SPEC 4.1/27.4).
+            report = {'failedStep': 'suspend', 'error': str(e), 'reverted': False,
+                      'addedStillCommitted': len(added), 'addedIds': added,
+                      'skipped': skipped}
+            raise PlusError('internal',
+                            'bulkAddNotes failed (batch NOT reverted): {}'.format(
+                                json.dumps(report, separators=(',', ':'))))
+        # Honesty cross-check (SPEC 27.4): 'suspended' must be post-op state,
+        # not the ids we handed the backend. suspend_cards is the one scheduler
+        # op that answers authoritatively (OpChangesWithCount) and every
+        # freshly created card is queue 0, so the count MUST equal the ids
+        # passed; if it ever does not, re-read the queues and report only the
+        # cards that really are suspended rather than over-claiming.
+        suspendCount = getattr(suspendOp, 'count', None)
+        if suspendCount is not None and suspendCount != len(suspended):
+            confirmed = []
+            for cid in suspended:
+                try:
+                    if col.get_card(cid).queue == QUEUE_SUSPENDED:
+                        confirmed.append(cid)
+                except NotFoundError:  # pragma: no cover - handlers are serialized
+                    continue
+            suspended = confirmed
+
     _pop_empty_undo(col, target, added, undo_name)
-    return {'added': added, 'skipped': skipped, 'undoEntry': undo_name if added else None}
+    return {'added': added, 'suspended': suspended, 'skipped': skipped,
+            'undoEntry': undo_name if added else None}
 
 
 def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
@@ -843,6 +1106,7 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
     preview = []       # dryRun+diff only: [{noteId, field, before, after}], capped
     diffTotal = 0      # changed-field entries found, INCLUDING those past the cap
     target = None
+    tagRegistry = None  # lazy: one col.tags.all() read, only if some entry has tags
     for i, entry in enumerate(notes):
         if not isinstance(entry, dict):
             skipped.append({'index': i, 'reason': 'invalid parameter: notes[{}]: object required'.format(i)})
@@ -880,13 +1144,26 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
                 skipped.append({'index': i, 'reason': 'invalid parameter: notes[{}].fields.{}: string required'.format(i, badValue)})
                 continue
 
+        # tags are compared and previewed in the form anki will actually
+        # STORE, not as requested (round-3 review fix; see canonify_tags).
+        # Comparing the raw request against already-canonical stored tags made
+        # an identical repeat of any non-canonical request ('gamma delta',
+        # ['b','a'], ['x','X'], ' padded ') report 'updated' and re-write the
+        # note every time, for no net data change.
+        if tags is not None:
+            if tagRegistry is None:
+                tagRegistry = tag_registry_map(col)
+            canonTags = canonify_tags(tags, tagRegistry)
+        else:
+            canonTags = None
+
         # no-op detection (shared rule with bulkAddTags, SPEC 4.2/4.3): an
         # entry whose requested fields AND tags all byte-match the note's
         # current values is never written — it lands in 'unchanged', creates
         # no undo entry, and the check is read-only so the dry and real paths
         # share it by construction (SPEC 15)
         if ((fields is None or all(ankiNote[name] == value for name, value in fields.items()))
-                and (tags is None or list(tags) == ankiNote.tags)):
+                and (canonTags is None or canonTags == ankiNote.tags)):
             unchanged.append(nid)
             continue
 
@@ -912,12 +1189,14 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
                 # with no preview row at all, so a reviewer saw a note slated
                 # for an update with no visible reason). Emitted after the
                 # note's field rows, values space-joined in list order.
-                if tags is not None and list(tags) != ankiNote.tags:
+                # 'after' is the CANONIFIED form — what the write will
+                # really store — not the raw request (round-3 review fix)
+                if canonTags is not None and canonTags != ankiNote.tags:
                     diffTotal += 1
                     if len(preview) < max_preview:
                         preview.append({'noteId': nid, 'field': TAGS_PREVIEW_FIELD,
                                         'before': ' '.join(ankiNote.tags),
-                                        'after': ' '.join(tags)})
+                                        'after': ' '.join(canonTags)})
             continue
 
         try:
@@ -1633,7 +1912,16 @@ def _existing_note_ids(col, ids):
     existence select (SPEC 13, revision 12 — the noteIds path's honest
     'total'/'missing' needs to know about ids OUTSIDE the current page, which
     a per-page col.get_note loop cannot see). Read-only select of note ids:
-    the same 'note-id/card-id location select' family the HARD RULES allow."""
+    the same 'note-id/card-id location select' family the HARD RULES allow.
+
+    COST, disclosed (round-3 review): this runs on EVERY page over the WHOLE
+    requested list, because window-independent total/missing is the point.
+    A full paged pass over N ids at page size L is therefore O(N^2/L), not
+    O(N). Measured ~0.83 us/id on a scratch collection: ~1 ms added over a
+    full pass at N=500, ~103 ms at N=5,000, ~1.7 s at N=20,000 (limit 200).
+    No opt-out param by design — a flag to skip it would be a flag to
+    reinstate the revision-12 lie; SPEC 13 tells callers to read
+    total/missing off the first page and carry them instead."""
     found = set()
     unique = list(dict.fromkeys(ids))
     for start in range(0, len(unique), SQL_IN_CHUNK):
@@ -2010,7 +2298,8 @@ def bulk_suspend(col, card_ids, suspend=True, undo_label=None):
     return {'changed': changed, 'changedIds': pending, 'undoEntry': undo_name}
 
 
-def bulk_set_due_date(col, card_ids, days, undo_label=None):
+def bulk_set_due_date(col, card_ids, days, preserve_suspended=None, dry_run=False,
+                     undo_label=None):
     undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_DUE
     if not isinstance(days, str) or not days:
         raise PlusError('invalid_param', 'invalid parameter: days: string like "0" or "1-7" required')
@@ -2022,15 +2311,43 @@ def bulk_set_due_date(col, card_ids, days, undo_label=None):
     # parse then rejects them, so [0-9] is the true accepted alphabet.
     if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?!?', days):
         raise PlusError('invalid_param', 'invalid parameter: days: {}'.format(days))
+    # SPEC 27: put back the suspensions anki's set_due_date clears. Resolved
+    # (and type-checked) before any undo entry exists, same as the days grammar.
+    preserve = resolve_suspension_flag(preserve_suspended, 'preserveSuspended',
+                                       DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE)
+    # dryRun is type-checked in the same breath, and for the same reason: a
+    # truthy non-boolean ("false", "no", 1) would silently turn a requested
+    # reschedule into a zero-write prediction and still answer 200. Same idiom
+    # as bulk_replace_in_fields' flag loop (SPEC 15).
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
     existing = _existing_cards(col, card_ids)
     if not existing:
+        if dry_run:
+            return {'wouldChange': 0, 'wouldChangeIds': [], 'wouldUnsuspend': [],
+                    'wouldUnbury': [], 'wouldResuspend': [], 'undoEntry': None}
         return {'changed': 0, 'changedIds': [], 'unsuspended': [], 'unburied': [],
-                'undoEntry': None}
+                'resuspended': [], 'undoEntry': None}
     ids = [cid for cid, _queue in existing]
     # queues are already in hand from the precheck: remember the cards that
     # were suspended (-1) or buried (-2 sibling, -3 manual) so the RESURRECTION
     # side effect can be reported (revision 12, round-3 field feedback)
     preNegative = [(cid, queue) for cid, queue in existing if queue < 0]
+
+    # dry run (SPEC 15, 27): the precheck above IS the real path's validation,
+    # and it is read-only; stop here, before add_custom_undo_entry, so
+    # undo_status() stays bit-identical. The 'would' keys are renamed because
+    # they are a PREDICTION from the pre-state, not an observation: unsuspended/
+    # unburied are re-read from the post-state on a real run, while wouldUnsuspend
+    # /wouldUnbury assume anki's measured resurrection behavior holds.
+    if dry_run:
+        wouldUnsuspend = [cid for cid, queue in preNegative if queue == QUEUE_SUSPENDED]
+        return {'wouldChange': len(ids), 'wouldChangeIds': ids,
+                'wouldUnsuspend': wouldUnsuspend,
+                'wouldUnbury': [cid for cid, queue in preNegative
+                                if queue != QUEUE_SUSPENDED],
+                'wouldResuspend': list(wouldUnsuspend) if preserve else [],
+                'undoEntry': None}
 
     target = col.add_custom_undo_entry(undo_name)
     try:
@@ -2060,10 +2377,52 @@ def bulk_set_due_date(col, card_ids, days, undo_label=None):
         if after >= 0:
             (unsuspended if queue == QUEUE_SUSPENDED else unburied).append(cid)
 
+    # CONTROL (SPEC 27, revision 15): re-suspend exactly the cards this call
+    # revived, merged into the SAME undo entry so one Ctrl+Z cannot leave a
+    # half-reverted state. Only 'unsuspended' is put back -- a card that was
+    # suspended before and stayed suspended never left, and claiming to have
+    # re-suspended it would be a lie. Buried cards are deliberately NOT re-
+    # buried (Deviation #13b): anki's unbury on reschedule is desirable, and
+    # only suspension was asked for. 'resuspended' is re-read from the post-op
+    # queues, so it reports what actually IS suspended now, not what was asked.
+    resuspended = []
+    if preserve and unsuspended:
+        try:
+            col.sched.suspend_cards(unsuspended)
+            col.merge_undo_entries(target)
+        except Exception as e:
+            if _revert_batch(col, undo_name):
+                raise PlusError('batch_reverted',
+                                'bulkSetDueDate failed (batch reverted): re-suspend: {}'.format(e))
+            # Our entry was no longer on top, so nothing was rolled back: the
+            # reschedule (and possibly the re-suspension itself) IS committed.
+            # Re-read the queues so the report names the cards actually left
+            # in review instead of asserting a revert that did not happen.
+            stillLive = []
+            for cid in unsuspended:
+                try:
+                    if col.get_card(cid).queue != QUEUE_SUSPENDED:
+                        stillLive.append(cid)
+                except Exception:  # pragma: no cover - handlers are serialized
+                    continue
+            report = {'failedStep': 'resuspend', 'error': str(e), 'reverted': False,
+                      'rescheduledStillCommitted': len(ids),
+                      'stillUnsuspended': stillLive}
+            raise PlusError('internal',
+                            'bulkSetDueDate failed (batch NOT reverted): {}'.format(
+                                json.dumps(report, separators=(',', ':'))))
+        for cid in unsuspended:
+            try:
+                if col.get_card(cid).queue == QUEUE_SUSPENDED:
+                    resuspended.append(cid)
+            except NotFoundError:  # pragma: no cover - handlers are serialized
+                continue
+
     # set_due_date returns plain OpChanges (no count); it applies to every
     # existing card regardless of state (SPEC Deviation #8)
     return {'changed': len(ids), 'changedIds': ids, 'unsuspended': unsuspended,
-            'unburied': unburied, 'undoEntry': undo_name}
+            'unburied': unburied, 'resuspended': resuspended,
+            'undoEntry': undo_name}
 
 
 #
@@ -2460,8 +2819,8 @@ def bulk_replace_in_fields(col, query=None, note_ids=None, field=None,
 #
 
 def undo_status(col):
-    """Read anki's undo stack (SPEC 26). Pure read: col.undo_status() is a
-    backend get_undo_status RPC, no write, no stack change.
+    """Read anki's undo stack (SPEC 26). Pure read: get_undo_status is a
+    backend RPC, no write, no stack change.
 
     Rationale (round-3 field feedback): every write action REPORTS the undo
     entry name it set, but a caller had no way to OBSERVE the stack, so the
@@ -2469,15 +2828,31 @@ def undo_status(col):
     driving Anki's menu bar with AppleScript and was blocked by assistive-
     access permissions).
 
+    Reads col._backend.get_undo_status() DIRECTLY rather than the
+    col.undo_status() wrapper (round-3 review fix). The wrapper is
+    `self._check_backend_undo_status() or UndoStatus()`
+    (SP/anki/collection.py:1033-1035), and _check_backend_undo_status
+    (:1080-1086) returns None whenever BOTH undo and redo are empty — so the
+    wrapper hands back a synthesized default proto whose last_step is 0. That
+    silently broke the monotonicity this action exists to provide: measured
+    on a scratch collection, col.fix_integrity() (Check Database) left
+    _backend.get_undo_status() == ('', '', 1) while col.undo_status()
+    reported last_step 0. col.decks.add_config() and col.mod_schema() clear
+    the stack the same way. The backend call returns the identical
+    undo/redo strings plus the TRUE counter, and is read-only (verified
+    stable across repeated calls); core.py already reaches for _backend the
+    same way for html_to_text_line, extract_latex and cloze_numbers_in_note.
+
     UndoStatus is the collection_pb2 proto with str 'undo'/'redo' and uint32
     'last_step'. Empty strings mean "nothing to undo/redo" (never None, never
     a raise, probe-verified on a fresh collection) and are normalized to null.
     lastStep is anki's monotonic step counter: it advances on every undoable
     operation, so a caller can prove a call created a new entry (or, for the
     documented always-writes case in §16.2, that a byte-identical repeat
-    still did).
+    still did). Note that lastStep is monotonic within a session but is NOT
+    reset-proof: clearing the stack keeps the counter, it does not rewind it.
     """
-    status = col.undo_status()
+    status = col._backend.get_undo_status()
     return {'undo': status.undo or None,
             'redo': status.redo or None,
             'lastStep': status.last_step}

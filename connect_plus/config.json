@@ -4,5 +4,7 @@
     "webBindAddress": "127.0.0.1",
     "webBindPort": 8766,
     "webCorsOriginList": ["http://localhost"],
-    "ignoreOriginList": []
+    "ignoreOriginList": [],
+    "preserveSuspendedOnReschedule": true,
+    "suspendNewCards": true
 }

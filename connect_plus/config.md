@@ -11,6 +11,15 @@ A personal fork of [AnkiConnect](https://foosoft.net/projects/anki-connect/) by 
 - **`webCorsOriginList`** — default `["http://localhost"]`. Origins allowed CORS access. The `ANKICONNECT_PLUS_CORS_ORIGIN` environment variable appends one more origin.
 - **`ignoreOriginList`** — default `[]`. Origins that are silently denied without prompting.
 
+### Suspension control (deliberate deviations from Anki's own behavior)
+
+Both keys ship **`true`**, so out of the box this fork does NOT behave like stock Anki. That is intentional: silently resurrecting suspended cards can revive a whole deck of leeches in one call, and a generated draft batch should not enter review before a human has read it. Each key is a *default* only — an explicit parameter on the call always wins, and a request that passes neither gets the value below.
+
+- **`preserveSuspendedOnReschedule`** — default `true`. `bulkSetDueDate` snapshots which target cards are suspended, reschedules, then **re-suspends exactly the cards Anki revived**, all inside the action's own undo entry (one Ctrl+Z reverts both halves). The response reports both `unsuspended` (what Anki revived mid-call) and `resuspended` (what was put back). Set to `false`, or pass `preserveSuspended: false` on the call, for stock Anki behavior. Buried cards are deliberately **not** re-buried.
+- **`suspendNewCards`** — default `true`. `bulkAddNotes` leaves the cards it creates **suspended**, in the same undo entry as the adds, and lists them in `suspended`. Set to `false`, or pass `suspend: false` on the call, for stock Anki behavior.
+
+A value that is not a JSON boolean is ignored and the documented default above applies (a config typo must not fail a write action).
+
 ### Environment variables
 
 - `ANKICONNECT_PLUS_BIND_ADDRESS` — overrides `webBindAddress`.

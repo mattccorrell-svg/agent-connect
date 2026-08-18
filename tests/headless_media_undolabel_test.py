@@ -342,8 +342,12 @@ def test5_undolabel_update_tags_replace():
 
 def test6_undolabel_scheduler():
     col.decks.id("R2Sched")
+    # suspend=False: revision 15 (SPEC 27) suspends new cards by default, and
+    # this test is about undo LABELS on the scheduler actions — it needs the
+    # two cards to start at queue 0 so bulkSuspend has something to change.
     added = core.bulk_add_notes(
-        col, [basic_note("R2Sched", "ul-sched-%d" % i) for i in range(2)])["added"]
+        col, [basic_note("R2Sched", "ul-sched-%d" % i) for i in range(2)],
+        suspend=False)["added"]
     cids = col.db.list("select id from cards where nid in (%s)" %
                        ",".join(str(n) for n in added))
 
@@ -355,8 +359,10 @@ def test6_undolabel_scheduler():
     assert r["undoEntry"] == "AnkiConnect Plus: Bulk Suspend", r
 
     r = core.bulk_set_due_date(col, cids, "0", undo_label="due today")
+    # revision 15 (SPEC 27): additive 'resuspended' key
     assert r == {"changed": 2, "changedIds": cids, "unsuspended": [],
-                 "unburied": [], "undoEntry": LABEL + "due today"}, r
+                 "unburied": [], "resuspended": [],
+                 "undoEntry": LABEL + "due today"}, r
     assert col.undo_status().undo == LABEL + "due today"
     # bad days string still leaves the undo stack untouched, label or not
     u_snap = undo_snap()

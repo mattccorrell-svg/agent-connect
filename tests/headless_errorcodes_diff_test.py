@@ -18,6 +18,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 import traceback
 import types
 
@@ -634,7 +635,11 @@ def test11_sync_guard_reachable():
     inst = FakeAC()
     # the test hook the locked design calls for: set the job state directly on a
     # constructed mixin — no real sync, no network, no Qt.
-    inst._plusSyncJobState = {"state": "syncing", "startedMs": 1,
+    # round-3 review fix: startedMs must be RECENT. The guard now reaps a
+    # job left "syncing" past core.SYNC_JOB_STALE_MS instead of refusing
+    # forever (liveness), and startedMs=1 is 1970 — permanently stale.
+    inst._plusSyncJobState = {"state": "syncing",
+                              "startedMs": int(time.time() * 1000),
                               "result": None, "error": None}
 
     def code_of(fn):
