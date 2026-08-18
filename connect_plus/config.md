@@ -11,12 +11,14 @@ A personal fork of [AnkiConnect](https://foosoft.net/projects/anki-connect/) by 
 - **`webCorsOriginList`** — default `["http://localhost"]`. Origins allowed CORS access. The `ANKICONNECT_PLUS_CORS_ORIGIN` environment variable appends one more origin.
 - **`ignoreOriginList`** — default `[]`. Origins that are silently denied without prompting.
 
-### Suspension control (deliberate deviations from Anki's own behavior)
+### Suspension control
 
-Both keys ship **`true`**, so out of the box this fork does NOT behave like stock Anki. That is intentional: silently resurrecting suspended cards can revive a whole deck of leeches in one call, and a generated draft batch should not enter review before a human has read it. Each key is a *default* only — an explicit parameter on the call always wins, and a request that passes neither gets the value below.
+These two keys are *defaults* only — an explicit parameter on the call always wins, and a request that passes neither gets the value below.
+
+**`preserveSuspendedOnReschedule` ships `true` and is a deliberate deviation from stock Anki.** Anki's own `set_due_date` silently un-suspends every card it touches — rescheduling a deck-wide selection can revive a whole set of suspended leeches in one call. This fork protects against that by default, and the response always discloses what happened. **`suspendNewCards` ships `false`** (stock-compatible): flip it to `true` to opt into the suspended-draft workflow, where generated batches never enter review before a human has read them.
 
 - **`preserveSuspendedOnReschedule`** — default `true`. `bulkSetDueDate` snapshots which target cards are suspended, reschedules, then **re-suspends exactly the cards Anki revived**, all inside the action's own undo entry (one Ctrl+Z reverts both halves). The response reports both `unsuspended` (what Anki revived mid-call) and `resuspended` (what was put back). Set to `false`, or pass `preserveSuspended: false` on the call, for stock Anki behavior. Buried cards are deliberately **not** re-buried.
-- **`suspendNewCards`** — default `true`. `bulkAddNotes` leaves the cards it creates **suspended**, in the same undo entry as the adds, and lists them in `suspended`. Set to `false`, or pass `suspend: false` on the call, for stock Anki behavior.
+- **`suspendNewCards`** — default `false` (stock Anki behavior: new cards are live). Set to `true`, or pass `suspend: true` on the call, and `bulkAddNotes` leaves the cards it creates **suspended**, in the same undo entry as the adds, listing them in `suspended`.
 
 A value that is not a JSON boolean is ignored and the documented default above applies (a config typo must not fail a write action).
 

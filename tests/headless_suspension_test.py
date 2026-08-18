@@ -1,8 +1,8 @@
 # Headless verification for SPEC 27 — suspension control (spec revision 15).
 #
-#   * bulkAddNotes   `suspend`           (config 'suspendNewCards', ships true)
+#   * bulkAddNotes   `suspend`           (config 'suspendNewCards', ships FALSE since rev 16)
 #   * bulkSetDueDate `preserveSuspended` (config 'preserveSuspendedOnReschedule',
-#                                         ships true) + its new `dryRun`
+#                                         ships TRUE) + its new `dryRun`
 #
 # Both defaults are DELIBERATE deviations from Anki's own behavior, so this
 # suite pins down four things the rest of the suites cannot: the deviation is
@@ -96,12 +96,14 @@ def code_of(fn):
 
 
 # ============================================================================
-# 1 — bulkAddNotes leaves new cards suspended BY DEFAULT, in one undo entry
+# 1 — bulkAddNotes suspend=true leaves new cards suspended, one undo entry
+#     (default is STOCK/live since revision 16 — pinned at the end)
 # ============================================================================
 def test1_add_suspends_by_default():
     col.decks.id("S1")
     before = note_count()
-    r = core.bulk_add_notes(col, [note("S1", "s1-%d" % i) for i in range(3)])
+    r = core.bulk_add_notes(col, [note("S1", "s1-%d" % i) for i in range(3)],
+                            suspend=True)
 
     assert len(r["added"]) == 3, r
     # every card of every added note is reported AND actually suspended
@@ -130,7 +132,7 @@ def test2_add_suspends_every_card_of_a_multi_card_note():
     r = core.bulk_add_notes(col, [{"deckName": "S2",
                                    "modelName": "Basic (and reversed card)",
                                    "fields": {"Front": "s2-a", "Back": "s2-b"},
-                                   "tags": []}])
+                                   "tags": []}], suspend=True)
     cids = col.card_ids_of_note(r["added"][0])
     assert len(cids) == 2, cids
     assert r["suspended"] == list(cids), (r["suspended"], cids)
@@ -144,10 +146,12 @@ def test3_add_suspend_false_is_stock_anki():
     assert r["suspended"] == [], r
     assert queues(cids) == [0], queues(cids)
 
-    # explicit None means "nothing said" -> the documented default applies
+    # explicit None means "nothing said" -> the documented default applies,
+    # which since revision 16 is FALSE (stock behavior: new cards live)
     r = core.bulk_add_notes(col, [note("S3", "s3-b")], suspend=None)
-    assert queues(r["suspended"]) == [core.QUEUE_SUSPENDED], r
-    assert core.DEFAULT_SUSPEND_NEW_CARDS is True
+    assert r["suspended"] == [], r
+    assert queues(col.find_cards("s3-b")) == [0], r
+    assert core.DEFAULT_SUSPEND_NEW_CARDS is False
 
 
 def test4_add_suspend_is_type_checked_before_any_write():
@@ -167,7 +171,7 @@ def test5_add_reports_the_decision_on_every_return_path():
     assert core.bulk_add_notes(col, []) == \
         {"added": [], "suspended": [], "skipped": [], "undoEntry": None}
     assert core.bulk_add_notes(col, [], dry_run=True) == \
-        {"wouldAdd": 0, "wouldSuspend": True, "skipped": [], "undoEntry": None}
+        {"wouldAdd": 0, "wouldSuspend": False, "skipped": [], "undoEntry": None}
 
     # all-skipped batch: nothing written, no empty undo entry left behind
     snap = undo_snap()
@@ -179,23 +183,27 @@ def test5_add_reports_the_decision_on_every_return_path():
 
     # dry run predicts the decision and writes NOTHING
     before, snap = note_count(), undo_snap()
-    dry = core.bulk_add_notes(col, [note("S5", "s5-a")], dry_run=True)
+    dry = core.bulk_add_notes(col, [note("S5", "s5-a")], dry_run=True,
+                              suspend=True)
     assert dry == {"wouldAdd": 1, "wouldSuspend": True, "skipped": [],
                    "undoEntry": None}, dry
-    dry_off = core.bulk_add_notes(col, [note("S5", "s5-a")], dry_run=True,
-                                  suspend=False)
-    assert dry_off["wouldSuspend"] is False, dry_off
+    dry_off = core.bulk_add_notes(col, [note("S5", "s5-a")], dry_run=True)
+    assert dry_off["wouldSuspend"] is False, dry_off   # rev-16 shipped default
     assert note_count() == before and undo_snap() == snap, "dry run wrote"
 
-    # dry prediction matches the real run
-    real = core.bulk_add_notes(col, [note("S5", "s5-a")])
+    # dry prediction matches the real run — on BOTH sides of the flag
+    real = core.bulk_add_notes(col, [note("S5", "s5-a")], suspend=True)
     assert len(real["added"]) == dry["wouldAdd"] == 1, real
     assert bool(real["suspended"]) is dry["wouldSuspend"], (real, dry)
+    real_off = core.bulk_add_notes(col, [note("S5", "s5-b")])
+    assert bool(real_off["suspended"]) is dry_off["wouldSuspend"], \
+        (real_off, dry_off)
 
 
 def test6_add_suspend_respects_undo_label():
     col.decks.id("S6")
-    r = core.bulk_add_notes(col, [note("S6", "s6-a")], undo_label="PI 7 draft")
+    r = core.bulk_add_notes(col, [note("S6", "s6-a")], undo_label="PI 7 draft",
+                            suspend=True)
     assert r["undoEntry"] == "AnkiConnect Plus: PI 7 draft", r
     assert col.undo_status().undo == "AnkiConnect Plus: PI 7 draft"
     assert queues(r["suspended"]) == [core.QUEUE_SUSPENDED]
@@ -359,10 +367,11 @@ def test12_config_defaults_are_in_lockstep():
                              encoding="utf-8"))
     defaults = _default_config_literal()
     pairs = ((core.CONFIG_PRESERVE_SUSPENDED,
-              core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE),
-             (core.CONFIG_SUSPEND_NEW_CARDS, core.DEFAULT_SUSPEND_NEW_CARDS))
-    for key, constant in pairs:
-        assert constant is True, (key, constant)          # both SHIP TRUE
+              core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE, True),
+             (core.CONFIG_SUSPEND_NEW_CARDS, core.DEFAULT_SUSPEND_NEW_CARDS,
+              False))                                     # rev-16 split
+    for key, constant, want in pairs:
+        assert constant is want, (key, constant, want)
         assert shipped[key] is constant, (key, shipped.get(key))
         assert defaults[key] is constant, (key, defaults.get(key))
 
@@ -383,7 +392,7 @@ def test13_wrapper_resolves_param_over_config_over_default():
 
     # the shipped DEFAULT_CONFIG really carries both keys, so util.setting()
     # answers even when config.json predates them
-    assert util_mod.DEFAULT_CONFIG[core.CONFIG_SUSPEND_NEW_CARDS] is True
+    assert util_mod.DEFAULT_CONFIG[core.CONFIG_SUSPEND_NEW_CARDS] is False
     assert util_mod.DEFAULT_CONFIG[core.CONFIG_PRESERVE_SUSPENDED] is True
 
     resolve = plus._resolve_suspension_param
@@ -405,7 +414,7 @@ def test13_wrapper_resolves_param_over_config_over_default():
         # older config.json without the key -> util.setting's own
         # DEFAULT_CONFIG fallback (this is the real code path, not a stub)
         util_mod.setting = lambda key: {}.get(key, util_mod.DEFAULT_CONFIG[key])
-        assert resolve(None, core.CONFIG_SUSPEND_NEW_CARDS, True) is True
+        assert resolve(None, core.CONFIG_SUSPEND_NEW_CARDS, True) is False
         assert resolve(None, core.CONFIG_PRESERVE_SUSPENDED, True) is True
 
         # unreadable config (no aqt.mw yet) -> documented default, no crash
@@ -448,8 +457,9 @@ def test14_wrapper_end_to_end_and_discoverability():
         r = inst.bulkAddNotes(notes=[note("S14", "s14-b")], suspend=True)
         assert queues(r["suspended"]) == [core.QUEUE_SUSPENDED], r
 
-        # config says "suspend" (the shipped value) -> default behavior
-        util_mod.setting = lambda key: util_mod.DEFAULT_CONFIG[key]
+        # config opts IN to suspension (rev 16: shipped value is False,
+        # so this exercises the config-True path explicitly)
+        util_mod.setting = lambda key: True
         r = inst.bulkAddNotes(notes=[note("S14", "s14-c")])
         assert queues(r["suspended"]) == [core.QUEUE_SUSPENDED], r
         cid = r["suspended"][0]
@@ -474,13 +484,14 @@ def test14_wrapper_end_to_end_and_discoverability():
         assert "preserveSuspended=null" in docs["bulkSetDueDate"]["params"], \
             docs["bulkSetDueDate"]
         assert "dryRun=false" in docs["bulkSetDueDate"]["params"], docs["bulkSetDueDate"]
-        for action, param, config_key in (
-                ("bulkAddNotes", "suspend", core.CONFIG_SUSPEND_NEW_CARDS),
-                ("bulkSetDueDate", "preserveSuspended", core.CONFIG_PRESERVE_SUSPENDED)):
-            summary = docs[action]["summary"]
-            assert "DEVIATION" in summary, (action, summary)
-            assert config_key in summary, (action, summary)
-            assert "%s=false" % param in summary, (action, summary)
+        add_summary = docs["bulkAddNotes"]["summary"]
+        assert "suspended-draft" in add_summary, add_summary   # opt-in, rev 16
+        assert core.CONFIG_SUSPEND_NEW_CARDS in add_summary, add_summary
+        assert "suspend=true" in add_summary, add_summary
+        due_summary = docs["bulkSetDueDate"]["summary"]
+        assert "DEVIATION" in due_summary, due_summary         # still shipped-on
+        assert core.CONFIG_PRESERVE_SUSPENDED in due_summary, due_summary
+        assert "preserveSuspended=false" in due_summary, due_summary
         assert "suspended: [cardId]" in docs["bulkAddNotes"]["returns"]
         assert "wouldSuspend" in docs["bulkAddNotes"]["returns"]
         assert "resuspended" in docs["bulkSetDueDate"]["returns"]
@@ -536,7 +547,7 @@ def test15_failure_paths_report_the_real_revert_outcome():
     col.sched.suspend_cards = blow_up
     try:
         code, report = _report_of(lambda: core.bulk_add_notes(
-            col, [note("S15", "s15-a"), note("S15", "s15-b")]))
+            col, [note("S15", "s15-a"), note("S15", "s15-b")], suspend=True))
     finally:
         col.sched.suspend_cards = orig_suspend
     assert code == "batch_reverted", (code, report)
@@ -560,7 +571,7 @@ def test15_failure_paths_report_the_real_revert_outcome():
     col.merge_undo_entries = merge_after_suspend_explodes
     try:
         code, report = _report_of(lambda: core.bulk_add_notes(
-            col, [note("S15", "s15-c")]))
+            col, [note("S15", "s15-c")], suspend=True))
     finally:
         col.sched.suspend_cards = orig_suspend
         col.merge_undo_entries = orig_merge

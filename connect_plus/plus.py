@@ -267,8 +267,8 @@ class PlusMixin:
 
 
     # suspend=None (SPEC 27) means "use config key 'suspendNewCards'", which
-    # SHIPS TRUE: by default this action leaves the cards it creates suspended,
-    # deviating from Anki on purpose. An explicit true/false wins over config.
+    # SHIPS FALSE (revision 16): stock-compatible by default; setting the key
+    # true opts into the suspended-draft workflow. Explicit true/false wins.
     @plus_api()
     def bulkAddNotes(self, notes, atomic=True, allowDuplicates=False, dryRun=False,
                      suspend=None, undoLabel=None):

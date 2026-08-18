@@ -6,5 +6,5 @@
     "webCorsOriginList": ["http://localhost"],
     "ignoreOriginList": [],
     "preserveSuspendedOnReschedule": true,
-    "suspendNewCards": true
+    "suspendNewCards": false
 }

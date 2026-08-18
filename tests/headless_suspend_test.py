@@ -672,18 +672,23 @@ def test3_config_resolution():
     try:
         # --- (a) key ABSENT from config -> the documented default applies.
         #     util.setting itself falls back to DEFAULT_CONFIG, so an older
-        #     config.json that predates these keys still resolves to True.
+        #     config.json that predates these keys still resolves to the
+        #     revision-16 shipped split: preserve True, suspend False.
         set_config({"webBindPort": 8766})               # neither key present
         assert util_mod.DEFAULT_CONFIG[PRESERVE] is True
-        assert util_mod.DEFAULT_CONFIG[SUSPEND] is True
+        assert util_mod.DEFAULT_CONFIG[SUSPEND] is False
         assert util_mod.setting(PRESERVE) is True, "util.setting fallback broke"
-        assert util_mod.setting(SUSPEND) is True, "util.setting fallback broke"
+        assert util_mod.setting(SUSPEND) is False, "util.setting fallback broke"
         assert resolve(None, PRESERVE, core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE) is True
-        assert resolve(None, SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS) is True
-        # end to end on the wire actions, with nothing passed
+        assert resolve(None, SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS) is False
+        # end to end on the wire actions, with nothing passed: new cards are
+        # LIVE (stock default since revision 16), and preserve still protects
+        # a card the caller suspends afterwards.
         r = inst.bulkAddNotes(notes=[basic("T3", "t3-default")])
-        cid = r["suspended"][0]
-        assert queues(col3, [cid]) == [QUEUE_SUSPENDED], r
+        assert r["suspended"] == [], r
+        cid = col3.find_cards("t3-default")[0]
+        assert queues(col3, [cid]) == [0], queues(col3, [cid])
+        inst.bulkSuspend(cardIds=[cid], suspend=True)
         due = inst.bulkSetDueDate(cardIds=[cid], days="5")
         assert due["unsuspended"] == [cid] and due["resuspended"] == [cid], due
         assert queues(col3, [cid]) == [QUEUE_SUSPENDED], queues(col3, [cid])
@@ -733,9 +738,11 @@ def test3_config_resolution():
         #     NOT a crash: a write action must not fail because config is late
         aqt.mw = None
         assert resolve(None, PRESERVE, core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE) is True
-        assert resolve(None, SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS) is True
+        assert resolve(None, SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS) is False
         r = inst.bulkAddNotes(notes=[basic("T3", "t3-no-mw")])
-        assert queues(col3, r["suspended"]) == [QUEUE_SUSPENDED], r
+        assert r["suspended"] == [], r
+        cid_nomw = col3.find_cards("t3-no-mw")[0]
+        assert queues(col3, [cid_nomw]) == [0], queues(col3, [cid_nomw])
 
         # --- a hand-edited NON-boolean falls back to the documented default
         set_config({PRESERVE: "false", SUSPEND: 0})
@@ -759,9 +766,11 @@ def test3_config_resolution():
         # --- the three sources of the default really are in lockstep
         shipped = json.load(open(os.path.join(REPO, "connect_plus", "config.json"),
                                  encoding="utf-8"))
-        for key, constant in ((PRESERVE, core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE),
-                              (SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS)):
-            assert constant is True, (key, constant)
+        # revision 16 split: preserve ships True, suspend ships False
+        for key, constant, want in (
+                (PRESERVE, core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE, True),
+                (SUSPEND, core.DEFAULT_SUSPEND_NEW_CARDS, False)):
+            assert constant is want, (key, constant, want)
             assert shipped[key] is constant, (key, shipped.get(key))
             assert util_mod.DEFAULT_CONFIG[key] is constant, key
     finally:

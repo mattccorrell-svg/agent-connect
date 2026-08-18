@@ -40,14 +40,14 @@ import anki.utils
 from anki.errors import (Interrupted, InvalidInput, NetworkError,
                          NotFoundError, SearchError, SyncError, SyncErrorKind)
 
-PLUS_VERSION = "1.1.0"
+PLUS_VERSION = "1.2.0"
 # The SPEC revision this code implements, kept in lockstep with SPEC.md's
 # "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
 # locked). Revision 15 is the first revision that changed what two actions DO
 # to the collection by default rather than only what they return, so plusInfo
 # needs ONE machine-readable field that a caching client can branch on:
 # PLUS_VERSION moves on behavior changes, specRevision names the contract.
-PLUS_SPEC_REVISION = 15
+PLUS_SPEC_REVISION = 16
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -92,7 +92,7 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
 # discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
 # present here; param signatures are read live off the plus.py wrappers.
 PLUS_ACTION_SUMMARIES = {
-    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview). DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'suspend' defaults to TRUE (config key 'suspendNewCards'), so the cards this batch creates are left SUSPENDED inside the same undo entry and listed in 'suspended' — a generated draft never enters review before a human unsuspends it. Pass suspend=false (or flip the config key) for stock behavior.",
+    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview). Optional suspended-draft mode (SPEC 27): pass suspend=true (or set config key 'suspendNewCards', ships false) and the cards this batch creates are left SUSPENDED inside the same undo entry and listed in 'suspended' — a generated draft never enters review before a human unsuspends it.",
     "bulkUpdateNoteFields": "Update fields and/or replace tags on many notes as one undoable batch; byte-identical no-ops are not written and are reported in 'unchanged'. dryRun=true with diff=true adds a per-field before/after preview capped at maxPreview.",
     "bulkAddTags": "Add tags to many notes as one undoable batch; only notes actually changed are written and reported in 'updated'.",
     "addImageOcclusionNote": "Create a native Image Occlusion note from an image path or base64 data plus normalized 0-1 rects.",
@@ -506,10 +506,10 @@ PLUS_RECIPES = [
     },
     {
         'name': 'suspended-draft workflow',
-        'description': ("This fork ships two DELIBERATE deviations from Anki's own "
-                        "behavior, both switchable (SPEC 27). (1) bulkAddNotes leaves the "
-                        "cards it creates SUSPENDED (param 'suspend', config "
-                        "'suspendNewCards', default true) and lists them in 'suspended', "
+        'description': ("This fork ships one DELIBERATE deviation from Anki's own "
+                        "behavior plus one opt-in mode, both switchable (SPEC 27). (1) bulkAddNotes can leave the "
+                        "cards it creates SUSPENDED — opt in via param 'suspend' or config "
+                        "'suspendNewCards' (ships false) — and lists them in 'suspended', "
                         "so a generated batch lands as a draft: write suspended -> a human "
                         "reads them in the browser -> that human unsuspends. (2) "
                         "bulkSetDueDate PUTS BACK the suspensions anki's set_due_date "
@@ -614,7 +614,7 @@ QUEUE_SUSPENDED = -1
 # always wins over config; config wins over these constants.
 #
 DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE = True
-DEFAULT_SUSPEND_NEW_CARDS = True
+DEFAULT_SUSPEND_NEW_CARDS = False
 CONFIG_PRESERVE_SUSPENDED = 'preserveSuspendedOnReschedule'
 CONFIG_SUSPEND_NEW_CARDS = 'suspendNewCards'
 

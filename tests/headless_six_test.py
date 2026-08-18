@@ -457,9 +457,9 @@ def test5_dry_run_add():
     snap = undo_snap()
     dry = core.bulk_add_notes(col, batch, dry_run=True)
     # revision 15 (SPEC 27): the dry shape gained 'wouldSuspend' — the RESOLVED
-    # suspend decision (a bool, not a count: card ids do not exist yet), true
-    # here because the shipped default suspends new cards
-    assert dry == {"wouldAdd": 2, "wouldSuspend": True, "skipped": want_skipped,
+    # suspend decision (a bool, not a count: card ids do not exist yet). Since
+    # revision 16 the shipped default is stock behavior, so it is False here.
+    assert dry == {"wouldAdd": 2, "wouldSuspend": False, "skipped": want_skipped,
                    "undoEntry": None}, dry
     assert note_count() == notes_before, "dry run added notes"
     assert media_count() == media_before, "dry run touched media"
@@ -475,7 +475,7 @@ def test5_dry_run_add():
 
     # empty batch dry run
     assert core.bulk_add_notes(col, [], dry_run=True) == \
-        {"wouldAdd": 0, "wouldSuspend": True, "skipped": [], "undoEntry": None}
+        {"wouldAdd": 0, "wouldSuspend": False, "skipped": [], "undoEntry": None}
     # ...and the decision is reported for the switched-off case too
     assert core.bulk_add_notes(col, [], dry_run=True, suspend=False) == \
         {"wouldAdd": 0, "wouldSuspend": False, "skipped": [], "undoEntry": None}
