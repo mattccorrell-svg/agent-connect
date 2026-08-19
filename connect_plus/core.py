@@ -37,10 +37,12 @@ import anki.notes
 import anki.notes_pb2
 import anki.sync
 import anki.utils
-from anki.errors import (Interrupted, InvalidInput, NetworkError,
-                         NotFoundError, SearchError, SyncError, SyncErrorKind)
+from anki.decks import FilteredDeckConfig
+from anki.errors import (FilteredDeckError, Interrupted, InvalidInput,
+                         NetworkError, NotFoundError, SearchError, SyncError,
+                         SyncErrorKind)
 
-PLUS_VERSION = "1.3.1"
+PLUS_VERSION = "1.4.0"
 # The SPEC revision this code implements, kept in lockstep with SPEC.md's
 # "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
 # locked). Revision 15 is the first revision that changed what two actions DO
@@ -49,8 +51,13 @@ PLUS_VERSION = "1.3.1"
 # PLUS_VERSION moves on behavior changes, specRevision names the contract.
 # Revision 18 (round-5 field feedback) is docs + additive keys + dry-run
 # fields with NO behavior change, so PLUS_VERSION moved only its PATCH
-# (1.3.0 -> 1.3.1); the minor still moves only with default-behavior changes.
-PLUS_SPEC_REVISION = 18
+# (1.3.0 -> 1.3.1). Revision 19 adds two actions (SPEC 32,
+# createFilteredDeck/rebuildFilteredDeck) while changing NO existing
+# action's defaults: new capability moves the MINOR (1.3.1 -> 1.4.0, plain
+# semver), and the guarantee the caching client relies on still holds in
+# the direction that matters — a default-behavior change always moves the
+# minor, so an unmoved minor still proves no default changed underneath it.
+PLUS_SPEC_REVISION = 19
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -100,6 +107,10 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "filteredDeckReport",
                 # send every card in ONE filtered deck back to its home deck, one undoable op
                 "emptyFilteredDeck",
+                # create + build a filtered (cram) deck from a search: GUI-faithful defaults, dry-run sizing, one undoable op
+                "createFilteredDeck",
+                # empty-then-regather ONE filtered deck by its saved terms; reports both halves honestly
+                "rebuildFilteredDeck",
                 # anki's Empty Cards report as data: per-note empty cards + what deletion would keep (read-only)
                 "getEmptyCards",
                 # delete empty cards the way anki's own dialog does: never a note's last card, one undoable batch
@@ -138,8 +149,10 @@ PLUS_ACTION_SUMMARIES = {
     "renameDeck": "Rename a deck IN PLACE — every subdeck follows in the same call, and the options-preset assignments, per-deck descriptions and collapse state all survive (the create/changeDeck/deleteDecks workaround silently resets subdeck presets to Default, changing scheduling with no error). One backend op, one undo entry. A newName (or implied descendant name) already taken by ANY deck other than the very deck being renamed onto it — the renamed deck's own descendants included — is refused with [duplicate] instead of inheriting anki's silent auto-rename; a case-only respelling stays legal. newName must arrive normalized: an empty or whitespace-padded '::' component is refused with [invalid_param] (the backend would silently rewrite it, making the dry-run prediction a lie). dryRun previews every resulting {from, to} pair, descendants included.",
     "bulkSetFlag": "Set or clear (flag: 0-7, 0 = no flag) the colored flag on many cards as one undoable batch. 'updated'/'unchanged' are split from the cards' REAL pre-op flags, so re-flagging is a reported no-op (nothing written, no undo entry). The sanctioned route for the flag-inbox workflow — a human flags cards in review, an agent fixes them and finally CLEARS the flag (stock's only route is setSpecificValueOfCard, which clobbers the whole flags byte and creates no undo entry). dryRun previews the split.",
     "renameTag": "Rename/move a tag AND its '::' subtree with anki's own segment-aware op: renaming lab1 to lab01 rewrites lab1 and lab1::* but never touches lab10 (stock replaceTagsInAllNotes matches whole tags only, so it strands the children — and it writes per note with no undo entry). Matching is case-insensitive; renaming onto an existing tag MERGES the trees, disclosed in 'merged'. dryRun lists the exact {from, to} pairs so the prefix-collision safety is visible before anything is written.",
-    "filteredDeckReport": "Read-only census of filtered decks: per filtered deck, how many cards it currently holds and which HOME decks those cards belong to ({name: count}). Pass deckName (a regular deck) to scope to cards homed in that subtree — the pre-export probe: totalCards is then the home-side count exportDeckApkg's fail-closed check trips on (the check ALSO flags filtered decks nested inside the export scope that hold foreign-homed cards; those show as rows of an UNSCOPED report), and the rows name the decks to pass to emptyFilteredDeck. A deckName naming a filtered deck reports just that deck.",
-    "emptyFilteredDeck": "Send every card in ONE filtered deck back to its home deck (the API equivalent of the deck's own Empty action, col.sched.empty_filtered_deck) as one undoable op — the remediation step exportDeckApkg's [cards_in_filtered_decks] refusal points at; stock AnkiConnect has no way to do this. Exactly one of deckName/deckId. Reports the homeDecks breakdown of what went home; emptying an already-empty filtered deck is a reported no-op (nothing written). dryRun previews the same numbers.",
+    "filteredDeckReport": "Read-only census of filtered decks: per filtered deck, how many cards it currently holds and which HOME decks those cards belong to ({name: count}). Pass deckName (a regular deck) to scope to cards homed in that subtree — the pre-export probe: totalCards is then the home-side count exportDeckApkg's fail-closed check trips on (the check ALSO flags filtered decks nested inside the export scope that hold foreign-homed cards; those show as rows of an UNSCOPED report), and the rows name the decks to pass to emptyFilteredDeck. A deckName naming a filtered deck reports just that deck. The census half of the filtered-deck lifecycle: pairs with createFilteredDeck/rebuildFilteredDeck (the build half) and emptyFilteredDeck (the remediation).",
+    "emptyFilteredDeck": "Send every card in ONE filtered deck back to its home deck (the API equivalent of the deck's own Empty action, col.sched.empty_filtered_deck) as one undoable op — the remediation step exportDeckApkg's [cards_in_filtered_decks] refusal points at; stock AnkiConnect has no way to do this. Exactly one of deckName/deckId. Reports the homeDecks breakdown of what went home; emptying an already-empty filtered deck is a reported no-op (nothing written). dryRun previews the same numbers. createFilteredDeck/rebuildFilteredDeck are the build half of the same filtered-deck lifecycle.",
+    "createFilteredDeck": "Create AND build a filtered (cram) deck from a search as one undoable op — the API equivalent of Tools > Create Filtered Deck (col.sched.add_or_update_filtered_deck): 'cram everything tagged PI9 that is due' is {name: 'PI9 cram', searchQuery: 'tag:PI9 is:due'}. Defaults mirror anki's own new-filtered-deck template: limit 100, order 'random', reschedule true; the optional secondFilter ships limit 20, order 'due'. Suspended cards, buried cards, and cards already in another filtered deck are NEVER gathered (anki's own gather rule, probe-verified). Refuses instead of surprising: a taken name is [duplicate] (anki would silently rename to 'name+'), zero gatherable cards is [validation_error] with nothing created (the GUI's own refusal), and a filtered parent deck is [validation_error] (anki forbids children there). dryRun answers 'how big would this deck be' WITHOUT creating anything: wouldGather plus an 'exact' flag with wouldGatherMin/Max bounds (equal when exact; a secondFilter overlapping the first term under a binding first limit makes the split gather-order-dependent — RANDOM is nondeterministic — so no point prediction exists and wouldGather reports the upper bound).",
+    "rebuildFilteredDeck": "Empty-then-regather ONE existing filtered deck by its SAVED search terms (col.sched.rebuild_filtered_deck — the deck's own Rebuild button): cards go home, then the saved searches gather from scratch, one undoable op. Reports both halves honestly: returnedFirst (pre-op residency, observed before the op) and cardsGathered (post-op residency). Rebuilding to zero is legal and leaves the deck empty (anki's behavior); rebuilding an EMPTY deck whose saved terms would also gather nothing is a reported no-op (nothing written, no undo entry). Exactly one of deckName/deckId; a regular deck is [validation_error]. dryRun predicts wouldReturn + wouldGather with the same exact/bounds semantics as createFilteredDeck — except the deck's OWN cards count as re-gatherable — and termsIgnored counts saved terms beyond the two anki actually gathers.",
     "getEmptyCards": "Anki's Tools > Empty Cards report as data (read-only): per note, the empty cards' ids and ordinals, exactly which of them deleteEmptyCards would delete, and the one card it would PROTECT when every card of the note is empty (deletion never removes a note's last card — anki's own dialog rule). Optional deckName scopes to notes with at least one empty card homed in that subtree. checkDeckIntegrity's clozeCardMismatch DETECTS the drift; this is the actionable report.",
     "deleteEmptyCards": "Delete empty cards as one undoable batch, honoring the same protection as anki's own Empty Cards dialog with 'keep notes' on: an all-empty note keeps its first card (reported in 'protected') and the note itself is NEVER deleted — notesPreserved post-checks that. noteIds=null acts on everything the live report finds; requested ids without empty cards land in skipped with a reason. dryRun previews the exact card ids.",
     "plusInfo": "Name/version/specRevision/action list plus per-action actionDocs (summary + params + returns, plus 'preserves' on side-effectful actions: what the action does NOT touch), an 'errorCodes' map, 'effectiveConfig' (the SPEC 27 knobs resolved for THIS install at call time, each {value, source}), and a 'recipes' list of named call patterns; works before a profile is open.",
@@ -365,6 +378,34 @@ PLUS_ACTION_RETURNS = {
         "nothing written — the backend would happily create an empty undo entry there "
         "(probe-verified), so this action gates before creating one. dryRun=true returns "
         "{wouldReturn: int, homeDecks, undoEntry: null}.",
+    "createFilteredDeck":
+        "{deckId: int, name: str (the deck's ACTUAL saved name, read back post-op), "
+        "cardsGathered: int (post-op residency count — an observation, not the ask), terms: "
+        "[{search (saved and echoed NORMALIZED by anki's own parser), limit, order, eligible (cards the term could gather right now: "
+        "matches minus suspended, buried, and other-filter cards)}], undoEntry: str} — ONE "
+        "undo entry; a single undo deletes the deck AND returns every gathered card. Missing "
+        "'::' parents are created as REGULAR decks inside the same entry (probe-verified). "
+        "dryRun=true returns {wouldCreate: bool (false predicts the real call's "
+        "[validation_error]: zero gatherable cards), wouldGather: int, exact: bool, "
+        "wouldGatherMin: int, wouldGatherMax: int, name, terms, undoEntry: null} and provably "
+        "writes nothing. wouldGather is EXACT for a single filter (probe-verified formula: "
+        "min(limit, eligible)); with a secondFilter it is exact unless the terms overlap "
+        "under a binding first limit — anki then decides the split by gather order (RANDOM "
+        "is nondeterministic), so wouldGather reports the UPPER bound and the min/max pair "
+        "brackets every possible outcome.",
+    "rebuildFilteredDeck":
+        "{cardsGathered: int (post-op residency count; the backend's OpChangesWithCount.count "
+        "agrees — the DB read is what gets reported), returnedFirst: int (pre-op residency: "
+        "the cards the rebuild first sent home), undoEntry: str|null} — anki empties then "
+        "regathers as ONE op; a single undo restores the previous membership. "
+        "Rebuild-to-zero (deck held cards, saved terms now match nothing) succeeds with "
+        "cardsGathered 0 and the deck left empty. An EMPTY deck whose saved terms would also "
+        "gather 0 is a data no-op: {cardsGathered: 0, returnedFirst: 0, undoEntry: null}, "
+        "nothing written. dryRun=true returns {wouldReturn: int, wouldGather: int, exact: "
+        "bool, wouldGatherMin: int, wouldGatherMax: int, terms: [{search, limit, order, "
+        "eligible}], termsIgnored: int (saved terms beyond the two anki actually gathers), "
+        "undoEntry: null} — same bounds semantics as createFilteredDeck, except the deck's "
+        "OWN cards count as eligible (they are re-gatherable).",
     "getEmptyCards":
         "{notes: [{noteId, ords: [int], willDeleteCards: [cardId], protectedCard: "
         "cardId|null}], total: int} — one entry per note that has empty cards, in anki's own "
@@ -511,6 +552,26 @@ PLUS_ACTION_PRESERVES = {
         "— going home IS the operation (anki's own Empty op: did=odid, odid=0, scheduling "
         "intact). NOT preserved: current filtered-deck residency and the filter's temporary "
         "due override — home-deck scheduling is restored.",
+    "createFilteredDeck":
+        "Note content, tags, flags, note ids, intervals/ease (scheduling travels with the "
+        "card: the original due is stashed in odue and restored on empty/rebuild), "
+        "suspension and burial (suspended/buried cards are simply never gathered — anki's "
+        "own gather rule, probe-verified), and every OTHER deck's membership. Gathered "
+        "cards MOVE into the new deck (did = filter, odid = home) — that is the operation "
+        "— and answers made inside it reschedule per the saved 'reschedule' flag (false = "
+        "preview mode: cards return unchanged). NOT preserved: the current-deck selection "
+        "— anki's own build op selects the built deck (GUI parity, probe-verified); "
+        "missing '::' parents are added as regular decks (an addition, nothing existing "
+        "is modified).",
+    "rebuildFilteredDeck":
+        "The deck itself and its SAVED config (name, search terms, limits, orders, "
+        "reschedule flag — a rebuild only re-runs them), the current-deck selection "
+        "(probe-verified: rebuild does NOT re-select the deck, unlike a build), and every "
+        "card's note content, tags, flags, intervals/ease, suspension and burial "
+        "(suspended/buried cards are never gathered; one suspended INSIDE the deck goes "
+        "home on the empty half and is not re-gathered). NOT preserved: the deck's card "
+        "membership — empty-then-regather is the operation — so cards the saved terms no "
+        "longer match go home and newly-matching cards move in.",
     "deleteEmptyCards":
         "The notes themselves — NEVER deleted (post-checked as notesPreserved); an all-empty "
         "note keeps its first card ('protected'). Every non-empty card, and every surviving "
@@ -549,7 +610,7 @@ PLUS_ERROR_CODES = {
     'not_found': False,               # note/card/media file/IO notetype/output dir absent
     'invalid_param': False,           # request shape/type/range wrong (house 'invalid parameter:' family)
     'deck_not_found': False,          # named deck does not exist (decks are never auto-created)
-    'duplicate': False,              # renameDeck: newName (or an implied descendant name) already taken by any deck but the pair's own; note-level duplicates remain per-item skip reasons
+    'duplicate': False,              # renameDeck newName (or an implied descendant name) / createFilteredDeck name already taken by another deck; note-level duplicates remain per-item skip reasons
     'cards_in_filtered_decks': False,  # exportDeckApkg fail-closed default: in-scope-home cards sit in filtered decks, or in-scope nested filters hold foreign-homed cards; empty them (emptyFilteredDeck) or pass allowFilteredOmission=true
     'unsupported_format': False,      # image failed to load/encode (corrupt or unsupported format)
     'io_error': False,                # reserved: disk read/write failure (today only per-item errors)
@@ -589,12 +650,14 @@ PLUS_ERROR_CODE_DOCS = {
     'deck_not_found': {'reachable': True, 'meaning':
         'The named deck does not exist. Decks are never auto-created by this add-on.'},
     'duplicate': {'reachable': True, 'meaning':
-        'A name you asked to claim is already taken: renameDeck refuses when newName (or an '
-        'implied descendant name) resolves to ANY deck other than the very deck being renamed '
-        'onto it — the renamed subtree\'s own members included — instead of inheriting the '
-        'backend silent auto-rename (a case-only respelling resolves to itself and stays '
-        'legal). Reachable since revision 17. NOTE-level duplicates are still reported per '
-        'item in skipped[].reason, never raised.'},
+        'A name you asked to claim is already taken. renameDeck: newName (or an implied '
+        'descendant name) resolves to ANY deck other than the very deck being renamed onto '
+        'it — the renamed subtree\'s own members included (a case-only respelling resolves '
+        'to itself and stays legal). createFilteredDeck: the requested deck name already '
+        'exists, matched the way anki matches deck names (case-insensitively, surrounding '
+        'whitespace ignored). Both refuse instead of inheriting the backend\'s silent '
+        'auto-rename to \'name+\'. Reachable since revision 17. NOTE-level duplicates are '
+        'still reported per item in skipped[].reason, never raised.'},
     'cards_in_filtered_decks': {'reachable': True, 'meaning':
         'exportDeckApkg refused (fail-closed default, revision 17): at least one card whose '
         'HOME deck is inside the export scope currently sits in a filtered deck, or a '
@@ -641,7 +704,10 @@ PLUS_ERROR_CODE_DOCS = {
         'The server refused the operation (AnkiHub HTTP 403). Requires the AnkiHub add-on.'},
     'validation_error': {'reachable': True, 'meaning':
         'A well-formed request refused on semantic grounds: wrong note kind, IO note without an '
-        'image, a crop that would drop every occlusion, AnkiHub HTTP 400, note already on AnkiHub.'},
+        'image, a crop that would drop every occlusion, a deck action aimed at the wrong deck '
+        'kind (emptyFilteredDeck/rebuildFilteredDeck on a regular deck; createFilteredDeck '
+        'under a filtered parent, or matching zero gatherable cards — nothing is created), '
+        'AnkiHub HTTP 400, note already on AnkiHub.'},
     'incompatible_ankihub_addon': {'reachable': True, 'meaning':
         'The AnkiHub add-on is missing, disabled, was not loaded this session, or has drifted '
         'from the version this bridge was tested against. The bridge is unusable either way.'},
@@ -660,7 +726,7 @@ PLUS_ERROR_CODE_DOCS = {
 # The one boundary rule a client cannot infer from a single response (SPEC 25,
 # revision 13): the '[code] ' prefix is NOT universal across this server.
 PLUS_ERROR_PREFIX_NOTE = (
-    "Prefixing boundary: errors from the 34 Plus actions AND the dispatcher's unknown-action "
+    "Prefixing boundary: errors from the 36 Plus actions AND the dispatcher's unknown-action "
     "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
     "EVERY OTHER error is passed through verbatim and UNPREFIXED, with errorCode: null and "
     "retryable: null — that is the ~90 UPSTREAM AnkiConnect actions, the dispatcher's api-key "
@@ -862,22 +928,29 @@ PLUS_RECIPES = [
     },
     {
         'name': 'safe deck export',
-        'description': ("Exporting a deck someone else will import: cards currently sitting "
-                        "in filtered decks are a silent hazard — a deck-scoped .apkg OMITS "
-                        "every note whose cards are all in out-of-scope filtered decks, "
-                        "ships the rest of those cards scheduling-reset (a real class deck "
-                        "nearly went out missing 141 cards / 96 notes), and ships FOREIGN "
-                        "notes whenever a filtered deck nested inside the export scope holds "
-                        "cards homed outside it. exportDeckApkg therefore FAILS CLOSED with "
-                        "[cards_in_filtered_decks] in both situations. The loop: "
-                        "filteredDeckReport with deckName=<export deck> to see the home-side "
-                        "exposure (totalCards is the count the export check trips on for "
-                        "in-scope-home cards; the unscoped report shows nested filters "
-                        "holding foreign cards), emptyFilteredDeck per named filter (one "
-                        "undoable op each; cards return to their home decks), then export "
-                        "clean. Pass allowFilteredOmission=true only when the damage is "
-                        "wanted — the response then itemizes it in 'warnings' instead of "
-                        "refusing."),
+        'description': ("The filtered-deck lifecycle, and why exports care. CREATE: "
+                        "createFilteredDeck builds a cram deck from a search as one undoable "
+                        "op ({name: 'PI9 cram', searchQuery: 'tag:PI9 is:due'}); dryRun "
+                        "first answers 'how big would it be' without creating anything, and "
+                        "suspended/buried/other-filter cards are never gathered. REBUILD: "
+                        "rebuildFilteredDeck re-runs a deck's saved terms (cards go home, "
+                        "then regather — returnedFirst/cardsGathered report both halves). "
+                        "REPORT: filteredDeckReport is the census — which filtered decks "
+                        "hold whose cards right now. EMPTY: emptyFilteredDeck sends ONE "
+                        "deck's cards home. The export tie-in: cards sitting in filtered "
+                        "decks are a silent hazard — a deck-scoped .apkg OMITS every note "
+                        "whose cards are all in out-of-scope filtered decks, ships the rest "
+                        "scheduling-reset (a real class deck nearly went out missing 141 "
+                        "cards / 96 notes), and ships FOREIGN notes whenever a filter "
+                        "nested inside the export scope holds cards homed outside it — so "
+                        "exportDeckApkg FAILS CLOSED with [cards_in_filtered_decks] in both "
+                        "situations. The pre-export loop: filteredDeckReport with "
+                        "deckName=<export deck> for the home-side exposure (totalCards is "
+                        "the count the check trips on; the unscoped report shows nested "
+                        "filters holding foreign cards), emptyFilteredDeck per named filter, "
+                        "then export clean. Pass allowFilteredOmission=true only when the "
+                        "damage is wanted — the response then itemizes it in 'warnings' "
+                        "instead of refusing."),
         'example': {'action': 'filteredDeckReport', 'params': {'deckName': 'HA2'}},
     },
     {
@@ -908,6 +981,8 @@ UNDO_RENAME_DECK = 'AnkiConnect Plus: Rename Deck'
 UNDO_BULK_FLAG = 'AnkiConnect Plus: Bulk Flag'
 UNDO_RENAME_TAG = 'AnkiConnect Plus: Rename Tag'
 UNDO_EMPTY_FILTERED = 'AnkiConnect Plus: Empty Filtered Deck'
+UNDO_CREATE_FILTERED = 'AnkiConnect Plus: Create Filtered Deck'
+UNDO_REBUILD_FILTERED = 'AnkiConnect Plus: Rebuild Filtered Deck'
 UNDO_DELETE_EMPTY = 'AnkiConnect Plus: Delete Empty Cards'
 
 # undoLabel (SPEC 24): every write action takes an optional undoLabel whose
@@ -3831,6 +3906,392 @@ def empty_filtered_deck(col, deck_name=None, deck_id=None, dry_run=False,
     # 'returned' is the pre-op residency minus whatever is still there
     remaining = col.db.scalar('select count() from cards where did = ?', did) or 0
     return {'returned': pending - remaining, 'homeDecks': home_decks,
+            'undoEntry': undo_name}
+
+
+#
+# Filtered-deck build vocabulary (SPEC 32). Wire order names -> the backend's
+# proto enum. The proto enum is OPEN — anki accepts order=99 silently and
+# builds (probe-verified) — so the closed vocabulary lives here; the enum
+# value equals the label's position in col.sched.filtered_deck_order_labels()
+# (pinned by probe on 25.09.4).
+#
+FILTERED_DECK_ORDERS = {
+    'oldestReviewedFirst': 0,
+    'random': 1,
+    'intervalsAscending': 2,
+    'intervalsDescending': 3,
+    'lapses': 4,
+    'added': 5,
+    'due': 6,
+    'reverseAdded': 7,
+    'retrievabilityAscending': 8,
+    'retrievabilityDescending': 9,
+}
+_FILTERED_DECK_ORDER_NAMES = {v: k for k, v in FILTERED_DECK_ORDERS.items()}
+# SearchTerm.limit is an unsigned 32-bit proto field: 2**32 raises a raw
+# ValueError ("Value out of range", probe-verified), so the cap is enforced
+# up front as a coded parameter error instead.
+FILTERED_DECK_LIMIT_MAX = 2 ** 32 - 1
+# (limit, order) defaults, read off the template deck anki's own dialog
+# starts from (probe-verified): first filter 100/random, second 20/due.
+FILTERED_DECK_TERM1_DEFAULTS = (100, 'random')
+FILTERED_DECK_TERM2_DEFAULTS = (20, 'due')
+
+
+def _validate_filter_term(col, search_query, limit, order, prefix, default_order):
+    """Validate ONE filtered-deck search term (SPEC 32) -> (normalized
+    search, limit, order enum int, order wire name).
+
+    The search is validated AND normalized through anki's own parser
+    (col.build_search_string — the same path notesSlim's query check rides),
+    so what gets saved and echoed is the parser's canonical spelling (the
+    multi-arg composition into the eligibility search parenthesizes OR
+    terms itself, probe-verified). An empty search is refused
+    explicitly: anki reads it as the WHOLE collection
+    (build_search_string('') -> 'deck:*', probe-verified), which is too much
+    deck to gather by accident — a caller who means that says deck:* out
+    loud.
+    """
+    if not isinstance(search_query, str) or not search_query.strip():
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}searchQuery: non-empty string '
+                        'required (an empty search would gather from the '
+                        'ENTIRE collection; pass deck:* explicitly if you '
+                        'mean that)'.format(prefix))
+    try:
+        normalized = col.build_search_string(search_query)
+    except SearchError as e:
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}searchQuery: {}'.format(prefix, e))
+    if isinstance(limit, bool) or not isinstance(limit, int) \
+            or limit < 1 or limit > FILTERED_DECK_LIMIT_MAX:
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}limit: int between 1 and {} '
+                        'required (anki stores an unsigned 32-bit int, and 0 '
+                        'would gather nothing)'.format(
+                            prefix, FILTERED_DECK_LIMIT_MAX))
+    if order is None:
+        order = default_order
+    if not isinstance(order, str) or order not in FILTERED_DECK_ORDERS:
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}order: one of {} required'.format(
+                            prefix, sorted(FILTERED_DECK_ORDERS)))
+    return normalized, limit, FILTERED_DECK_ORDERS[order], order
+
+
+def _filtered_gather_pool(col, normalized_search, own_deck_id=None):
+    """The card ids ONE filter term could gather right now (SPEC 32).
+
+    Anki's gather exclusions, probe-verified on 25.09.4: suspended cards,
+    buried cards, and cards sitting in OTHER filtered decks are never
+    gathered. With own_deck_id (the rebuild reading), the deck's own
+    cards ARE re-gatherable, so the residency exclusion widens to
+    (-deck:filtered OR did:<this deck's id>). The own-deck disjunct is
+    the deck ID, never the deck NAME (revision-19 fix pass): for a
+    filtered deck literally named lowercase 'filtered', the writer emits
+    deck:filtered unquoted and anki's parser reads that as the
+    in-any-filtered-deck KEYWORD (case-sensitive — 'Filtered' matches
+    the deck; quoting does not escape it; probe-verified on 25.09.4), so
+    a name-based disjunction was a tautology that counted OTHER filters'
+    cards as re-gatherable. did:<id> matches exactly the deck's current
+    residents (filtered decks have no children and are never a home).
+    """
+    residency = '-deck:filtered'
+    if own_deck_id is not None:
+        residency = col.group_searches(
+            anki.collection.SearchNode(
+                negated=anki.collection.SearchNode(deck='filtered')),
+            anki.collection.SearchNode(
+                parsable_text='did:{}'.format(int(own_deck_id))),
+            joiner='OR')
+    return set(col.find_cards(col.build_search_string(
+        normalized_search, '-is:suspended', '-is:buried', residency)))
+
+
+def _predict_filtered_gather(pools_limits):
+    """Total-gather bounds (lo, hi) for up to two (pool, limit) terms.
+
+    One term is EXACT: min(limit, |pool|), the probe-verified formula. Two
+    terms: anki gathers term 1 first, and term 2 skips only cards ALREADY
+    GATHERED (probe-verified), so term 2's effective pool is pool2 minus x,
+    the overlap cards term 1 actually consumed. x is only bounded —
+    max(0, gather1 - |pool1 - pool2|) <= x <= min(gather1, |pool1 & pool2|)
+    — and the bounds collapse to one number whenever term 1's limit does
+    not bind, the pools are disjoint, or term 2's own limit caps both ends
+    equally. Every other case genuinely depends on term 1's gather ORDER
+    (RANDOM is nondeterministic), so no point prediction exists; callers
+    report the bounds plus an 'exact' flag instead of a fake count. A zero
+    total is always exact: any nonzero term-1 gather lifts both bounds.
+    """
+    if not pools_limits:
+        return 0, 0
+    pool1, limit1 = pools_limits[0]
+    gather1 = min(limit1, len(pool1))
+    if len(pools_limits) == 1:
+        return gather1, gather1
+    pool2, limit2 = pools_limits[1]
+    overlap = len(pool1 & pool2)
+    x_min = max(0, gather1 - (len(pool1) - overlap))
+    x_max = min(gather1, overlap)
+    gather2_hi = min(limit2, len(pool2) - x_min)
+    gather2_lo = min(limit2, len(pool2) - x_max)
+    return gather1 + gather2_lo, gather1 + gather2_hi
+
+
+def create_filtered_deck(col, name, search_query, limit=100, order=None,
+                         second_filter=None, reschedule=True, dry_run=False,
+                         undo_label=None):
+    """Create AND build a filtered (cram) deck from a search (SPEC 32.1).
+
+    The API equivalent of Tools > Create Filtered Deck: one backend op
+    (col.sched.add_or_update_filtered_deck) creates the deck, gathers the
+    cards, and lands as ONE undoable entry — a single undo deletes the
+    deck and returns every card (probe-verified). Defaults mirror anki's
+    own new-filtered-deck template (100/random, second filter 20/due,
+    reschedule on). The term list is capped at two BY CONSTRUCTION: anki
+    saves a third term but never gathers it (probe-verified), and a param
+    that saves dead config would be a lie.
+
+    Stricter than the backend where the backend is silently surprising,
+    every refusal fired BEFORE any undo entry exists:
+      * taken name -> [duplicate] (anki silently renames to 'name+');
+      * zero gatherable cards -> [validation_error], nothing created
+        (allow_empty stays False, mirroring the GUI's own refusal);
+      * filtered parent -> [validation_error] (anki forbids children under
+        filtered decks);
+      * un-normalized name -> [invalid_param] (the renameDeck rule: the
+        backend silently rewrites padded/empty '::' components, which
+        would make the reported name a lie).
+    Missing '::' parents are legal and are created as REGULAR decks inside
+    the same undoable op (probe-verified; the undo removes them too).
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_CREATE_FILTERED
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    if not isinstance(reschedule, bool):
+        raise PlusError('invalid_param', 'invalid parameter: reschedule: boolean required')
+    if not isinstance(name, str) or not name:
+        raise PlusError('invalid_param', 'invalid parameter: name: string required')
+    if any(not comp or comp != comp.strip() for comp in name.split('::')):
+        raise PlusError(
+            'invalid_param',
+            'invalid parameter: name: every "::" component must be non-empty '
+            'with no leading/trailing whitespace: {!r}'.format(name))
+
+    _default_limit1, default_order1 = FILTERED_DECK_TERM1_DEFAULTS
+    terms = [_validate_filter_term(col, search_query, limit, order, '',
+                                   default_order1)]
+    if second_filter is not None:
+        if not isinstance(second_filter, dict):
+            raise PlusError('invalid_param',
+                            'invalid parameter: secondFilter: object with '
+                            'searchQuery[, limit, order] required')
+        unknown = sorted(set(second_filter) - {'searchQuery', 'limit', 'order'})
+        if unknown:
+            raise PlusError('invalid_param',
+                            'invalid parameter: secondFilter: unknown key(s) '
+                            '{}; allowed: searchQuery, limit, order'.format(unknown))
+        default_limit2, default_order2 = FILTERED_DECK_TERM2_DEFAULTS
+        terms.append(_validate_filter_term(
+            col, second_filter.get('searchQuery'),
+            second_filter.get('limit', default_limit2),
+            second_filter.get('order'), 'secondFilter.', default_order2))
+
+    # collision precheck: the backend NEVER errors here — it silently
+    # uniquifies the name to 'name+' (probe-verified), after which the
+    # response would report a name the deck does not carry. id_for_name
+    # matches the way anki matches deck names (case-insensitively,
+    # surrounding whitespace ignored) — exactly the collisions the backend
+    # would dodge with '+'.
+    if col.decks.id_for_name(name) is not None:
+        raise PlusError('duplicate', 'deck already exists: {}'.format(name))
+    # filtered-parent precheck, fired here so the refusal is coded and no
+    # undo entry ever exists (popping an empty custom entry would push a
+    # phantom Redo item — the SPEC 16.2 hazard); the backend's own
+    # FilteredDeckError ("Filtered decks can not have child decks.") stays
+    # as the drift backstop inside the try below.
+    parts = name.split('::')
+    for depth in range(1, len(parts)):
+        ancestor_id = col.decks.id_for_name('::'.join(parts[:depth]))
+        if ancestor_id is not None and col.decks.is_filtered(ancestor_id):
+            raise PlusError('validation_error',
+                            'cannot create {!r} under {!r}: filtered decks '
+                            'can not have child decks'.format(
+                                name, col.decks.name(ancestor_id)))
+
+    pools = [_filtered_gather_pool(col, term[0]) for term in terms]
+    lo, hi = _predict_filtered_gather(
+        [(pool, term[1]) for pool, term in zip(pools, terms)])
+    term_echo = [{'search': term[0], 'limit': term[1], 'order': term[3],
+                  'eligible': len(pool)}
+                 for term, pool in zip(terms, pools)]
+
+    if dry_run:
+        # a zero prediction is REPORTED here, never raised: answering "how
+        # big would it be" with 0 is the dry run's whole point, and
+        # wouldCreate: false says the real call would refuse. lo == 0
+        # implies hi == 0 (_predict_filtered_gather), so the verdict never
+        # straddles the refusal line.
+        return {'wouldCreate': lo > 0, 'wouldGather': hi, 'exact': lo == hi,
+                'wouldGatherMin': lo, 'wouldGatherMax': hi, 'name': name,
+                'terms': term_echo, 'undoEntry': None}
+
+    if hi == 0:
+        # the GUI's own refusal, prechecked so nothing is created and no
+        # undo entry ever exists (exact by the zero-total argument above)
+        raise PlusError('validation_error',
+                        'no cards would be gathered: suspended cards, buried '
+                        "cards, and cards already in another filtered deck "
+                        "are never gathered (anki's own rule) — nothing was "
+                        'created; size the search first with dryRun=true')
+
+    deck = col.sched.get_or_create_filtered_deck(deck_id=0)
+    deck.name = name
+    config = deck.config
+    config.reschedule = reschedule
+    # the template arrives with anki's own two prefilled default terms (and,
+    # on old schedulers, v1 delays); clear both the way the GUI dialog does
+    # (aqt/filtered_deck.py _update_deck) before appending ours
+    del config.delays[:]
+    del config.search_terms[:]
+    for normalized, term_limit, order_enum, _order_name in terms:
+        config.search_terms.append(FilteredDeckConfig.SearchTerm(
+            search=normalized, limit=term_limit, order=order_enum))
+    # deck.allow_empty stays False: the zero-gather refusal above IS the
+    # contract, and the backend enforcing the same rule is the backstop
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        changes = col.sched.add_or_update_filtered_deck(deck)
+        col.merge_undo_entries(target)
+    except FilteredDeckError as e:
+        # drift backstop: both refusal classes the backend enforces here
+        # were prechecked above, and the backend op is ATOMIC — nothing was
+        # created (probe-verified) — so the honest code is the prechecks'
+        # own [validation_error], not batch_reverted
+        _revert_batch(col, undo_name)
+        raise PlusError('validation_error', str(e))
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'createFilteredDeck failed (batch reverted): {}'.format(e))
+
+    deck_id = int(changes.id)
+    gathered = col.db.scalar('select count() from cards where did = ?',
+                             deck_id) or 0
+    # observations, not echoes: the stored name (the collision precheck
+    # makes it equal to the request; reading it back keeps that a FACT) and
+    # the post-op residency count
+    return {'deckId': deck_id, 'name': col.decks.name(deck_id),
+            'cardsGathered': gathered, 'terms': term_echo,
+            'undoEntry': undo_name}
+
+
+def rebuild_filtered_deck(col, deck_name=None, deck_id=None, dry_run=False,
+                          undo_label=None):
+    """Empty-then-regather ONE filtered deck by its saved terms (SPEC 32.2).
+
+    The API equivalent of the filtered deck's own Rebuild button
+    (col.sched.rebuild_filtered_deck): anki sends every current card home,
+    then re-runs the deck's SAVED search terms from scratch, as one
+    undoable op. Both halves are reported honestly — returnedFirst is the
+    pre-op residency (observed BEFORE the op: the op does not report it),
+    cardsGathered the post-op residency (the backend's own count agrees;
+    the DB read is what gets reported). Selector prechecks mirror
+    empty_filtered_deck verbatim. Rebuild-to-zero is anki's own behavior
+    and succeeds silently; the one gated case is the full data no-op
+    (empty deck whose saved terms would gather nothing) — the backend
+    would happily write a do-nothing undo step there (probe-verified), so
+    it is answered the way emptyFilteredDeck's already-empty gate is,
+    before any undo entry exists.
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_REBUILD_FILTERED
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    if (deck_name is None) == (deck_id is None):
+        raise PlusError('invalid_param',
+                        'invalid parameter: exactly one of deckName/deckId is required')
+    if deck_name is not None:
+        if not isinstance(deck_name, str) or not deck_name:
+            raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
+        did = col.decks.id_for_name(deck_name)
+        if did is None:
+            raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+    else:
+        if isinstance(deck_id, bool) or not isinstance(deck_id, int):
+            raise PlusError('invalid_param', 'invalid parameter: deckId: integer required')
+        did = deck_id
+    deck = col.decks.get(did, default=False)
+    if deck is None:
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_id))
+    if not deck.get('dyn'):
+        # pre-checked so the refusal is coded and no undo entry ever exists;
+        # the backend's own FilteredDeckError stays as a drift backstop
+        raise PlusError('validation_error',
+                        'deck is not a filtered deck: {}'.format(deck['name']))
+
+    returned_first = col.db.scalar(
+        'select count() from cards where did = ?', did) or 0
+
+    # the saved config, via the same read the GUI's edit dialog opens with
+    # (a read, not a write: the dry path below is test-locked to leave the
+    # undo status byte-identical). Anki GATHERS only the first two saved
+    # terms — a third is stored but dead (probe-verified) — so the
+    # prediction uses exactly the two the rebuild will.
+    saved = col.sched.get_or_create_filtered_deck(deck_id=did)
+    saved_terms = list(saved.config.search_terms)
+    used_terms = saved_terms[:2]
+    pools_limits = []
+    term_echo = []
+    for index, term in enumerate(used_terms):
+        try:
+            normalized = col.build_search_string(term.search)
+        except SearchError as e:
+            # not the caller's parameter — the DECK's saved search is broken
+            # (an external writer): coded refusal on both paths, before any
+            # undo entry exists, instead of a mid-op backend failure
+            raise PlusError('validation_error',
+                            "the deck's saved search term {} does not parse: "
+                            '{}'.format(index + 1, e))
+        pool = _filtered_gather_pool(col, normalized, own_deck_id=did)
+        pools_limits.append((pool, int(term.limit)))
+        term_echo.append({'search': normalized, 'limit': int(term.limit),
+                          'order': _FILTERED_DECK_ORDER_NAMES.get(
+                              int(term.order), int(term.order)),
+                          'eligible': len(pool)})
+    lo, hi = _predict_filtered_gather(pools_limits)
+
+    if dry_run:
+        return {'wouldReturn': returned_first, 'wouldGather': hi,
+                'exact': lo == hi, 'wouldGatherMin': lo, 'wouldGatherMax': hi,
+                'terms': term_echo,
+                'termsIgnored': max(0, len(saved_terms) - 2),
+                'undoEntry': None}
+
+    if returned_first == 0 and hi == 0:
+        # full data no-op, gated BEFORE any undo entry exists (the SPEC
+        # 16.2 phantom-redo hazard; emptyFilteredDeck's already-empty gate,
+        # answered the same way). A zero prediction is always EXACT: any
+        # nonzero term-1 gather lifts both bounds above zero.
+        return {'cardsGathered': 0, 'returnedFirst': 0, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        col.sched.rebuild_filtered_deck(did)
+        col.merge_undo_entries(target)
+    except FilteredDeckError as e:
+        # drift backstop (the dyn precheck above makes this unreachable);
+        # the backend op is atomic — nothing changed
+        _revert_batch(col, undo_name)
+        raise PlusError('validation_error', str(e))
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'rebuildFilteredDeck failed (batch reverted): {}'.format(e))
+
+    gathered = col.db.scalar('select count() from cards where did = ?', did) or 0
+    return {'cardsGathered': gathered, 'returnedFirst': returned_first,
             'undoEntry': undo_name}
 
 

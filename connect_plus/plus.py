@@ -568,6 +568,29 @@ class PlusMixin:
                                         undo_label=undoLabel)
 
 
+    #
+    # Filtered-deck build (SPEC 32, revision 19)
+    #
+
+    @plus_api()
+    def createFilteredDeck(self, name, searchQuery, limit=100, order=None,
+                           secondFilter=None, reschedule=True, dryRun=False,
+                           undoLabel=None):
+        return core.create_filtered_deck(self.collection(), name, searchQuery,
+                                         limit=limit, order=order,
+                                         second_filter=secondFilter,
+                                         reschedule=reschedule, dry_run=dryRun,
+                                         undo_label=undoLabel)
+
+
+    @plus_api()
+    def rebuildFilteredDeck(self, deckName=None, deckId=None, dryRun=False,
+                            undoLabel=None):
+        return core.rebuild_filtered_deck(self.collection(),
+                                          deck_name=deckName, deck_id=deckId,
+                                          dry_run=dryRun, undo_label=undoLabel)
+
+
     @plus_api()
     def getEmptyCards(self, deckName=None):
         return core.get_empty_cards(self.collection(), deck_name=deckName)

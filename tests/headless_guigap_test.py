@@ -25,9 +25,10 @@
 #   5. renameTag     — x::lab1 -> x::lab01 with x::lab10 untouched and
 #                      x::lab1::sub followed; pairs exact; notesUpdated
 #                      recounted; dry preview parity; undo restores.
-#   6. plusInfo      — action count (code truth: 34 = 27 + slice1 3 + slice2 4;
-#                      the verification briefing said 32 — code, SPEC and README
-#                      all agree on 34, asserted in lockstep here), returns
+#   6. plusInfo      — action count (code truth: 36 = 27 + slice1 3 + slice2 4
+#                      + revision-19 SPEC 32's 2; the verification briefing said
+#                      32 — code, SPEC and README all agree on 36, asserted in
+#                      lockstep here), returns
 #                      docs spot-verified against REAL captured responses,
 #                      errorCodes coverage, PLUS_VERSION/PLUS_SPEC_REVISION
 #                      lockstep with the SPEC.md header.
@@ -838,17 +839,18 @@ def test11_plusinfo_and_doc_lockstep():
     assert "aqt" not in sys.modules, "a core-path test pulled in aqt"
 
     # ---- code-level registry truth. The verification briefing said "32
-    # actions"; the code says 34 (27 at v1.2.0 + 3 slice-1 + 4 slice-2), and
-    # SPEC.md's own revision-17 entry says 27 -> 30 -> 34. Lock the internally
+    # actions"; the code says 36 (27 at v1.2.0 + 3 slice-1 + 4 slice-2 +
+    # 2 revision-19 filtered-deck build), and
+    # SPEC.md's own revision entries say 27 -> 30 -> 34 -> 36. Lock the internally
     # consistent truth; the briefing's number is reported as stale.
-    assert len(core.PLUS_ACTIONS) == 34, len(core.PLUS_ACTIONS)
-    assert len(set(core.PLUS_ACTIONS)) == 34, "duplicate action names"
+    assert len(core.PLUS_ACTIONS) == 36, len(core.PLUS_ACTIONS)
+    assert len(set(core.PLUS_ACTIONS)) == 36, "duplicate action names"
     for name in NEW_ACTIONS:
         assert name in core.PLUS_ACTIONS, name
     assert set(core.PLUS_ACTION_SUMMARIES) == set(core.PLUS_ACTIONS)
     assert set(core.PLUS_ACTION_RETURNS) == set(core.PLUS_ACTIONS)
-    assert core.PLUS_VERSION == "1.3.1", core.PLUS_VERSION
-    assert core.PLUS_SPEC_REVISION == 18, core.PLUS_SPEC_REVISION
+    assert core.PLUS_VERSION == "1.4.0", core.PLUS_VERSION
+    assert core.PLUS_SPEC_REVISION == 19, core.PLUS_SPEC_REVISION
     assert "%d Plus actions" % len(core.PLUS_ACTIONS) in core.PLUS_ERROR_PREFIX_NOTE
 
     # ---- SPEC.md header lockstep
@@ -857,7 +859,7 @@ def test11_plusinfo_and_doc_lockstep():
     want = "Version: %s (spec revision %d," % (core.PLUS_VERSION,
                                                core.PLUS_SPEC_REVISION)
     assert want in spec_head, "SPEC.md header does not carry %r" % want
-    assert "**34**" in spec_head, "SPEC.md header lost the 34-action count"
+    assert "**36**" in spec_head, "SPEC.md header lost the 36-action count"
 
     # ---- README lockstep: every new action has a table row; the export
     # escape hatch is documented
@@ -884,10 +886,10 @@ def test11_plusinfo_and_doc_lockstep():
     finally:
         util_mod.setting = orig_setting
 
-    assert info["version"] == core.PLUS_VERSION == "1.3.1", info["version"]
-    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 18
+    assert info["version"] == core.PLUS_VERSION == "1.4.0", info["version"]
+    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 19
     assert info["actions"] == list(core.PLUS_ACTIONS)
-    assert len(info["actions"]) == 34
+    assert len(info["actions"]) == 36
 
     # every action documented, returns non-empty, params never hidden
     for name in core.PLUS_ACTIONS:
@@ -997,7 +999,7 @@ def main():
         ("emptyFilteredDeck: dry/real/undo/no-op/refusals + clean export", test08_empty_filtered_deck_then_clean_export),
         ("empty cards: report + integrity cross-check", test09_empty_cards_report_and_integrity_crosscheck),
         ("deleteEmptyCards: orphan, protection, sweep, skipped", test10_delete_empty_cards),
-        ("plusInfo: 34 actions, returns truth, codes, SPEC/README lockstep", test11_plusinfo_and_doc_lockstep),
+        ("plusInfo: 36 actions, returns truth, codes, SPEC/README lockstep", test11_plusinfo_and_doc_lockstep),
     ]
     for name, fn in tests:
         run(name, fn)

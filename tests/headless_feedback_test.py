@@ -583,15 +583,16 @@ def test7_plus_info_action_docs():
     assert info["actions"] == list(core.PLUS_ACTIONS)
 
     docs = info["actionDocs"]
-    # all 34 actions documented, no strays (34 = 24 + round-2 SPEC 22/23:
+    # all 36 actions documented, no strays (36 = 24 + round-2 SPEC 22/23:
     # mediaExists, storeMediaFilesBulk + round-3 SPEC 26: undoStatus
     # + round-4 SPEC 28: renameDeck, bulkSetFlag, renameTag
     # + round-4 SPEC 29/30: filteredDeckReport, emptyFilteredDeck,
-    #   getEmptyCards, deleteEmptyCards)
-    assert len(core.PLUS_ACTIONS) == 34, core.PLUS_ACTIONS
+    #   getEmptyCards, deleteEmptyCards
+    # + revision-19 SPEC 32: createFilteredDeck, rebuildFilteredDeck)
+    assert len(core.PLUS_ACTIONS) == 36, core.PLUS_ACTIONS
     assert set(docs) == set(core.PLUS_ACTIONS), \
         sorted(set(docs) ^ set(core.PLUS_ACTIONS))
-    assert len(docs) == 34, len(docs)
+    assert len(docs) == 36, len(docs)
 
     # summary non-empty for EVERY action; params never leak 'self'
     for name in core.PLUS_ACTIONS:

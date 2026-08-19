@@ -1271,13 +1271,13 @@ def test_ask1_plus_info_surface():
     pkg_core = sys.modules[PLUS_PKG + ".core"]
     info = _with_default_settings(PLUS_PKG, plus.PlusMixin().plusInfo)
 
-    # --- 34 actions, each documented with a NON-EMPTY 'returns'
-    assert len(pkg_core.PLUS_ACTIONS) == 34, len(pkg_core.PLUS_ACTIONS)
-    assert len(set(pkg_core.PLUS_ACTIONS)) == 34, "duplicate action name"
+    # --- 36 actions, each documented with a NON-EMPTY 'returns'
+    assert len(pkg_core.PLUS_ACTIONS) == 36, len(pkg_core.PLUS_ACTIONS)
+    assert len(set(pkg_core.PLUS_ACTIONS)) == 36, "duplicate action name"
     assert info["actions"] == list(pkg_core.PLUS_ACTIONS)
     assert set(info["actionDocs"]) == set(pkg_core.PLUS_ACTIONS), \
         sorted(set(info["actionDocs"]) ^ set(pkg_core.PLUS_ACTIONS))
-    assert len(info["actionDocs"]) == 34
+    assert len(info["actionDocs"]) == 36
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
         # revision 18: side-effectful actions carry a fourth key, 'preserves'

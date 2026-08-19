@@ -122,6 +122,7 @@ SIDE_EFFECTFUL = {
     "bulkSuspend", "bulkSetDueDate", "bulkReplaceInFields",
     "renameDeck", "bulkSetFlag", "renameTag",
     "emptyFilteredDeck", "deleteEmptyCards",
+    "createFilteredDeck", "rebuildFilteredDeck",
     "createBackup", "exportDeckApkg", "syncNow",
     "ankihubSuggestNoteUpdate", "ankihubSuggestNewNote",
 }
@@ -175,8 +176,8 @@ def test1_stale_default_sweep():
         assert token in spec_text, token
 
     # version/revision moved (patch bump: no behavior change)
-    assert core.PLUS_VERSION == "1.3.1", core.PLUS_VERSION
-    assert core.PLUS_SPEC_REVISION == 18, core.PLUS_SPEC_REVISION
+    assert core.PLUS_VERSION == "1.4.0", core.PLUS_VERSION
+    assert core.PLUS_SPEC_REVISION == 19, core.PLUS_SPEC_REVISION
 
     # README + config.md name the new surfaces
     readme = open(os.path.join(REPO, "README.md"), encoding="utf-8").read()
