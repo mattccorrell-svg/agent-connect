@@ -525,8 +525,8 @@ def test10_undo_status():
 def test9_actions_registered():
     assert "mediaExists" in core.PLUS_ACTIONS
     assert "storeMediaFilesBulk" in core.PLUS_ACTIONS
-    # 27 = 26 + round-3 SPEC 26 undoStatus
-    assert len(core.PLUS_ACTIONS) == 27, len(core.PLUS_ACTIONS)
+    # 34 = 26 + round-3 SPEC 26 undoStatus + round-4 SPEC 28 + SPEC 29/30
+    assert len(core.PLUS_ACTIONS) == 34, len(core.PLUS_ACTIONS)
     assert "undoStatus" in core.PLUS_ACTIONS
     assert set(core.PLUS_ACTIONS) == set(core.PLUS_ACTION_SUMMARIES)
     assert core.PLUS_ACTION_SUMMARIES["mediaExists"]

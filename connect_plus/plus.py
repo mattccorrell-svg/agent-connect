@@ -432,13 +432,15 @@ class PlusMixin:
 
 
     @plus_api()
-    def exportDeckApkg(self, deckName, outPath=None, includeScheduling=True, includeMedia=True):
+    def exportDeckApkg(self, deckName, outPath=None, includeScheduling=True,
+                       includeMedia=True, allowFilteredOmission=False):
         return core.export_deck_apkg(
             self.collection(),
             deckName,
             out_path=outPath,
             include_scheduling=includeScheduling,
-            include_media=includeMedia
+            include_media=includeMedia,
+            allow_filtered_omission=allowFilteredOmission
         )
 
 
@@ -478,6 +480,56 @@ class PlusMixin:
     @plus_api()
     def undoStatus(self):
         return core.undo_status(self.collection())
+
+
+    #
+    # Round-4 maintenance actions (SPEC 28)
+    #
+
+    @plus_api()
+    def renameDeck(self, oldName, newName, dryRun=False, undoLabel=None):
+        return core.rename_deck(self.collection(), oldName, newName,
+                                dry_run=dryRun, undo_label=undoLabel)
+
+
+    @plus_api()
+    def bulkSetFlag(self, cardIds, flag, dryRun=False, undoLabel=None):
+        return core.bulk_set_flag(self.collection(), cardIds, flag,
+                                  dry_run=dryRun, undo_label=undoLabel)
+
+
+    @plus_api()
+    def renameTag(self, oldTag, newTag, dryRun=False, undoLabel=None):
+        return core.rename_tag(self.collection(), oldTag, newTag,
+                               dry_run=dryRun, undo_label=undoLabel)
+
+
+    #
+    # Round-4 filtered-deck safety + empty cards (SPEC 29, SPEC 30)
+    #
+
+    @plus_api()
+    def filteredDeckReport(self, deckName=None):
+        return core.filtered_deck_report(self.collection(), deck_name=deckName)
+
+
+    @plus_api()
+    def emptyFilteredDeck(self, deckName=None, deckId=None, dryRun=False,
+                          undoLabel=None):
+        return core.empty_filtered_deck(self.collection(), deck_name=deckName,
+                                        deck_id=deckId, dry_run=dryRun,
+                                        undo_label=undoLabel)
+
+
+    @plus_api()
+    def getEmptyCards(self, deckName=None):
+        return core.get_empty_cards(self.collection(), deck_name=deckName)
+
+
+    @plus_api()
+    def deleteEmptyCards(self, noteIds=None, dryRun=False, undoLabel=None):
+        return core.delete_empty_cards(self.collection(), note_ids=noteIds,
+                                       dry_run=dryRun, undo_label=undoLabel)
 
 
     #

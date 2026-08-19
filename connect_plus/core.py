@@ -40,14 +40,14 @@ import anki.utils
 from anki.errors import (Interrupted, InvalidInput, NetworkError,
                          NotFoundError, SearchError, SyncError, SyncErrorKind)
 
-PLUS_VERSION = "1.2.0"
+PLUS_VERSION = "1.3.0"
 # The SPEC revision this code implements, kept in lockstep with SPEC.md's
 # "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
 # locked). Revision 15 is the first revision that changed what two actions DO
 # to the collection by default rather than only what they return, so plusInfo
 # needs ONE machine-readable field that a caching client can branch on:
 # PLUS_VERSION moves on behavior changes, specRevision names the contract.
-PLUS_SPEC_REVISION = 16
+PLUS_SPEC_REVISION = 17
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -87,6 +87,20 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "bulkReplaceInFields",
                 # read Anki's own undo stack: what a single undo/redo would do right now (read-only)
                 "undoStatus",
+                # rename a deck IN PLACE, whole subtree at once: options presets, description, collapse state survive
+                "renameDeck",
+                # set or clear (flag 0) the colored flag on many cards as one undoable batch
+                "bulkSetFlag",
+                # segment-aware tag rename/move via anki's own op: lab1 -> lab01 never touches lab10
+                "renameTag",
+                # which filtered decks hold whose cards right now — the pre-export safety probe (read-only)
+                "filteredDeckReport",
+                # send every card in ONE filtered deck back to its home deck, one undoable op
+                "emptyFilteredDeck",
+                # anki's Empty Cards report as data: per-note empty cards + what deletion would keep (read-only)
+                "getEmptyCards",
+                # delete empty cards the way anki's own dialog does: never a note's last card, one undoable batch
+                "deleteEmptyCards",
                 "plusInfo"]
 # One-line summaries served by plusInfo's actionDocs (SPEC 4.9): the
 # discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
@@ -109,7 +123,7 @@ PLUS_ACTION_SUMMARIES = {
     "storeMediaFilesBulk": "Store many media files (base64 data or absolute path) in one call; per-item {requested, actual} makes Anki's dedup/rename decision visible, {requested, error} on failures, input order.",
     "bulkSuspend": "Suspend or unsuspend cards as one undoable batch; changedIds lists the cards actually written.",
     "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'preserveSuspended' defaults to TRUE (config key 'preserveSuspendedOnReschedule'), so the cards it revived are RE-SUSPENDED inside the same undo entry and listed in 'resuspended' (buried cards are deliberately NOT re-buried). Pass preserveSuspended=false (or flip the config key) for stock behavior. It also always writes (no no-op suppression: '1-7' is nondeterministic by design); dryRun=true predicts changedIds and the whole resurrection/re-suspension set without writing anything.",
-    "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting.",
+    "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting. FAIL-CLOSED since revision 17 (SPEC 29.3): if any card whose HOME deck is inside the export scope currently sits in a filtered deck, OR any filtered deck nested inside the scope holds cards homed OUTSIDE it, the call refuses with [cards_in_filtered_decks] — a deck-scoped .apkg silently OMITS every note whose cards are all in out-of-scope filtered decks, ships the rest of the displaced cards scheduling-reset, and ships nested filters' FOREIGN notes into the filter recreated as a regular deck (a real class deck nearly shipped missing 141 cards / 96 notes this way). Run emptyFilteredDeck on the named decks first, or pass allowFilteredOmission=true to export anyway with the damage itemized in 'warnings' (always present, [] on a clean export).",
     "syncStatus": "Read-only sync probe: login, local dirtiness, server-required kind, async job state.",
     "syncNow": "Start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus.",
     "ankihubStatus": "AnkiHub bridge probe: install/enable/login/deck status + add-on compatibility (read-only, never network).",
@@ -118,6 +132,13 @@ PLUS_ACTION_SUMMARIES = {
     "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional orphan-media scan. Every list is deck-scoped EXCEPT orphanMediaCollectionWide, which is COLLECTION-WIDE (capped by orphanMediaLimit, full size in orphanMediaCount).",
     "bulkReplaceInFields": "Find/replace (literal or python-regex) on ONE named field's raw HTML, as one undoable batch; field, find and replace are required, plus exactly one of query/noteIds. dryRun returns a capped before/after preview.",
     "undoStatus": "Read Anki's undo stack (read-only): what a single undo/redo would do right now, plus lastStep — the observed truth behind every action's undoEntry.",
+    "renameDeck": "Rename a deck IN PLACE — every subdeck follows in the same call, and the options-preset assignments, per-deck descriptions and collapse state all survive (the create/changeDeck/deleteDecks workaround silently resets subdeck presets to Default, changing scheduling with no error). One backend op, one undo entry. A newName (or implied descendant name) already taken by ANY deck other than the very deck being renamed onto it — the renamed deck's own descendants included — is refused with [duplicate] instead of inheriting anki's silent auto-rename; a case-only respelling stays legal. newName must arrive normalized: an empty or whitespace-padded '::' component is refused with [invalid_param] (the backend would silently rewrite it, making the dry-run prediction a lie). dryRun previews every resulting {from, to} pair, descendants included.",
+    "bulkSetFlag": "Set or clear (flag: 0-7, 0 = no flag) the colored flag on many cards as one undoable batch. 'updated'/'unchanged' are split from the cards' REAL pre-op flags, so re-flagging is a reported no-op (nothing written, no undo entry). The sanctioned route for the flag-inbox workflow — a human flags cards in review, an agent fixes them and finally CLEARS the flag (stock's only route is setSpecificValueOfCard, which clobbers the whole flags byte and creates no undo entry). dryRun previews the split.",
+    "renameTag": "Rename/move a tag AND its '::' subtree with anki's own segment-aware op: renaming lab1 to lab01 rewrites lab1 and lab1::* but never touches lab10 (stock replaceTagsInAllNotes matches whole tags only, so it strands the children — and it writes per note with no undo entry). Matching is case-insensitive; renaming onto an existing tag MERGES the trees, disclosed in 'merged'. dryRun lists the exact {from, to} pairs so the prefix-collision safety is visible before anything is written.",
+    "filteredDeckReport": "Read-only census of filtered decks: per filtered deck, how many cards it currently holds and which HOME decks those cards belong to ({name: count}). Pass deckName (a regular deck) to scope to cards homed in that subtree — the pre-export probe: totalCards is then the home-side count exportDeckApkg's fail-closed check trips on (the check ALSO flags filtered decks nested inside the export scope that hold foreign-homed cards; those show as rows of an UNSCOPED report), and the rows name the decks to pass to emptyFilteredDeck. A deckName naming a filtered deck reports just that deck.",
+    "emptyFilteredDeck": "Send every card in ONE filtered deck back to its home deck (the API equivalent of the deck's own Empty action, col.sched.empty_filtered_deck) as one undoable op — the remediation step exportDeckApkg's [cards_in_filtered_decks] refusal points at; stock AnkiConnect has no way to do this. Exactly one of deckName/deckId. Reports the homeDecks breakdown of what went home; emptying an already-empty filtered deck is a reported no-op (nothing written). dryRun previews the same numbers.",
+    "getEmptyCards": "Anki's Tools > Empty Cards report as data (read-only): per note, the empty cards' ids and ordinals, exactly which of them deleteEmptyCards would delete, and the one card it would PROTECT when every card of the note is empty (deletion never removes a note's last card — anki's own dialog rule). Optional deckName scopes to notes with at least one empty card homed in that subtree. checkDeckIntegrity's clozeCardMismatch DETECTS the drift; this is the actionable report.",
+    "deleteEmptyCards": "Delete empty cards as one undoable batch, honoring the same protection as anki's own Empty Cards dialog with 'keep notes' on: an all-empty note keeps its first card (reported in 'protected') and the note itself is NEVER deleted — notesPreserved post-checks that. noteIds=null acts on everything the live report finds; requested ids without empty cards land in skipped with a reason. dryRun previews the exact card ids.",
     "plusInfo": "Name/version/specRevision/action list plus per-action actionDocs (summary + params + returns), an 'errorCodes' map and a 'recipes' list of named call patterns; works before a profile is open.",
 }
 
@@ -211,9 +232,19 @@ PLUS_ACTION_RETURNS = {
         "wouldUnbury: [cardId], wouldResuspend: [cardId], undoEntry: null} — a prediction from "
         "the pre-state that writes nothing.",
     "exportDeckApkg":
-        "{path: str, sizeBytes: int, notesExported: int} — path is the file actually written "
-        "(never an overwrite; a serial suffix is added if needed), so read it rather than "
-        "assuming the requested outPath.",
+        "{path: str, sizeBytes: int, notesExported: int, warnings: [{code, count, decks: "
+        "{filteredDeckName: cardCount}, ...}]} — path is the file actually written (never an "
+        "overwrite; a serial suffix is added if needed), so read it rather than assuming the "
+        "requested outPath. 'warnings' (revision 17) is ALWAYS present and [] on a clean "
+        "export; it is non-empty only when allowFilteredOmission=true let a flagged export "
+        "proceed, with up to two entries: {code: 'cards_in_filtered_decks', count, decks, "
+        "notesOmitted} — cards whose in-scope home deck could not save them from a filtered "
+        "deck (omitted from the package, or shipped scheduling-reset into a recreated "
+        "deck), notesOmitted being the notes that vanish entirely — and {code: "
+        "'foreign_cards_in_scope_filters', count, decks} — cards homed OUTSIDE the export "
+        "scope that SHIPPED anyway because they sit in a filtered deck nested inside it "
+        "(scheduling-reset, filter recreated as a regular deck). The DEFAULT never exports "
+        "in either state: it raises [cards_in_filtered_decks] instead.",
     "syncStatus":
         "{loggedIn: bool, job: {state, startedMs, result, error}, mediaSyncing: bool, "
         "mediaSecondsSinceLastSync: int, lastSyncMs: int|null, modMs: int|null, "
@@ -256,6 +287,79 @@ PLUS_ACTION_RETURNS = {
         "{undo: str|null, redo: str|null, lastStep: int} — null (never '') when there is nothing "
         "to undo/redo. lastStep is anki's monotonic undo-step counter: snapshot it, run a write, "
         "call again — it advances iff an undo entry was really created.",
+    "renameDeck":
+        "{renamed: [{from, to}], configPreserved: bool, cardsAffected: int, undoEntry: str|null} "
+        "— 'renamed' covers the deck AND every descendant, re-read from the collection AFTER the "
+        "op (stored spellings, so it reports what actually happened, not what was asked). "
+        "configPreserved is an actual post-check that every renamed deck kept its options-preset "
+        "id (deck ids are stable across a rename, so true is the structural expectation; the "
+        "manual create/move/delete workaround is the thing that resets presets). cardsAffected "
+        "counts cards homed in or visiting the subtree (odid-aware). A byte-identical newName is "
+        "a data no-op: {renamed: [], configPreserved: true, cardsAffected: 0, undoEntry: null}. "
+        "dryRun=true instead returns {wouldRename: [{from, to}], cardsAffected, undoEntry: null} "
+        "— a prediction from the pre-op names; the same [duplicate]/[deck_not_found]/"
+        "[invalid_param] refusals (occupied target; un-normalized newName) fire on the dry "
+        "path too, so the prediction is exactly what the real call would land.",
+    "bulkSetFlag":
+        "{updated: [cardId], unchanged: [cardId], undoEntry: str|null} — 'unchanged' lists the "
+        "cards that ALREADY carried the requested flag (read from their real pre-op values); "
+        "cardIds are deduplicated and unknown ids silently dropped (same precheck contract as "
+        "bulkSuspend). A data no-op returns updated [], undoEntry null, nothing written. "
+        "dryRun=true returns {wouldUpdate: [cardId], unchanged, undoEntry: null}.",
+    "renameTag":
+        "{notesUpdated: int, tagsRewritten: [{from, to}], merged: [str], undoEntry: str|null} — "
+        "notesUpdated is the backend's own changed-note count; tagsRewritten pairs are re-read "
+        "from the post-op tag registry (a merge reports the spelling that actually won). "
+        "'merged' names the pre-existing tags this rename folded into (tree merge, pre-op "
+        "observation). A match carried by NO note (a ghost tag left registered after its notes "
+        "were deleted) is not renamed by the backend; an all-ghost match returns notesUpdated 0, "
+        "tagsRewritten [] and undoEntry null with nothing written. dryRun=true returns "
+        "{wouldRewrite: [{from, to}], merged, undoEntry: null} "
+        "— the preview that proves prefix safety: lab1 -> lab01 lists lab1 and lab1::* only, "
+        "never lab10.",
+    "filteredDeckReport":
+        "{filteredDecks: [{filteredDeck: str, filteredDeckId: int, cardCount: int, "
+        "homeDecks: {homeDeckName: count}}], totalCards: int} — one row per filtered deck, "
+        "name-sorted. Unscoped: every filtered deck in the collection, empty ones included "
+        "(cardCount 0, homeDecks {}). deckName naming a REGULAR deck: only cards whose HOME "
+        "deck lies in that subtree are counted, rows without such cards are dropped, and "
+        "totalCards is the home-side count exportDeckApkg's fail-closed check would trip on "
+        "(that check also flags foreign-homed cards inside the scope's own nested filters, "
+        "which a scoped report does not count — check the unscoped rows for those). "
+        "deckName naming a FILTERED deck: just that deck's full row. Read-only; a home name "
+        "of '[no deck]' is anki's own label for a dangling odid (database damage).",
+    "emptyFilteredDeck":
+        "{returned: int, homeDecks: {homeDeckName: count}, undoEntry: str|null} — 'returned' "
+        "is the cards actually sent home: the pre-op residency count cross-checked against "
+        "the post-op count of cards still in the filter. homeDecks is where they went, from "
+        "the cards' odid read BEFORE the op (afterwards odid is 0). An already-empty "
+        "filtered deck is a data no-op: {returned: 0, homeDecks: {}, undoEntry: null} with "
+        "nothing written — the backend would happily create an empty undo entry there "
+        "(probe-verified), so this action gates before creating one. dryRun=true returns "
+        "{wouldReturn: int, homeDecks, undoEntry: null}.",
+    "getEmptyCards":
+        "{notes: [{noteId, ords: [int], willDeleteCards: [cardId], protectedCard: "
+        "cardId|null}], total: int} — one entry per note that has empty cards, in anki's own "
+        "report order. ords are the empty cards' template/cloze ordinals, aligned with the "
+        "note's empty cards in the backend's order; willDeleteCards are the card ids "
+        "deleteEmptyCards would really delete; protectedCard is non-null exactly when EVERY "
+        "card of the note is empty — that first card would be kept (its ordinal is ords[0]; "
+        "it appears in no willDeleteCards). total counts the notes listed. With deckName, "
+        "notes with at least one empty card HOMED in that subtree (odid-aware) are listed — "
+        "a listed note still reports ALL its empty cards, because deletion acts per note and "
+        "empty siblings can sit in other decks. Read-only: no undo entry.",
+    "deleteEmptyCards":
+        "{cardsDeleted: int, deletedCardIds: [cardId], notesAffected: int, protected: "
+        "[{noteId, cardId}], notesPreserved: bool, skipped: [{noteId, reason}], undoEntry: "
+        "str|null} — mirrors anki's own Empty Cards dialog with 'keep notes' ON (its shipped "
+        "default): an all-empty note keeps its first card, listed in 'protected', and the "
+        "note itself is never deleted — notesPreserved is an actual post-check that every "
+        "protected note still exists, not an assumption. noteIds=null deletes what the live "
+        "report finds; explicit ids not in the report land in skipped with reason 'no empty "
+        "cards' or 'note was not found' (keyed noteId — the bulkReplaceInFields precedent). "
+        "An all-protected or empty target set is a data no-op: cardsDeleted 0, undoEntry "
+        "null, nothing written. dryRun=true returns {wouldDelete: [cardId], notesAffected, "
+        "protected, skipped, undoEntry: null}.",
     "plusInfo":
         "{name: str, version: str, specRevision: int (the SPEC revision this build "
         "implements; version's minor moves whenever DEFAULT BEHAVIOR does, so a cached "
@@ -281,7 +385,8 @@ PLUS_ERROR_CODES = {
     'not_found': False,               # note/card/media file/IO notetype/output dir absent
     'invalid_param': False,           # request shape/type/range wrong (house 'invalid parameter:' family)
     'deck_not_found': False,          # named deck does not exist (decks are never auto-created)
-    'duplicate': False,               # reserved: duplicates are per-item skip reasons today, never raised
+    'duplicate': False,              # renameDeck: newName (or an implied descendant name) already taken by any deck but the pair's own; note-level duplicates remain per-item skip reasons
+    'cards_in_filtered_decks': False,  # exportDeckApkg fail-closed default: in-scope-home cards sit in filtered decks, or in-scope nested filters hold foreign-homed cards; empty them (emptyFilteredDeck) or pass allowFilteredOmission=true
     'unsupported_format': False,      # image failed to load/encode (corrupt or unsupported format)
     'io_error': False,                # reserved: disk read/write failure (today only per-item errors)
     'batch_reverted': False,          # atomic batch hit a hard error and was rolled back; JSON report after the prefix
@@ -319,8 +424,22 @@ PLUS_ERROR_CODE_DOCS = {
         'argument-binding failures (missing required argument, unexpected keyword argument).'},
     'deck_not_found': {'reachable': True, 'meaning':
         'The named deck does not exist. Decks are never auto-created by this add-on.'},
-    'duplicate': {'reachable': False, 'meaning':
-        'RESERVED — never raised. Duplicates are reported per item in skipped[].reason instead.'},
+    'duplicate': {'reachable': True, 'meaning':
+        'A name you asked to claim is already taken: renameDeck refuses when newName (or an '
+        'implied descendant name) resolves to ANY deck other than the very deck being renamed '
+        'onto it — the renamed subtree\'s own members included — instead of inheriting the '
+        'backend silent auto-rename (a case-only respelling resolves to itself and stays '
+        'legal). Reachable since revision 17. NOTE-level duplicates are still reported per '
+        'item in skipped[].reason, never raised.'},
+    'cards_in_filtered_decks': {'reachable': True, 'meaning':
+        'exportDeckApkg refused (fail-closed default, revision 17): at least one card whose '
+        'HOME deck is inside the export scope currently sits in a filtered deck, or a '
+        'filtered deck nested inside the scope holds cards homed outside it. The .apkg '
+        'would silently omit whole notes, ship scheduling-reset cards, or ship foreign '
+        'notes into a recreated regular deck. The message names the filtered decks and '
+        'counts. Empty them (emptyFilteredDeck) and re-export, or pass '
+        "allowFilteredOmission=true to export anyway with the damage itemized in "
+        "'warnings'."},
     'unsupported_format': {'reachable': True, 'meaning':
         'An image could not be loaded or re-encoded (corrupt file, or a format this Qt build '
         'cannot write).'},
@@ -377,7 +496,7 @@ PLUS_ERROR_CODE_DOCS = {
 # The one boundary rule a client cannot infer from a single response (SPEC 25,
 # revision 13): the '[code] ' prefix is NOT universal across this server.
 PLUS_ERROR_PREFIX_NOTE = (
-    "Prefixing boundary: errors from the 27 Plus actions AND the dispatcher's unknown-action "
+    "Prefixing boundary: errors from the 34 Plus actions AND the dispatcher's unknown-action "
     "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
     "EVERY OTHER error is passed through verbatim and UNPREFIXED, with errorCode: null and "
     "retryable: null — that is the ~90 UPSTREAM AnkiConnect actions, the dispatcher's api-key "
@@ -573,6 +692,40 @@ PLUS_RECIPES = [
                         "errorCodes map it returns."),
         'example': {'action': 'plusInfo', 'params': {}},
     },
+    {
+        'name': 'safe deck export',
+        'description': ("Exporting a deck someone else will import: cards currently sitting "
+                        "in filtered decks are a silent hazard — a deck-scoped .apkg OMITS "
+                        "every note whose cards are all in out-of-scope filtered decks, "
+                        "ships the rest of those cards scheduling-reset (a real class deck "
+                        "nearly went out missing 141 cards / 96 notes), and ships FOREIGN "
+                        "notes whenever a filtered deck nested inside the export scope holds "
+                        "cards homed outside it. exportDeckApkg therefore FAILS CLOSED with "
+                        "[cards_in_filtered_decks] in both situations. The loop: "
+                        "filteredDeckReport with deckName=<export deck> to see the home-side "
+                        "exposure (totalCards is the count the export check trips on for "
+                        "in-scope-home cards; the unscoped report shows nested filters "
+                        "holding foreign cards), emptyFilteredDeck per named filter (one "
+                        "undoable op each; cards return to their home decks), then export "
+                        "clean. Pass allowFilteredOmission=true only when the damage is "
+                        "wanted — the response then itemizes it in 'warnings' instead of "
+                        "refusing."),
+        'example': {'action': 'filteredDeckReport', 'params': {'deckName': 'HA2'}},
+    },
+    {
+        'name': 'empty-cards cleanup',
+        'description': ("The audit -> remediate loop for empty cards (cloze rewrites leave "
+                        "orphan cards behind; anki only offers the manual Tools > Empty "
+                        "Cards dialog): checkDeckIntegrity's clozeCardMismatch DETECTS the "
+                        "drift, getEmptyCards turns it into an actionable per-note report "
+                        "(which card ids a deletion would remove, which last card it would "
+                        "protect), deleteEmptyCards dryRun=true previews the exact ids, and "
+                        "the real call deletes them as ONE undoable batch. Deletion follows "
+                        "anki's own dialog rule: a note is never deleted and never loses its "
+                        "last card — an all-empty note keeps its first card, reported in "
+                        "'protected' and post-checked in 'notesPreserved'."),
+        'example': {'action': 'deleteEmptyCards', 'params': {'dryRun': True}},
+    },
 ]
 
 UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
@@ -583,6 +736,11 @@ UNDO_CROP_IO = 'AnkiConnect Plus: Crop IO Image'
 UNDO_BULK_SUSPEND = 'AnkiConnect Plus: Bulk Suspend'
 UNDO_BULK_DUE = 'AnkiConnect Plus: Bulk Due Date'
 UNDO_BULK_REPLACE = 'AnkiConnect Plus: Replace in Fields'
+UNDO_RENAME_DECK = 'AnkiConnect Plus: Rename Deck'
+UNDO_BULK_FLAG = 'AnkiConnect Plus: Bulk Flag'
+UNDO_RENAME_TAG = 'AnkiConnect Plus: Rename Tag'
+UNDO_EMPTY_FILTERED = 'AnkiConnect Plus: Empty Filtered Deck'
+UNDO_DELETE_EMPTY = 'AnkiConnect Plus: Delete Empty Cards'
 
 # undoLabel (SPEC 24): every write action takes an optional undoLabel whose
 # sanitized form becomes the undo entry name 'AnkiConnect Plus: <label>', so
@@ -595,16 +753,19 @@ UNDO_LABEL_MAX_CHARS = 80
 QUEUE_SUSPENDED = -1
 
 #
-# Suspension control (SPEC 27, spec revision 15). BOTH defaults are True, which
-# means this fork DELIBERATELY DEVIATES from Anki's native behavior on two
-# actions -- see SPEC 27 and README for the full rationale and the switch-off:
-#   * bulkSetDueDate: anki's own set_due_date turns every targeted card into a
-#     review card, silently RESURRECTING suspended ones. Left alone, one
-#     deck-wide reschedule can revive every leech you ever suspended. With
-#     preserve_suspended the cards that were suspended before the call are put
-#     back afterwards, inside the SAME undo entry.
-#   * bulkAddNotes: new cards are left suspended so a generated draft batch
-#     never enters review before a human has read it.
+# Suspension control (SPEC 27, spec revisions 15-16). The two defaults ship
+# SPLIT since revision 16 (the pre-publication defaults split):
+#   * preserveSuspendedOnReschedule ships True -- the one DELIBERATE DEVIATION
+#     from Anki's native behavior that stays on by default: anki's own
+#     set_due_date turns every targeted card into a review card, silently
+#     RESURRECTING suspended ones (one deck-wide reschedule can revive every
+#     leech you ever suspended). With preserve_suspended the cards that were
+#     suspended before the call are put back afterwards, inside the SAME undo
+#     entry, disclosed in 'resuspended'.
+#   * suspendNewCards ships False since revision 16 -- stock-compatible:
+#     bulkAddNotes leaves new cards LIVE unless the suspended-draft workflow
+#     is opted into per call (suspend=true) or per config.
+# See SPEC 27 and README for the full rationale and the switches.
 # These constants are the documented fallback used whenever the parameter is
 # None AND no usable config value exists; connect_plus/config.json ships the
 # same two values under CONFIG_PRESERVE_SUSPENDED / CONFIG_SUSPEND_NEW_CARDS
@@ -2430,7 +2591,7 @@ def bulk_set_due_date(col, card_ids, days, preserve_suspended=None, dry_run=Fals
 #
 
 def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
-                     include_media=True):
+                     include_media=True, allow_filtered_omission=False):
     if not isinstance(deck_name, str) or not deck_name:
         raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
     if out_path is not None and (not isinstance(out_path, str) or not out_path):
@@ -2439,9 +2600,106 @@ def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
         raise PlusError('invalid_param', 'invalid parameter: includeScheduling: boolean required')
     if not isinstance(include_media, bool):
         raise PlusError('invalid_param', 'invalid parameter: includeMedia: boolean required')
+    if not isinstance(allow_filtered_omission, bool):
+        raise PlusError('invalid_param',
+                        'invalid parameter: allowFilteredOmission: boolean required')
     did = col.decks.id_for_name(deck_name)
     if did is None:
         raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+
+    # Fail-closed filtered-deck check (SPEC 29.3, revision 17 — a DELIBERATE
+    # behavior change; second flagged set added in the revision-17 fix pass).
+    # The backend's deck-scoped gather ships a note iff at least one of its
+    # cards has did inside the subtree; a card visiting a filtered deck has
+    # did=<filter>. TWO damage classes follow:
+    #   1. HOME in scope, sitting in a filtered deck (any filtered deck):
+    #      a note whose EVERY such card is in an OUT-of-scope filtered deck
+    #      VANISHES from the package, and a partially-filtered note's
+    #      filtered card ships with did=<filter> — the importer recreates
+    #      the filter as a regular deck and the card arrives scheduling-
+    #      reset (both probe-verified; a real class deck nearly shipped
+    #      missing 141 cards / 96 notes). Detection is odid-aware: any card
+    #      whose HOME deck is in scope while it sits in a filtered deck.
+    #   2. HOME OUTSIDE scope, sitting in a filtered deck NESTED INSIDE the
+    #      export subtree: the filter's did IS in scope, so the gather ships
+    #      those FOREIGN notes — scheduling-reset, into the filter recreated
+    #      as a regular deck (behaviorally proven on 25.09.4: filtered child
+    #      'EA::Cram' holding a card homed in 'EZ' shipped the EZ note).
+    # Read-only card-location selects, explicitly allowed by SPEC 29.3.
+    # Exporting a filtered deck ITSELF stays out of this guard's scope: no
+    # card's odid ever names a filtered deck (class 1), and the export ROOT
+    # is excluded from the class-2 filter list (filtered decks cannot nest,
+    # so a filtered root has no children to catch either way).
+    scope_list = list(col.decks.deck_and_child_ids(did))
+    scope_ids = ','.join(str(int(x)) for x in scope_list)
+    filtered_rows = col.db.all(
+        'select did, count() from cards where odid != 0 and odid in ({}) '
+        'group by did order by did'.format(scope_ids))
+    filters_in_scope = [x for x in scope_list
+                        if x != did and col.decks.is_filtered(x)]
+    foreign_rows = []
+    if filters_in_scope:
+        foreign_rows = col.db.all(
+            'select did, count() from cards where did in ({}) and odid not in '
+            '({}) group by did order by did'.format(
+                ','.join(str(int(x)) for x in filters_in_scope), scope_ids))
+    warnings = []
+    if filtered_rows or foreign_rows:
+        decks_breakdown = {}
+        for filter_did, count in filtered_rows:
+            key = col.decks.name(filter_did)
+            decks_breakdown[key] = decks_breakdown.get(key, 0) + count
+        filtered_count = sum(decks_breakdown.values())
+        foreign_breakdown = {}
+        for filter_did, count in foreign_rows:
+            key = col.decks.name(filter_did)
+            foreign_breakdown[key] = foreign_breakdown.get(key, 0) + count
+        foreign_count = sum(foreign_breakdown.values())
+        # vanish class: notes whose every card is in a filtered deck AND no
+        # card keeps a did inside the scope. Cards in IN-scope filters keep
+        # an in-scope did, so their notes ship (class 2) and are correctly
+        # NOT counted here.
+        notes_omitted = 0
+        if filtered_rows:
+            notes_omitted = col.db.scalar(
+                'select count() from (select nid from cards where odid != 0 and '
+                'odid in ({0}) and nid not in (select nid from cards where did in '
+                '({0})) group by nid)'.format(scope_ids)) or 0
+        if not allow_filtered_omission:
+            parts = []
+            if filtered_rows:
+                detail = ', '.join('{}: {}'.format(name, count)
+                                   for name, count in sorted(decks_breakdown.items()))
+                parts.append(
+                    '{} cards whose home deck is inside "{}" are sitting in filtered '
+                    'decks ({}); a deck-scoped export silently omits notes whose every '
+                    'card is in a filtered deck ({} such notes here) and ships the '
+                    'other filtered cards scheduling-reset'.format(
+                        filtered_count, col.decks.name(did), detail, notes_omitted))
+            if foreign_rows:
+                foreign_detail = ', '.join(
+                    '{}: {}'.format(name, count)
+                    for name, count in sorted(foreign_breakdown.items()))
+                parts.append(
+                    '{} cards homed OUTSIDE "{}" are sitting in filtered decks '
+                    'nested inside it ({}); the export would ship those foreign '
+                    'notes scheduling-reset, with their filtered decks recreated '
+                    'as regular decks'.format(
+                        foreign_count, col.decks.name(did), foreign_detail))
+            raise PlusError(
+                'cards_in_filtered_decks',
+                '{}. Empty the filtered decks first (emptyFilteredDeck) or pass '
+                'allowFilteredOmission=true to export anyway'.format(
+                    '. '.join(parts)))
+        if filtered_rows:
+            warnings.append({'code': 'cards_in_filtered_decks',
+                             'count': filtered_count,
+                             'decks': decks_breakdown,
+                             'notesOmitted': notes_omitted})
+        if foreign_rows:
+            warnings.append({'code': 'foreign_cards_in_scope_filters',
+                             'count': foreign_count,
+                             'decks': foreign_breakdown})
 
     if out_path is None:
         # sanitize: unicode word chars, dot, dash survive; '::' and anything
@@ -2480,8 +2738,10 @@ def export_deck_apkg(col, deck_name, out_path=None, include_scheduling=True,
     )
     notes = col.export_anki_package(out_path=out_path, options=options,
                                     limit=anki.collection.DeckIdLimit(did))
+    # 'warnings' is ALWAYS present (revision 17, additive): [] on a clean
+    # export, the itemized loss when allowFilteredOmission let one through
     return {'path': out_path, 'sizeBytes': os.path.getsize(out_path),
-            'notesExported': notes}
+            'notesExported': notes, 'warnings': warnings}
 
 
 #
@@ -2856,6 +3116,651 @@ def undo_status(col):
     return {'undo': status.undo or None,
             'redo': status.redo or None,
             'lastStep': status.last_step}
+
+
+#
+# Round-4 maintenance actions (SPEC 28): renameDeck, bulkSetFlag, renameTag
+#
+
+def rename_deck(col, old_name, new_name, dry_run=False, undo_label=None):
+    """Rename a deck IN PLACE — the whole subtree follows (SPEC 28.1).
+
+    The one-call answer to the create/changeDeck/deleteDecks workaround,
+    which silently loses every subdeck's options-preset assignment (cards
+    are scheduled by their deck's preset, so a forgotten preset re-point
+    changes scheduling with no error), plus per-deck description and
+    collapse state. col.decks.rename moves the prefix and every descendant
+    in one backend op; deck ids are STABLE across it, so presets/desc/
+    collapse survive by construction — and configPreserved re-checks that
+    from the post-op decks anyway, because the response reports what
+    HAPPENED, not what the mechanism implies.
+
+    Deliberately stricter than the backend on collisions: anki's rename
+    silently auto-renames an occupied target ('Occupied' -> 'Occupied+');
+    this action refuses with [duplicate] instead, on the dry path too.
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_RENAME_DECK
+    if not isinstance(old_name, str) or not old_name:
+        raise PlusError('invalid_param', 'invalid parameter: oldName: string required')
+    if not isinstance(new_name, str) or not new_name:
+        raise PlusError('invalid_param', 'invalid parameter: newName: string required')
+    # newName strictness (revision-17 fix pass): the backend normalizes deck
+    # names on write — components stripped of surrounding whitespace, empty
+    # components filled with 'blank' (probe-verified: 'P3A2 ' lands 'P3A2',
+    # 'P3B2::' lands 'P3B2::blank') — which would make the dry-run's string-
+    # math prediction diverge from what the real call lands (§15). Refuse
+    # un-normalized input up front, on both paths, matching this action's
+    # stricter-than-backend stance rather than predicting one name and
+    # writing another. oldName stays lenient: id_for_name resolves it against
+    # the stored (already normalized) spellings.
+    if any(not comp or comp != comp.strip() for comp in new_name.split('::')):
+        raise PlusError(
+            'invalid_param',
+            'invalid parameter: newName: every "::" component must be non-empty '
+            'with no leading/trailing whitespace: {!r}'.format(new_name))
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    did = col.decks.id_for_name(old_name)
+    if did is None:
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(old_name))
+
+    # pre-op subtree snapshot: (stored spelling, id), root included, in the
+    # backend's name-sorted parent-first order. Suffixes are computed against
+    # the STORED root spelling, never the request's (id_for_name matched it
+    # case-insensitively).
+    subtree = list(col.decks.deck_and_child_name_ids(did))
+    root_name = next(name for name, deck_id in subtree if deck_id == did)
+
+    if new_name == root_name:
+        # byte-identical rename: data no-op — nothing written, undo untouched
+        # (a case-only respelling is NOT this: it is a real rename)
+        if dry_run:
+            return {'wouldRename': [], 'cardsAffected': 0, 'undoEntry': None}
+        return {'renamed': [], 'configPreserved': True, 'cardsAffected': 0,
+                'undoEntry': None}
+
+    predicted = [{'from': name, 'to': new_name + name[len(root_name):]}
+                 for name, _deck_id in subtree]
+    # occupied-name refusal (tightened in the revision-17 fix pass): a
+    # predicted target may resolve ONLY to its own pair's deck — that is the
+    # deck itself under a case-only respelling (id_for_name matches case-
+    # insensitively). ANY other hit is refused, in-subtree hits included:
+    # renaming 'A' onto its own child 'A::B' would otherwise ride the
+    # backend's silent ensure-unique auto-'+' ('A::B+'), diverging from the
+    # dry-run prediction. Clean self-nesting ('A' -> 'A::B' with no existing
+    # 'A::B') stays legal — every predicted target resolves to None and the
+    # backend recreates missing parents. subtree and predicted are index-
+    # aligned by construction.
+    for (_name, deck_id), pair in zip(subtree, predicted):
+        taken = col.decks.id_for_name(pair['to'])
+        if taken is not None and taken != deck_id:
+            raise PlusError('duplicate', 'deck already exists: {}'.format(pair['to']))
+
+    # cards homed in OR currently visiting the subtree (odid-aware count via
+    # the decks API): a card sitting in a filtered deck keeps its HOME here,
+    # and that home's name is what this call changes
+    cards_affected = col.decks.card_count(did, include_subdecks=True)
+
+    if dry_run:
+        return {'wouldRename': predicted, 'cardsAffected': cards_affected,
+                'undoEntry': None}
+
+    pre_conf = {}
+    for _name, deck_id in subtree:
+        deck = col.decks.get(deck_id, default=False)
+        if deck is not None and 'conf' in deck:
+            # filtered decks carry no 'conf' (embedded config); skipping them
+            # here makes the post-check compare None == None for them
+            pre_conf[deck_id] = deck['conf']
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        col.decks.rename(did, new_name)
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'renameDeck failed (batch reverted): {}'.format(e))
+
+    # POST-CHECK, not assumption: ids are stable across a rename, so re-read
+    # every subtree member by id for the name that actually landed and the
+    # options-preset id that actually survived.
+    renamed = []
+    config_preserved = True
+    for name, deck_id in subtree:
+        deck = col.decks.get(deck_id, default=False)
+        if deck is None:  # pragma: no cover - handlers are serialized
+            config_preserved = False
+            continue
+        renamed.append({'from': name, 'to': deck['name']})
+        if pre_conf.get(deck_id) != deck.get('conf'):
+            config_preserved = False
+
+    return {'renamed': renamed, 'configPreserved': config_preserved,
+            'cardsAffected': cards_affected, 'undoEntry': undo_name}
+
+
+def bulk_set_flag(col, card_ids, flag, dry_run=False, undo_label=None):
+    """Set or clear (flag 0) the colored flag on many cards (SPEC 28.2).
+
+    The sanctioned route for the flag-inbox workflow: a human flags cards in
+    review, an agent fixes them and finally CLEARS the flag. Stock's only
+    path is setSpecificValueOfCard, which clobbers the whole flags byte and
+    creates no undo entry; col.set_user_flag_for_cards writes only the
+    user-flag bits and undoes cleanly.
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_FLAG
+    if isinstance(flag, bool) or not isinstance(flag, int) or not 0 <= flag <= 7:
+        raise PlusError('invalid_param', 'invalid parameter: flag: integer 0-7 required')
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    if not isinstance(card_ids, list) or not all(
+            isinstance(cid, int) and not isinstance(cid, bool) for cid in card_ids):
+        raise PlusError('invalid_param', 'invalid parameter: cardIds: ints required')
+    # dedupe (first occurrence wins) + drop unknown ids + read the REAL
+    # current flag — the same precheck contract as the scheduler pair
+    # (SPEC 16 / Deviation #8); Card.user_flag() is flags & 0b111
+    existing = []
+    for cid in dict.fromkeys(card_ids):
+        try:
+            existing.append((cid, col.get_card(cid).user_flag()))
+        except NotFoundError:
+            continue
+    pending = [cid for cid, current in existing if current != flag]
+    unchanged = [cid for cid, current in existing if current == flag]
+
+    # dry run (SPEC 15): the precheck above IS the real path's validation and
+    # it is read-only; stop before add_custom_undo_entry so undo_status()
+    # stays bit-identical
+    if dry_run:
+        return {'wouldUpdate': pending, 'unchanged': unchanged, 'undoEntry': None}
+    if not pending:
+        # data no-op: every requested card already carries the flag
+        return {'updated': [], 'unchanged': unchanged, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        # OpChangesWithCount: the backend no-op-detects on its own, so count
+        # is the cards actually changed
+        changed = col.set_user_flag_for_cards(flag, pending).count
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'bulkSetFlag failed (batch reverted): {}'.format(e))
+
+    if changed == len(pending):
+        updated = pending
+    else:
+        # backend disagreed with the precheck (never observed): re-read and
+        # report the cards that really carry the flag NOW, not the ask
+        updated = []
+        for cid in pending:
+            try:
+                if col.get_card(cid).user_flag() == flag:
+                    updated.append(cid)
+            except NotFoundError:  # pragma: no cover - handlers are serialized
+                continue
+    if changed == 0 and not updated:
+        # the op wrote nothing after all: pop the empty custom entry so the
+        # Undo menu matches undoEntry null (Deviation #7)
+        _revert_batch(col, undo_name)
+        return {'updated': [], 'unchanged': unchanged, 'undoEntry': None}
+    return {'updated': updated, 'unchanged': unchanged, 'undoEntry': undo_name}
+
+
+def _validate_single_tag(value, name):
+    if not isinstance(value, str) or not value:
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}: string required'.format(name))
+    # anki splits tags on whitespace (U+3000 included, tags.split), so a
+    # spacey value can never name one stored tag; the backend would also
+    # reject a spacey replacement with InvalidInput — refuse both up front,
+    # before any undo entry exists
+    if value.replace('\u3000', ' ').split() != [value]:
+        raise PlusError('invalid_param',
+                        'invalid parameter: {}: a single tag (no spaces) required'.format(name))
+
+
+def _tag_subtree_cut(stored, old_fold):
+    """Index of the '::' where old_fold's spelling ends inside stored, else
+    None. Candidate cuts are only stored's own '::' separators, so the slice
+    stays exact even if casefolding changed the prefix's LENGTH (the 'ß' ->
+    'ss' family) — the caller never slices by len(old_tag) blindly."""
+    for match in re.finditer('::', stored):
+        if stored[:match.start()].casefold() == old_fold:
+            return match.start()
+    return None
+
+
+def rename_tag(col, old_tag, new_tag, dry_run=False, undo_label=None):
+    """Segment-aware tag rename/move via anki's own op (SPEC 28.3).
+
+    col.tags.rename rewrites the tag AND its '::' children and matches whole
+    segments, so lab1 -> lab01 rewrites lab1::pass1 but never lab10. Stock
+    replaceTagsInAllNotes is exact-whole-tag (it would not corrupt lab10
+    either) but it STRANDS the children and writes per note with
+    skip_undo_entry — no undo at all; this is the subtree-aware, undoable
+    replacement.
+
+    Preview honesty: the backend matches with rust unicase; the preview
+    mirrors it with str.casefold(), the closest python equivalent (same
+    documented approximation as canonify_tags). The REAL run's tagsRewritten
+    is re-read from the post-op registry, so what it says is what happened.
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_RENAME_TAG
+    _validate_single_tag(old_tag, 'oldTag')
+    _validate_single_tag(new_tag, 'newTag')
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+
+    registry = col.tags.all()
+    old_fold = old_tag.casefold()
+    pairs = []
+    for stored in registry:
+        stored_fold = stored.casefold()
+        if stored_fold == old_fold:
+            pairs.append({'from': stored, 'to': new_tag})
+        elif stored_fold.startswith(old_fold + '::'):
+            cut = _tag_subtree_cut(stored, old_fold)
+            if cut is not None:
+                pairs.append({'from': stored, 'to': new_tag + stored[cut:]})
+    if not pairs:
+        # a named top-level target, like deckName: raise, never succeed-empty
+        # (the classic silent failure is a typo'd oldTag "renaming" nothing)
+        raise PlusError('not_found', 'tag was not found: {}'.format(old_tag))
+
+    # collision disclosure: targets that already exist OUTSIDE the renamed
+    # set mean the rename MERGES trees (backend behavior, deliberate)
+    from_folds = {pair['from'].casefold() for pair in pairs}
+    registry_by_fold = {}
+    for stored in registry:
+        registry_by_fold.setdefault(stored.casefold(), stored)
+    merged = []
+    for pair in pairs:
+        existing = registry_by_fold.get(pair['to'].casefold())
+        if existing is not None and existing.casefold() not in from_folds \
+                and existing not in merged:
+            merged.append(existing)
+
+    if new_tag == old_tag:
+        # byte-identical: data no-op — nothing written, undo untouched
+        # (a case-only respelling is NOT this: it is a real rename)
+        if dry_run:
+            return {'wouldRewrite': [], 'merged': [], 'undoEntry': None}
+        return {'notesUpdated': 0, 'tagsRewritten': [], 'merged': [],
+                'undoEntry': None}
+
+    # registered-but-unused gate (probe-verified): the backend renames only
+    # NOTE-CARRIED tags — when every match is a registry-only ghost (a tag
+    # whose notes were deleted), rename_tags writes nothing and leaves the
+    # registry as-is. Detect that BEFORE any undo entry exists with anki's
+    # own search (its writer escapes hostile tag names, its matcher is the
+    # same unicase engine the rename op uses; 'tag:X' matches X and X::*):
+    # popping an empty custom entry afterwards would push a phantom Redo
+    # item (the §16.2 hazard). Applied to the dry path too, so dry and real
+    # agree that nothing would be rewritten.
+    if not col.find_notes(col.build_search_string(
+            anki.collection.SearchNode(tag=old_tag))):
+        if dry_run:
+            return {'wouldRewrite': [], 'merged': merged, 'undoEntry': None}
+        return {'notesUpdated': 0, 'tagsRewritten': [], 'merged': merged,
+                'undoEntry': None}
+
+    if dry_run:
+        return {'wouldRewrite': pairs, 'merged': merged, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        # OpChangesWithCount: the backend's own changed-NOTE count
+        notes_updated = col.tags.rename(old_tag, new_tag).count
+        col.merge_undo_entries(target)
+    except InvalidInput as e:
+        # backstop for grammar drift only — the space rule is pre-validated
+        _revert_batch(col, undo_name)
+        raise PlusError('invalid_param', 'invalid parameter: newTag: {}'.format(e))
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'renameTag failed (batch reverted): {}'.format(e))
+
+    # observation, not echo: re-read the registry so the report carries the
+    # spellings that actually landed (a merge keeps the EXISTING spelling)
+    post_registry = col.tags.all()
+    post_exact = set(post_registry)
+    post_by_fold = {}
+    for stored in post_registry:
+        post_by_fold.setdefault(stored.casefold(), stored)
+    rewritten = []
+    for pair in pairs:
+        landed = post_by_fold.get(pair['to'].casefold())
+        if landed is not None and pair['from'] not in post_exact:
+            rewritten.append({'from': pair['from'], 'to': landed})
+
+    if notes_updated == 0 and not rewritten:
+        # the backend matched nothing the casefold preview thought it would
+        # (unicase drift): pop the empty entry, report the no-write truth
+        _revert_batch(col, undo_name)
+        return {'notesUpdated': 0, 'tagsRewritten': [], 'merged': merged,
+                'undoEntry': None}
+    return {'notesUpdated': notes_updated, 'tagsRewritten': rewritten,
+            'merged': merged, 'undoEntry': undo_name}
+
+
+#
+# Round-4 filtered-deck safety (SPEC 29) and empty cards (SPEC 30)
+#
+
+def _filtered_home_breakdown(col, rows):
+    """{home deck name: count} from (odid, count) rows, name-aggregated.
+
+    Deck names are unique so aggregation only matters for the damage case:
+    a dangling odid renders as anki's own '[no deck]' label, and two of
+    those must not clobber each other."""
+    breakdown = {}
+    for odid, count in rows:
+        key = col.decks.name(odid)
+        breakdown[key] = breakdown.get(key, 0) + count
+    return breakdown
+
+
+def filtered_deck_report(col, deck_name=None):
+    """Read-only census of filtered decks (SPEC 29.1).
+
+    The pre-export probe: exportDeckApkg's package gather follows cards'
+    CURRENT did, so cards visiting a filtered deck are omitted or shipped
+    damaged (see export_deck_apkg). This report answers 'which filtered
+    decks hold whose cards right now' — unscoped for the whole collection,
+    or scoped to one home subtree, where its totalCards equals the HOME-side
+    count the export's fail-closed check trips on (the export check also
+    flags foreign-homed cards sitting in filters nested inside the scope,
+    which a home-scoped report does not count — the unscoped rows show
+    them). Card-location selects are read-only and explicitly allowed by
+    SPEC 29.1.
+    """
+    if deck_name is not None and (not isinstance(deck_name, str) or not deck_name):
+        raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
+    filters = sorted((deck['name'], deck['id'])
+                     for deck in col.decks.all() if deck.get('dyn'))
+    scope_ids = None
+    if deck_name is not None:
+        did = col.decks.id_for_name(deck_name)
+        if did is None:
+            raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+        if col.decks.is_filtered(did):
+            # a filtered deck has no children and never appears in odid, so
+            # subtree-scoping it would report nothing; the useful reading of
+            # 'scope this report to deck X' when X IS a filter is X's own row
+            filters = [(name, fid) for name, fid in filters if fid == did]
+        else:
+            scope_ids = ','.join(str(int(x))
+                                 for x in col.decks.deck_and_child_ids(did))
+
+    rows = []
+    total = 0
+    for name, filter_did in filters:
+        if scope_ids is None:
+            breakdown_rows = col.db.all(
+                'select odid, count() from cards where did = ? group by odid',
+                filter_did)
+        else:
+            breakdown_rows = col.db.all(
+                'select odid, count() from cards where did = ? and odid in ({}) '
+                'group by odid'.format(scope_ids), filter_did)
+        breakdown = _filtered_home_breakdown(col, breakdown_rows)
+        count = sum(breakdown.values())
+        if scope_ids is not None and count == 0:
+            # scoped mode reports exposure, not existence: a filter holding
+            # none of the scoped deck's cards is noise there (unscoped mode
+            # keeps empty filters — their existence is the information)
+            continue
+        rows.append({'filteredDeck': name, 'filteredDeckId': filter_did,
+                     'cardCount': count, 'homeDecks': breakdown})
+        total += count
+    return {'filteredDecks': rows, 'totalCards': total}
+
+
+def empty_filtered_deck(col, deck_name=None, deck_id=None, dry_run=False,
+                        undo_label=None):
+    """Send every card in ONE filtered deck home (SPEC 29.2).
+
+    The API equivalent of the filtered deck's own Empty action
+    (col.sched.empty_filtered_deck): cards return to did=odid, odid=0,
+    scheduling intact. This is the remediation step the export refusal
+    points at. The homeDecks breakdown is read BEFORE the op (afterwards
+    odid is 0), and 'returned' is cross-checked against the post-op count.
+
+    The already-empty case is gated BEFORE any undo entry exists: the
+    backend happily writes an entry for an empty op (probe-verified), and
+    popping an empty custom entry afterwards would push a phantom Redo
+    item (the SPEC 16.2 hazard renameTag's ghost gate answers the same way).
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_EMPTY_FILTERED
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    if (deck_name is None) == (deck_id is None):
+        raise PlusError('invalid_param',
+                        'invalid parameter: exactly one of deckName/deckId is required')
+    if deck_name is not None:
+        if not isinstance(deck_name, str) or not deck_name:
+            raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
+        did = col.decks.id_for_name(deck_name)
+        if did is None:
+            raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+    else:
+        if isinstance(deck_id, bool) or not isinstance(deck_id, int):
+            raise PlusError('invalid_param', 'invalid parameter: deckId: integer required')
+        did = deck_id
+    deck = col.decks.get(did, default=False)
+    if deck is None:
+        raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_id))
+    if not deck.get('dyn'):
+        # pre-checked so the refusal is coded and no undo entry ever exists;
+        # the backend's own FilteredDeckError stays as a drift backstop
+        raise PlusError('validation_error',
+                        'deck is not a filtered deck: {}'.format(deck['name']))
+
+    home_decks = _filtered_home_breakdown(col, col.db.all(
+        'select odid, count() from cards where did = ? group by odid', did))
+    pending = sum(home_decks.values())
+
+    if dry_run:
+        return {'wouldReturn': pending, 'homeDecks': home_decks, 'undoEntry': None}
+    if pending == 0:
+        return {'returned': 0, 'homeDecks': {}, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        col.sched.empty_filtered_deck(did)
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'emptyFilteredDeck failed (batch reverted): {}'.format(e))
+
+    # observation, not echo: the op returns plain OpChanges (no count), so
+    # 'returned' is the pre-op residency minus whatever is still there
+    remaining = col.db.scalar('select count() from cards where did = ?', did) or 0
+    return {'returned': pending - remaining, 'homeDecks': home_decks,
+            'undoEntry': undo_name}
+
+
+def _empty_cards_index(col, report):
+    """{cardId: (ord, home deck id)} for every card in an EmptyCardsReport.
+
+    Home is odid-aware (a card visiting a filtered deck belongs to its home
+    deck — the same rule as the SPEC 20 scope select). Handlers are
+    serialized (SPEC 3.1), so the select sees exactly the report's state."""
+    all_cids = [cid for note in report.notes for cid in note.card_ids]
+    index = {}
+    for start in range(0, len(all_cids), SQL_IN_CHUNK):
+        chunk = all_cids[start:start + SQL_IN_CHUNK]
+        for cid, ord_, home in col.db.all(
+                'select id, ord, (case when odid != 0 then odid else did end) '
+                'from cards where id in ({})'.format(
+                    ','.join(str(int(c)) for c in chunk))):
+            index[cid] = (ord_, home)
+    return index
+
+
+def get_empty_cards(col, deck_name=None):
+    """Anki's Tools > Empty Cards report as data (SPEC 30.1). Read-only.
+
+    col.get_empty_cards() is a pure backend read (probe: undo status
+    byte-identical, stable across calls). The report's card_ids come in the
+    backend's own order — the dialog keeps card_ids[0] of an all-empty
+    note, so that order IS the protection contract and is preserved here.
+    """
+    if deck_name is not None and (not isinstance(deck_name, str) or not deck_name):
+        raise PlusError('invalid_param', 'invalid parameter: deckName: string required')
+    scope = None
+    if deck_name is not None:
+        did = col.decks.id_for_name(deck_name)
+        if did is None:
+            raise PlusError('deck_not_found', 'deck was not found: {}'.format(deck_name))
+        scope = {int(x) for x in col.decks.deck_and_child_ids(did)}
+
+    report = col.get_empty_cards()
+    index = _empty_cards_index(col, report)
+    notes = []
+    for note in report.notes:
+        cids = list(note.card_ids)
+        if scope is not None and not any(index[cid][1] in scope for cid in cids):
+            # deck scoping is at-least-one-empty-card-homed-here; a listed
+            # note still reports ALL its empty cards (deletion is per note,
+            # and empty siblings can live in other decks)
+            continue
+        if note.will_delete_note:
+            protected = cids[0]
+            will_delete = cids[1:]
+        else:
+            protected = None
+            will_delete = cids
+        notes.append({'noteId': note.note_id,
+                      'ords': [index[cid][0] for cid in cids],
+                      'willDeleteCards': will_delete,
+                      'protectedCard': protected})
+    return {'notes': notes, 'total': len(notes)}
+
+
+def delete_empty_cards(col, note_ids=None, dry_run=False, undo_label=None):
+    """Delete empty cards like anki's own dialog would (SPEC 30.2).
+
+    Mirrors aqt's EmptyCardsDialog._delete_cards with keep_notes=True (the
+    dialog's shipped default): an all-empty note keeps card_ids[0] and the
+    note itself is never deleted — remove_cards_and_orphaned_notes only
+    removes a note when its LAST card goes, which the protection makes
+    impossible, and notesPreserved post-checks exactly that claim.
+    """
+    undo_name = sanitize_undo_label(undo_label) or UNDO_DELETE_EMPTY
+    if not isinstance(dry_run, bool):
+        raise PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+    if note_ids is not None and (not isinstance(note_ids, list) or not all(
+            isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids)):
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
+
+    report = col.get_empty_cards()
+    by_note = {note.note_id: note for note in report.notes}
+
+    skipped = []
+    if note_ids is None:
+        targets = list(report.notes)
+    else:
+        # dedupe, first occurrence wins (the SPEC 16 precheck contract);
+        # skipped is keyed noteId (the SPEC 21 precedent) — requested ids
+        # the report does not cover are reported, never silently dropped
+        targets = []
+        for nid in dict.fromkeys(note_ids):
+            note = by_note.get(nid)
+            if note is not None:
+                targets.append(note)
+                continue
+            try:
+                col.get_note(nid)
+                skipped.append({'noteId': nid, 'reason': 'no empty cards'})
+            except NotFoundError:
+                skipped.append({'noteId': nid, 'reason': 'note was not found'})
+
+    to_delete = []
+    protected = []
+    notes_affected = 0
+    for note in targets:
+        cids = list(note.card_ids)
+        if note.will_delete_note:
+            # the dialog's keep_notes rule: leave the first card
+            protected.append({'noteId': note.note_id, 'cardId': cids[0]})
+            deletable = cids[1:]
+        else:
+            deletable = cids
+        if deletable:
+            to_delete.extend(deletable)
+            notes_affected += 1
+
+    if dry_run:
+        return {'wouldDelete': to_delete, 'notesAffected': notes_affected,
+                'protected': protected, 'skipped': skipped, 'undoEntry': None}
+    if not to_delete:
+        # data no-op: nothing deletable (no empty cards at all, or only
+        # protected last cards) — nothing written, undo stack untouched
+        return {'cardsDeleted': 0, 'deletedCardIds': [], 'notesAffected': 0,
+                'protected': protected, 'notesPreserved': True,
+                'skipped': skipped, 'undoEntry': None}
+
+    target = col.add_custom_undo_entry(undo_name)
+    try:
+        # the dialog's own removal op; OpChangesWithCount = cards removed
+        count = col.remove_cards_and_orphaned_notes(to_delete).count
+        col.merge_undo_entries(target)
+    except Exception as e:
+        _revert_batch(col, undo_name)
+        raise PlusError('batch_reverted',
+                        'deleteEmptyCards failed (batch reverted): {}'.format(e))
+
+    if count == len(to_delete):
+        deleted = to_delete
+    else:
+        # backend disagreed with the report (never observed): re-read which
+        # of the asked cards are really gone and report those (SPEC 27.4)
+        survivors = set()
+        for start in range(0, len(to_delete), SQL_IN_CHUNK):
+            chunk = to_delete[start:start + SQL_IN_CHUNK]
+            survivors.update(col.db.list(
+                'select id from cards where id in ({})'.format(
+                    ','.join(str(int(c)) for c in chunk))))
+        deleted = [cid for cid in to_delete if cid not in survivors]
+        deleted_set = set(deleted)
+        notes_affected = 0
+        for note in targets:
+            cids = list(note.card_ids)
+            deletable = cids[1:] if note.will_delete_note else cids
+            if any(cid in deleted_set for cid in deletable):
+                notes_affected += 1
+
+    if not deleted:
+        # the op wrote nothing after all: pop the empty custom entry so the
+        # Undo menu matches undoEntry null (Deviation #7)
+        _revert_batch(col, undo_name)
+        return {'cardsDeleted': 0, 'deletedCardIds': [], 'notesAffected': 0,
+                'protected': protected, 'notesPreserved': True,
+                'skipped': skipped, 'undoEntry': None}
+
+    # the core promise, POST-CHECKED (the renameDeck configPreserved
+    # precedent): every note we kept a last card for must still exist
+    notes_preserved = True
+    protected_nids = [entry['noteId'] for entry in protected]
+    if protected_nids:
+        found = set()
+        for start in range(0, len(protected_nids), SQL_IN_CHUNK):
+            chunk = protected_nids[start:start + SQL_IN_CHUNK]
+            found.update(col.db.list(
+                'select id from notes where id in ({})'.format(
+                    ','.join(str(int(n)) for n in chunk))))
+        notes_preserved = all(nid in found for nid in protected_nids)
+
+    return {'cardsDeleted': len(deleted), 'deletedCardIds': deleted,
+            'notesAffected': notes_affected, 'protected': protected,
+            'notesPreserved': notes_preserved, 'skipped': skipped,
+            'undoEntry': undo_name}
 
 
 #

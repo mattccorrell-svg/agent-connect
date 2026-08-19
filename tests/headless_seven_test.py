@@ -115,10 +115,13 @@ def test0_actions_registered():
     assert "checkDeckIntegrity" in core.PLUS_ACTIONS
     assert "bulkReplaceInFields" in core.PLUS_ACTIONS
     assert "undoStatus" in core.PLUS_ACTIONS
-    # 27 = 24 + round-2 SPEC 22/23 (mediaExists, storeMediaFilesBulk)
+    # 34 = 24 + round-2 SPEC 22/23 (mediaExists, storeMediaFilesBulk)
     #         + round-3 SPEC 26 (undoStatus)
-    assert len(core.PLUS_ACTIONS) == 27, core.PLUS_ACTIONS
-    assert len(set(core.PLUS_ACTIONS)) == 27, "duplicate action names"
+    #         + round-4 SPEC 28 (renameDeck, bulkSetFlag, renameTag)
+    #         + round-4 SPEC 29/30 (filteredDeckReport, emptyFilteredDeck,
+    #           getEmptyCards, deleteEmptyCards)
+    assert len(core.PLUS_ACTIONS) == 34, core.PLUS_ACTIONS
+    assert len(set(core.PLUS_ACTIONS)) == 34, "duplicate action names"
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
     # summaries lockstep (SPEC 4.9): every action documented, no strays
     assert set(core.PLUS_ACTION_SUMMARIES) == set(core.PLUS_ACTIONS), (

@@ -127,6 +127,10 @@ def test1_error_code_vocabulary():
     expected = {
         "not_found": False, "invalid_param": False, "deck_not_found": False,
         "duplicate": False, "unsupported_format": False, "io_error": False,
+        # revision 17 slice 2: exportDeckApkg's fail-closed refusal (SPEC
+        # 17/29.3) — born reachable, not retryable (the caller must change
+        # something: empty the filter or pass allowFilteredOmission)
+        "cards_in_filtered_decks": False,
         "batch_reverted": False, "collection_unavailable": True,
         "sync_in_progress": True, "not_logged_in": False, "auth_failed": False,
         "offline": True, "full_sync_required": False, "network_error": True,
@@ -702,10 +706,10 @@ def test12_plusinfo_returns_and_error_codes():
     finally:
         util_mod.setting = orig
 
-    # (i) 'returns' for all 27 actions, no strays, none empty
+    # (i) 'returns' for all 34 actions, no strays, none empty
     assert set(pkg_core.PLUS_ACTION_RETURNS) == set(pkg_core.PLUS_ACTIONS), \
         sorted(set(pkg_core.PLUS_ACTION_RETURNS) ^ set(pkg_core.PLUS_ACTIONS))
-    assert len(pkg_core.PLUS_ACTIONS) == 27, len(pkg_core.PLUS_ACTIONS)
+    assert len(pkg_core.PLUS_ACTIONS) == 34, len(pkg_core.PLUS_ACTIONS)
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
         assert set(entry) == {"summary", "params", "returns"}, (name, sorted(entry))
@@ -738,8 +742,12 @@ def test12_plusinfo_returns_and_error_codes():
     # the reserved-vs-reachable split is the thing ASK 4 asked to be honest
     # about: a caller must not build retry logic on an unreachable code
     reserved = {c for c, e in codes.items() if not e["reachable"]}
-    assert reserved == {"duplicate", "io_error", "offline", "full_sync_required"}, \
+    # revision 17: 'duplicate' moved to reachable (renameDeck's occupied-name
+    # refusal, SPEC 28.1) — a deliberate contract change, so the lock moves
+    assert reserved == {"io_error", "offline", "full_sync_required"}, \
         sorted(reserved)
+    assert codes["duplicate"]["reachable"] is True
+    assert codes["duplicate"]["retryable"] is False
     for code in reserved:
         assert "RESERVED" in codes[code]["meaning"], code
     # sync_in_progress moved from reserved to reachable in revision 13
