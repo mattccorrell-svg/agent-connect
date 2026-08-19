@@ -293,6 +293,7 @@ def test3_bulk_update_unchanged_buckets():
     out = core.bulk_update_note_fields(
         col, [{"id": n1, "fields": {"Front": "keep-front", "Back": "keep-back"}}])
     assert out == {"updated": [], "unchanged": [n1], "skipped": [],
+                   "suspensionPreserved": True, "schedulingPreserved": True,
                    "undoEntry": None}, out
     assert undo_snap() == snap, "identical write touched the undo stack"
     assert field_value(n1, "Front") == "keep-front"
@@ -302,6 +303,7 @@ def test3_bulk_update_unchanged_buckets():
     out = core.bulk_update_note_fields(
         col, [{"id": n2, "fields": {"Front": "aaa", "Back": "new"}}])
     assert out == {"updated": [n2], "unchanged": [], "skipped": [],
+                   "suspensionPreserved": True, "schedulingPreserved": True,
                    "undoEntry": core.UNDO_BULK_UPDATE}, out
     assert field_value(n2, "Back") == "new"
     assert field_value(n2, "Front") == "aaa"
@@ -327,6 +329,7 @@ def test3_bulk_update_unchanged_buckets():
     real = core.bulk_update_note_fields(col, batch)
     assert real == {"updated": [n3], "unchanged": [n1],
                     "skipped": dry["skipped"],
+                    "suspensionPreserved": True, "schedulingPreserved": True,
                     "undoEntry": core.UNDO_BULK_UPDATE}, real
     assert real["updated"] == dry["wouldUpdate"], (real, dry)
     assert field_value(n3, "Back") == "after"

@@ -20,6 +20,8 @@ These two keys are *defaults* only — an explicit parameter on the call always 
 - **`preserveSuspendedOnReschedule`** — default `true`. `bulkSetDueDate` snapshots which target cards are suspended, reschedules, then **re-suspends exactly the cards Anki revived**, all inside the action's own undo entry (one Ctrl+Z reverts both halves). The response reports both `unsuspended` (what Anki revived mid-call) and `resuspended` (what was put back). Set to `false`, or pass `preserveSuspended: false` on the call, for stock Anki behavior. Buried cards are deliberately **not** re-buried.
 - **`suspendNewCards`** — default `false` (stock Anki behavior: new cards are live). Set to `true`, or pass `suspend: true` on the call, and `bulkAddNotes` leaves the cards it creates **suspended**, in the same undo entry as the adds, listing them in `suspended`.
 
+The RESOLVED value of both keys on this install — and whether each came from this config or the shipped default — is served machine-readably by the `plusInfo` action as `effectiveConfig`, through the same code path the two write actions use. `source: "user_config"` means the key sits in your saved config; `"shipped_default"` means the shipped value is in force. Saving this config dialog stores every key at once, so after one save both keys report `user_config`.
+
 A value that is not a JSON boolean is ignored and the documented default above applies (a config typo must not fail a write action).
 
 ### Environment variables

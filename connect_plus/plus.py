@@ -49,30 +49,77 @@ def _signature_string(method):
     return ', '.join(parts)
 
 
+def _resolve_suspension_config(config_key, documented_default):
+    """(value, source) for a SPEC 27 config key when the caller said nothing.
+
+    The config-fallback ladder of _resolve_suspension_param, split out so
+    plusInfo's effectiveConfig (SPEC 31.3) reports — through this same code,
+    by construction — the value the next parameterless write will use.
+
+    value: read config.json through the same util.setting() accessor
+    webBindPort uses. util.setting already falls back to util.DEFAULT_CONFIG
+    when the key is missing, so an OLDER config.json that predates these keys
+    still resolves to the documented default. The except branch covers the
+    other ways that read can fail (no aqt.mw yet — headless —, an unreadable
+    config), and a hand-edited non-boolean value falls back too — a config
+    typo must not fail a write action; the fallback is documented in SPEC 27
+    / config.md rather than being a silent surprise.
+
+    source: 'user_config' ONLY when the user's SAVED config — meta.json's
+    'config' dict, probed via addonManager.addonMeta — carries the key with
+    a usable boolean. Deliberately NOT addonManager.getConfig: getConfig
+    returns the SHIPPED config.json defaults with the user's meta.json keys
+    merged over them (aqt 25.09.4 aqt/addons.py), and this add-on ships both
+    SPEC 27 keys in config.json, so a merged-view probe would see a boolean
+    for every key on every intact install and claim 'user_config'
+    unconditionally (the round-5 review's blocker). Everything else is
+    'shipped_default': key absent from the user store (util.setting then
+    answers the shipped value — config.json's, or util.DEFAULT_CONFIG for an
+    older config.json — not a user choice), config unreadable, no aqt.mw
+    (headless: the value reported is the shipped default, which a lockstep
+    test holds equal to the core constant), or a non-boolean typo, which the
+    value resolution above deliberately ignored. Honest caveat (SPEC 31.3):
+    saving Anki's add-on config dialog writes the ENTIRE merged dict into
+    meta.json (writeConfig), so after any dialog save both keys are
+    genuinely user-stored and report 'user_config' from then on.
+    """
+    try:
+        configured = util.setting(config_key)
+    except Exception:
+        return documented_default, 'shipped_default'
+    if not isinstance(configured, bool):
+        return documented_default, 'shipped_default'
+    try:
+        manager = util.aqt.mw.addonManager
+        stored = manager.addonMeta(
+            manager.addonFromModule(util.__name__)).get('config')
+    except Exception:
+        stored = None
+    if isinstance(stored, dict) and isinstance(stored.get(config_key), bool):
+        return configured, 'user_config'
+    return configured, 'shipped_default'
+
+
+def _effective_config_entry(config_key, documented_default):
+    """One plusInfo effectiveConfig row (SPEC 31.3): {value, source}."""
+    value, source = _resolve_suspension_config(config_key, documented_default)
+    return {'value': value, 'source': source}
+
+
 def _resolve_suspension_param(value, config_key, documented_default):
     """Resolve a SPEC 27 suspension-control parameter to a concrete value.
 
     Precedence: an explicit parameter ALWAYS wins over config, and config wins
     over the documented default. A non-None value is passed through untouched
     — including a bad one (say the string "yes"), so core raises the normal
-    [invalid_param] instead of this layer silently swallowing it.
-
-    None means "nothing said by the caller": read config.json through the same
-    util.setting() accessor webBindPort uses. util.setting already falls back
-    to util.DEFAULT_CONFIG when the key is missing, so an OLDER config.json
-    that predates these keys still resolves to the documented default. The
-    except branch covers the other ways that read can fail (no aqt.mw yet, an
-    unreadable config), and a hand-edited non-boolean value falls back too —
-    a config typo must not fail a write action, and the fallback is documented
-    in SPEC 27 / config.md rather than being a silent surprise.
+    [invalid_param] instead of this layer silently swallowing it. None means
+    "nothing said by the caller": defer to _resolve_suspension_config — the
+    same ladder plusInfo's effectiveConfig reports, so the report and the
+    writes cannot drift.
     """
     if value is not None:
         return value
-    try:
-        configured = util.setting(config_key)
-    except Exception:
-        return documented_default
-    return configured if isinstance(configured, bool) else documented_default
+    return _resolve_suspension_config(config_key, documented_default)[0]
 
 
 #
@@ -1227,6 +1274,12 @@ class PlusMixin:
                 'params': _signature_string(getattr(self, name)),
                 'returns': core.PLUS_ACTION_RETURNS.get(name, ''),
             }
+            # 'preserves' (SPEC 31.1, revision 18): what a side-effectful
+            # action does NOT touch. Only actions with side effects carry
+            # the key — read-only actions' summaries already say read-only.
+            preserves = core.PLUS_ACTION_PRESERVES.get(name)
+            if preserves is not None:
+                actionDocs[name]['preserves'] = preserves
         # errorCodes (revision 13): the full wire vocabulary with retryable
         # read from the single source of truth (core.PLUS_ERROR_CODES) plus
         # reachable/meaning, so a client can build its retry table at runtime
@@ -1251,6 +1304,22 @@ class PlusMixin:
             'actions': list(core.PLUS_ACTIONS),
             'actionDocs': actionDocs,
             'errorCodes': errorCodes,
+            # effectiveConfig (SPEC 31.3, revision 18): the SPEC 27 knobs
+            # RESOLVED for this install at call time, through the very ladder
+            # the write actions use (_resolve_suspension_config), so what
+            # this reports is by construction what the next parameterless
+            # bulkAddNotes/bulkSetDueDate will do. Headless (no aqt.mw): the
+            # shipped defaults, source 'shipped_default'. Config reads only —
+            # still works before a profile is open (addonManager needs no
+            # collection).
+            'effectiveConfig': {
+                core.CONFIG_SUSPEND_NEW_CARDS: _effective_config_entry(
+                    core.CONFIG_SUSPEND_NEW_CARDS,
+                    core.DEFAULT_SUSPEND_NEW_CARDS),
+                core.CONFIG_PRESERVE_SUSPENDED: _effective_config_entry(
+                    core.CONFIG_PRESERVE_SUSPENDED,
+                    core.DEFAULT_PRESERVE_SUSPENDED_ON_RESCHEDULE),
+            },
             # where the '[code] ' prefix and the errorCode/retryable response
             # fields do and do NOT apply (Plus + unknown-action vs upstream)
             'errorPrefixNote': core.PLUS_ERROR_PREFIX_NOTE,

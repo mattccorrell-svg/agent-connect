@@ -523,12 +523,14 @@ def test6_dry_run_update_and_tags():
                          "skipped": want_skipped, "undoEntry": None}, rerun_dry
     rerun = core.bulk_update_note_fields(col, batch)
     assert rerun == {"updated": [], "unchanged": [n1], "skipped": want_skipped,
+                     "suspensionPreserved": True, "schedulingPreserved": True,
                      "undoEntry": None}, rerun
     assert undo_snap() == snap, "no-op update touched the undo stack"
     # tags-only no-op: replacing the tag list with its current value
     tags_now = col.get_note(n1).tags
     rerun = core.bulk_update_note_fields(col, [{"id": n1, "tags": list(tags_now)}])
     assert rerun == {"updated": [], "unchanged": [n1], "skipped": [],
+                     "suspensionPreserved": True, "schedulingPreserved": True,
                      "undoEntry": None}, rerun
     assert undo_snap() == snap, "tags-only no-op touched the undo stack"
 

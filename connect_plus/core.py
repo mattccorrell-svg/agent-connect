@@ -40,14 +40,17 @@ import anki.utils
 from anki.errors import (Interrupted, InvalidInput, NetworkError,
                          NotFoundError, SearchError, SyncError, SyncErrorKind)
 
-PLUS_VERSION = "1.3.0"
+PLUS_VERSION = "1.3.1"
 # The SPEC revision this code implements, kept in lockstep with SPEC.md's
 # "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
 # locked). Revision 15 is the first revision that changed what two actions DO
 # to the collection by default rather than only what they return, so plusInfo
 # needs ONE machine-readable field that a caching client can branch on:
 # PLUS_VERSION moves on behavior changes, specRevision names the contract.
-PLUS_SPEC_REVISION = 17
+# Revision 18 (round-5 field feedback) is docs + additive keys + dry-run
+# fields with NO behavior change, so PLUS_VERSION moved only its PATCH
+# (1.3.0 -> 1.3.1); the minor still moves only with default-behavior changes.
+PLUS_SPEC_REVISION = 18
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -106,7 +109,7 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
 # discoverability surface for LLM callers. Keep every PLUS_ACTIONS name
 # present here; param signatures are read live off the plus.py wrappers.
 PLUS_ACTION_SUMMARIES = {
-    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview). Optional suspended-draft mode (SPEC 27): pass suspend=true (or set config key 'suspendNewCards', ships false) and the cards this batch creates are left SUSPENDED inside the same undo entry and listed in 'suspended' — a generated draft never enters review before a human unsuspends it.",
+    "bulkAddNotes": "Add many notes as one undoable batch (duplicate precheck, atomic revert, dryRun preview). Optional suspended-draft mode (SPEC 27): pass suspend=true (or set config key 'suspendNewCards', ships false) and the cards this batch creates are left SUSPENDED inside the same undo entry and listed in 'suspended' — a generated draft never enters review before a human unsuspends it. plusInfo's effectiveConfig reports this install's RESOLVED value of 'suspendNewCards'.",
     "bulkUpdateNoteFields": "Update fields and/or replace tags on many notes as one undoable batch; byte-identical no-ops are not written and are reported in 'unchanged'. dryRun=true with diff=true adds a per-field before/after preview capped at maxPreview.",
     "bulkAddTags": "Add tags to many notes as one undoable batch; only notes actually changed are written and reported in 'updated'.",
     "addImageOcclusionNote": "Create a native Image Occlusion note from an image path or base64 data plus normalized 0-1 rects.",
@@ -122,7 +125,7 @@ PLUS_ACTION_SUMMARIES = {
     "mediaExists": "Membership probe: which of these bare media filenames exist in the media folder (read-only, input order; malformed/path-y names report exists:false). actualName reveals the true stored spelling when the filesystem matched case-insensitively (macOS/Windows) — a name that only differs in case will 404 on AnkiWeb/Linux/iOS.",
     "storeMediaFilesBulk": "Store many media files (base64 data or absolute path) in one call; per-item {requested, actual} makes Anki's dedup/rename decision visible, {requested, error} on failures, input order.",
     "bulkSuspend": "Suspend or unsuspend cards as one undoable batch; changedIds lists the cards actually written.",
-    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'preserveSuspended' defaults to TRUE (config key 'preserveSuspendedOnReschedule'), so the cards it revived are RE-SUSPENDED inside the same undo entry and listed in 'resuspended' (buried cards are deliberately NOT re-buried). Pass preserveSuspended=false (or flip the config key) for stock behavior. It also always writes (no no-op suppression: '1-7' is nondeterministic by design); dryRun=true predicts changedIds and the whole resurrection/re-suspension set without writing anything.",
+    "bulkSetDueDate": "Reschedule cards' due dates ('0', '1-7', '3!') as one undoable batch. WARNING: Anki's set_due_date RESURRECTS suspended and buried cards — every targeted card becomes a normal review card; the ids it revived are reported in 'unsuspended'/'unburied'. DELIBERATE DEVIATION FROM ANKI (SPEC 27): 'preserveSuspended' defaults to config key 'preserveSuspendedOnReschedule' (SHIPS true; plusInfo's effectiveConfig reports this install's resolved value), so the cards it revived are RE-SUSPENDED inside the same undo entry and listed in 'resuspended' (buried cards are deliberately NOT re-buried). Pass preserveSuspended=false (or flip the config key) for stock behavior. It also always writes (no no-op suppression: '1-7' is nondeterministic by design); dryRun=true predicts changedIds and the whole resurrection/re-suspension set without writing anything.",
     "exportDeckApkg": "Export a deck (and its subdecks) to a .apkg file, never overwriting. FAIL-CLOSED since revision 17 (SPEC 29.3): if any card whose HOME deck is inside the export scope currently sits in a filtered deck, OR any filtered deck nested inside the scope holds cards homed OUTSIDE it, the call refuses with [cards_in_filtered_decks] — a deck-scoped .apkg silently OMITS every note whose cards are all in out-of-scope filtered decks, ships the rest of the displaced cards scheduling-reset, and ships nested filters' FOREIGN notes into the filter recreated as a regular deck (a real class deck nearly shipped missing 141 cards / 96 notes this way). Run emptyFilteredDeck on the named decks first, or pass allowFilteredOmission=true to export anyway with the damage itemized in 'warnings' (always present, [] on a clean export).",
     "syncStatus": "Read-only sync probe: login, local dirtiness, server-required kind, async job state.",
     "syncNow": "Start a normal AnkiWeb sync as a background job (never full-sync, never dialogs); poll syncStatus.",
@@ -139,7 +142,7 @@ PLUS_ACTION_SUMMARIES = {
     "emptyFilteredDeck": "Send every card in ONE filtered deck back to its home deck (the API equivalent of the deck's own Empty action, col.sched.empty_filtered_deck) as one undoable op — the remediation step exportDeckApkg's [cards_in_filtered_decks] refusal points at; stock AnkiConnect has no way to do this. Exactly one of deckName/deckId. Reports the homeDecks breakdown of what went home; emptying an already-empty filtered deck is a reported no-op (nothing written). dryRun previews the same numbers.",
     "getEmptyCards": "Anki's Tools > Empty Cards report as data (read-only): per note, the empty cards' ids and ordinals, exactly which of them deleteEmptyCards would delete, and the one card it would PROTECT when every card of the note is empty (deletion never removes a note's last card — anki's own dialog rule). Optional deckName scopes to notes with at least one empty card homed in that subtree. checkDeckIntegrity's clozeCardMismatch DETECTS the drift; this is the actionable report.",
     "deleteEmptyCards": "Delete empty cards as one undoable batch, honoring the same protection as anki's own Empty Cards dialog with 'keep notes' on: an all-empty note keeps its first card (reported in 'protected') and the note itself is NEVER deleted — notesPreserved post-checks that. noteIds=null acts on everything the live report finds; requested ids without empty cards land in skipped with a reason. dryRun previews the exact card ids.",
-    "plusInfo": "Name/version/specRevision/action list plus per-action actionDocs (summary + params + returns), an 'errorCodes' map and a 'recipes' list of named call patterns; works before a profile is open.",
+    "plusInfo": "Name/version/specRevision/action list plus per-action actionDocs (summary + params + returns, plus 'preserves' on side-effectful actions: what the action does NOT touch), an 'errorCodes' map, 'effectiveConfig' (the SPEC 27 knobs resolved for THIS install at call time, each {value, source}), and a 'recipes' list of named call patterns; works before a profile is open.",
 }
 
 # plusInfo actionDocs 'returns' (SPEC 4.9, revision 13 — round-3 field feedback
@@ -155,14 +158,22 @@ PLUS_ACTION_RETURNS = {
     "bulkAddNotes":
         "{added: [noteId], suspended: [cardId], skipped: [{index, reason}], undoEntry: str|null} "
         "— 'suspended' is ALWAYS present and lists the cards this call left SUSPENDED (SPEC 27: "
-        "the 'suspend' param defaults to true, so a successful add normally returns a non-empty "
-        "list; a non-empty 'added' with 'suspended': [] means suspension was switched off). "
+        "the 'suspend' param defaults to config key 'suspendNewCards', which SHIPS false — so a "
+        "stock install returns [] here, and a non-empty list means the caller passed suspend=true "
+        "or this install's config switched the key on; plusInfo's effectiveConfig reports the "
+        "resolved value). "
         "dryRun=true instead returns {wouldAdd: int, wouldSuspend: bool, skipped: [{index, "
         "reason}], undoEntry: null} — wouldSuspend is the resolved DECISION, not a count, because "
         "card ids do not exist until a real add.",
     "bulkUpdateNoteFields":
-        "{updated: [noteId], unchanged: [noteId], skipped: [{index, reason}], undoEntry: str|null} — "
-        "dryRun=true returns {wouldUpdate: [noteId], unchanged, skipped, undoEntry: null}, and "
+        "{updated: [noteId], unchanged: [noteId], skipped: [{index, reason}], suspensionPreserved: "
+        "bool, schedulingPreserved: bool, undoEntry: str|null} — suspensionPreserved/"
+        "schedulingPreserved (SPEC 31.2) are POST-CHECKS, not promises: the written notes' cards "
+        "(queue, due, ivl) are snapshotted before the writes and re-read after, in the same call; "
+        "false means scheduling/suspension state actually moved (a field edit never should — "
+        "treat it as an alarm). Both always present on the real response (true on a zero-write "
+        "batch). dryRun=true returns {wouldUpdate: [noteId], unchanged, skipped, undoEntry: null} "
+        "— no post-check keys, nothing was written — and "
         "dryRun+diff=true adds {preview: [{noteId, field, before, after}], previewTruncated: bool} "
         "where field is a notetype field name or the literal '__tags__' for a tags-only change.",
     "bulkAddTags":
@@ -224,8 +235,9 @@ PLUS_ACTION_RETURNS = {
         "resuspended: [cardId], undoEntry: str|null} — all three id lists are ALWAYS present ([] "
         "when empty). unsuspended/unburied list the cards this call RESURRECTED (anki's "
         "set_due_date turns suspended and buried cards into normal review cards); 'resuspended' "
-        "lists the ones it then PUT BACK because preserveSuspended was on (SPEC 27, default "
-        "true), re-read from the post-op queues. They are DURING-the-call facts, not final state: "
+        "lists the ones it then PUT BACK because preserveSuspended was on (SPEC 27: config key "
+        "'preserveSuspendedOnReschedule', ships true — plusInfo's effectiveConfig has this "
+        "install's resolved value), re-read from the post-op queues. They are DURING-the-call facts, not final state: "
         "the cards left revived are unsuspended MINUS resuspended, and buried cards are never "
         "re-buried. This action always writes; it never suppresses no-ops. dryRun=true instead "
         "returns {wouldChange: int, wouldChangeIds: [cardId], wouldUnsuspend: [cardId], "
@@ -278,7 +290,11 @@ PLUS_ACTION_RETURNS = {
         "unless includeOrphanMedia=true.",
     "bulkReplaceInFields":
         "{changed: [noteId], matchesTotal: int, unchanged: [noteId], skipped: [{noteId, reason}], "
-        "undoEntry: str|null} — dryRun=true instead returns {wouldChange: [noteId], matchesTotal, "
+        "suspensionPreserved: bool, schedulingPreserved: bool, undoEntry: str|null} — "
+        "suspensionPreserved/schedulingPreserved (SPEC 31.2) are the same before/after "
+        "(queue, due, ivl) post-check bulkUpdateNoteFields carries: verified facts about the "
+        "written notes' cards, always present on the real response, false = alarm. dryRun=true "
+        "instead returns {wouldChange: [noteId], matchesTotal, "
         "unchanged, skipped: [{noteId, reason}], preview: [{noteId, before, after}], "
         "previewTruncated: bool, undoEntry: null}. before/after are raw field HTML. NOTE the "
         "deliberate deviation from every other action's skipped[]: entries here are keyed "
@@ -296,8 +312,14 @@ PLUS_ACTION_RETURNS = {
         "manual create/move/delete workaround is the thing that resets presets). cardsAffected "
         "counts cards homed in or visiting the subtree (odid-aware). A byte-identical newName is "
         "a data no-op: {renamed: [], configPreserved: true, cardsAffected: 0, undoEntry: null}. "
-        "dryRun=true instead returns {wouldRename: [{from, to}], cardsAffected, undoEntry: null} "
-        "— a prediction from the pre-op names; the same [duplicate]/[deck_not_found]/"
+        "REAL vs DRY key sets, side by side (SPEC 31.4): real {renamed, configPreserved, "
+        "cardsAffected, undoEntry} / dry {wouldRename, configWillBePreserved, cardsAffected, "
+        "undoEntry: null}. dryRun=true returns {wouldRename: [{from, to}], configWillBePreserved: "
+        "true, cardsAffected, undoEntry: null} — a prediction from the pre-op names. "
+        "configWillBePreserved is a STATIC contract statement (always true): preset/description/"
+        "collapse survival is a property of the in-place rename path itself (deck ids are stable "
+        "across it), NOT a post-check — the real run's configPreserved is the post-check. The "
+        "same [duplicate]/[deck_not_found]/"
         "[invalid_param] refusals (occupied target; un-normalized newName) fire on the dry "
         "path too, so the prediction is exactly what the real call would land.",
     "bulkSetFlag":
@@ -313,10 +335,16 @@ PLUS_ACTION_RETURNS = {
         "'merged' names the pre-existing tags this rename folded into (tree merge, pre-op "
         "observation). A match carried by NO note (a ghost tag left registered after its notes "
         "were deleted) is not renamed by the backend; an all-ghost match returns notesUpdated 0, "
-        "tagsRewritten [] and undoEntry null with nothing written. dryRun=true returns "
-        "{wouldRewrite: [{from, to}], merged, undoEntry: null} "
-        "— the preview that proves prefix safety: lab1 -> lab01 lists lab1 and lab1::* only, "
-        "never lab10.",
+        "tagsRewritten [] and undoEntry null with nothing written. REAL vs DRY key sets, side "
+        "by side (SPEC 31.4): real {notesUpdated, tagsRewritten, merged, undoEntry} / dry "
+        "{notesUpdated, wouldRewrite, merged, undoEntry: null}. dryRun=true returns "
+        "{notesUpdated: int, wouldRewrite: [{from, to}], merged, undoEntry: null} — the preview "
+        "that proves prefix safety: lab1 -> lab01 lists lab1 and lab1::* only, never lab10. "
+        "Dry notesUpdated is a PREDICTION: the count of notes CARRYING the affected tags "
+        "(anki's own tag search, the ghost gate's read — counted without writing), where the "
+        "real run reports the backend rename op's own changed-note count; rust-unicase vs "
+        "python-casefold drift is the only way they can differ (same documented approximation "
+        "as wouldRewrite).",
     "filteredDeckReport":
         "{filteredDecks: [{filteredDeck: str, filteredDeckId: int, cardCount: int, "
         "homeDecks: {homeDeckName: count}}], totalCards: int} — one row per filtered deck, "
@@ -364,9 +392,145 @@ PLUS_ACTION_RETURNS = {
         "{name: str, version: str, specRevision: int (the SPEC revision this build "
         "implements; version's minor moves whenever DEFAULT BEHAVIOR does, so a cached "
         "plusInfo can detect it), apiVersion: int, actions: [str], actionDocs: {action: "
-        "{summary, params, returns}}, errorCodes: {code: {retryable: bool, reachable: bool, "
-        "meaning: str}}, errorPrefixNote: str, recipes: [{name, description, example}], "
-        "docs: {plus, upstream, upstreamSource}}",
+        "{summary, params, returns, preserves?}} — 'preserves' (SPEC 31.1) appears only on "
+        "side-effectful actions and states what the action does NOT touch. errorCodes: {code: "
+        "{retryable: bool, reachable: bool, meaning: str}}, errorPrefixNote: str, "
+        "effectiveConfig: {suspendNewCards: {value: bool, source: "
+        "'user_config'|'shipped_default'}, preserveSuspendedOnReschedule: {value, source}} — "
+        "the SPEC 27 knobs RESOLVED for THIS install at call time, through the same config "
+        "ladder the write actions use (SPEC 31.3): source 'user_config' means the key sits in "
+        "the user's SAVED add-on config — saving Anki's config dialog once stores every key, "
+        "after which both legitimately report it — and with no aqt.mw (headless) both report "
+        "the shipped default. recipes: [{name, description, example}], docs: {plus, upstream, "
+        "upstreamSource}}",
+}
+
+
+# actionDocs 'preserves' (SPEC 31.1, revision 18 — round-5 field feedback: "a
+# default that changes state is a decision the API made on the caller's
+# behalf"; the flip side is that a caller must be able to see what a write
+# will NOT touch). One entry per SIDE-EFFECTFUL action: what it preserves
+# among scheduling (due/interval/queue), suspension, flags, tags, note ids,
+# GUIDs, deck assignment — and, named explicitly, what it does not. Every
+# claim is verified against the actual code path or probed on 25.09.4 (an
+# untrue 'preserves' claim is worse than none; the probes live in
+# tests/headless_round5_test.py). Read-only actions carry NO entry and
+# plusInfo omits the key for them — their summaries already say read-only.
+_ANKIHUB_SUGGEST_PRESERVES = (
+    "Local scheduling, suspension, flags, tags, note ids, GUIDs, deck assignment — the "
+    "suggestion is submitted to AnkiHub's server for review, not written into the local "
+    "collection. CAVEAT (SPEC 19, inherited from the AnkiHub add-on, not added here): "
+    "newly-added media referenced by the note is content-hash RENAMED across the whole "
+    "collection (raw SQL, not undoable) and the referencing note FIELDS are rewritten to "
+    "match, before the background S3 upload.")
+PLUS_ACTION_PRESERVES = {
+    "bulkAddNotes":
+        "Every PRE-EXISTING note and card: scheduling, suspension, flags, tags, note ids, "
+        "GUIDs, deck assignment all untouched — this call only CREATES (new notes, their new "
+        "cards, plus media files embedded via audio/video/picture payloads; media writes are "
+        "not undoable). Decks and notetypes are never auto-created. Suspension applies only "
+        "to the cards this call itself created, and only when the resolved suspend flag is on.",
+    "bulkUpdateNoteFields":
+        "Scheduling (due/interval/queue) and suspension of every existing card — that half "
+        "post-checked per call as suspensionPreserved/schedulingPreserved (SPEC 31.2) — plus "
+        "flags and deck assignment (verified by probe, not per-call), note ids and GUIDs; "
+        "tags too, unless the entry itself carries "
+        "'tags'. NOT preserved: the note's CARD SET can grow — a field edit that introduces a "
+        "new cloze number generates that card in the note's own deck (probe-verified: existing "
+        "cards' rows stay byte-identical), and removing a cloze deletes nothing — the card "
+        "goes empty (see getEmptyCards).",
+    "bulkAddTags":
+        "Everything except the notes' tag lists (existing tags kept, requested ones appended): "
+        "fields, scheduling, suspension, flags, deck assignment, note ids, GUIDs, and the card "
+        "set (a tags-only update generates no cards; probe-verified).",
+    "addImageOcclusionNote":
+        "Every pre-existing note, card and media file (a media name collision renames the "
+        "INCOMING image, never an existing file). Adds one note, its cards, and one media "
+        "file; first use also adds anki's stock Image Occlusion NOTETYPE when the collection "
+        "lacks it — an addition, nothing existing is modified. The target deck must already "
+        "exist (never auto-created).",
+    "updateImageOcclusionNote":
+        "The note's id, GUID, deck assignment, its base image and media file (the image cannot "
+        "be changed here), and every existing card's scheduling/suspension/flags. Occlusion "
+        "ordinals are cloze numbers, so editing occlusions edits the card set the cloze way: a "
+        "NEW ordinal generates its card, a removed one leaves its card EMPTY, never deleted "
+        "(see getEmptyCards).",
+    "cropImage":
+        "The ORIGINAL media file — the crop always lands in a NEW file. Notes not passed in "
+        "noteIds entirely; on the passed notes only fields REFERENCING the filename are "
+        "rewritten (boundary-guarded match), so scheduling, suspension, flags, tags, note ids, "
+        "GUIDs, deck assignment and the card set are all preserved (a filename swap introduces "
+        "no cloze numbers).",
+    "cropImageOcclusionImage":
+        "The original media file (the cropped image is a NEW file), the note's id, GUID, tags "
+        "and deck assignment, and every card's scheduling/suspension/flags — kept occlusions "
+        "keep their ORDINALS, so cards keep their identity. NOT preserved: the Image field now "
+        "references the new file and occlusion geometry is remapped into the cropped frame; a "
+        "DROPPED occlusion's card is left EMPTY, never deleted (see getEmptyCards).",
+    "storeMediaFilesBulk":
+        "The entire collection database — no notes, cards, decks, tags or scheduling — and "
+        "every EXISTING media file: a name collision with different bytes renames the INCOMING "
+        "file (content-hash suffix), identical bytes dedup to the existing name; the per-item "
+        "{requested, actual} pairs disclose which happened.",
+    "bulkSuspend":
+        "Due dates, intervals, ease, flags, tags, fields, note ids, and deck assignment — "
+        "including filtered-deck residency: suspending a card sitting in a filtered deck "
+        "leaves it there (probe-verified; only queue changes). NOT preserved: bury state — "
+        "suspending a buried card replaces its burial with suspension, and unsuspend returns "
+        "EVERY negative queue (buried included) to normal (SPEC 16.1, Deviation #8).",
+    "bulkSetDueDate":
+        "Flags, fields, tags, note ids, GUIDs, ease factor. NOT preserved — rescheduling is "
+        "the job: due/queue/type change on every targeted card ('!' also rewrites the "
+        "interval; new cards become review cards), suspension and burial are cleared by "
+        "anki's own op (suspension put back under preserveSuspended, burial never), AND "
+        "filtered-deck residency: a card sitting in a filtered deck is sent back to its home "
+        "deck, odid consumed (probe-verified on 25.09.4).",
+    "bulkReplaceInFields":
+        "Everything except the ONE named field's HTML on the matched notes: tags ALWAYS, other "
+        "fields, existing cards' scheduling/suspension — that half post-checked per call as "
+        "suspensionPreserved/schedulingPreserved (SPEC 31.2) — their flags and deck assignment "
+        "(verified by probe, not per-call), note ids and GUIDs. "
+        "Same card-set caveat as bulkUpdateNoteFields: a replacement that introduces a new "
+        "cloze number generates that card; removing one deletes nothing.",
+    "renameDeck":
+        "Everything about cards and notes: ids, scheduling, suspension, flags, tags, fields. "
+        "Cards do not move — deck IDS are stable and only stored deck NAMES change, so 'deck "
+        "assignment' is unchanged in the sense that matters; options-preset assignments, "
+        "per-deck descriptions and collapse state survive (post-checked as configPreserved).",
+    "bulkSetFlag":
+        "Scheduling, suspension, deck assignment, fields, tags, note ids — and the NON-user "
+        "bits of each card's flags byte: col.set_user_flag_for_cards writes only the flag "
+        "bits, where the stock setSpecificValueOfCard workaround clobbers the whole byte. "
+        "Only the requested cards' user flag changes.",
+    "renameTag":
+        "Note fields, ids, GUIDs, every card's scheduling/suspension/flags/deck assignment, "
+        "and every OTHER tag on the affected notes — only the matched tag and its '::' "
+        "subtree are rewritten.",
+    "emptyFilteredDeck":
+        "Note content, tags, flags, note ids, intervals, and the cards' HOME deck assignment "
+        "— going home IS the operation (anki's own Empty op: did=odid, odid=0, scheduling "
+        "intact). NOT preserved: current filtered-deck residency and the filter's temporary "
+        "due override — home-deck scheduling is restored.",
+    "deleteEmptyCards":
+        "The notes themselves — NEVER deleted (post-checked as notesPreserved); an all-empty "
+        "note keeps its first card ('protected'). Every non-empty card, and every surviving "
+        "card's scheduling/suspension/flags/deck assignment; fields, tags, note ids, GUIDs "
+        "untouched. Deletes exactly the reported empty card ids, nothing else.",
+    "createBackup":
+        "The entire collection — a backup is a READ of it into a new .colpkg in the profile's "
+        "backups folder; no note, card, deck, tag or scheduling state changes.",
+    "exportDeckApkg":
+        "The entire local collection — an export is a READ into a NEW .apkg (existing files "
+        "never overwritten; a serial suffix dodges collisions). The fail-closed filtered-deck "
+        "check exists because the PACKAGE can silently lose cards, not because the local "
+        "collection changes.",
+    "syncNow":
+        "No per-item guarantee CAN be stated: a normal sync applies whatever the other side "
+        "changed, so any note/card/deck/tag may move — that is a sync's job. What IS "
+        "guaranteed: never a FULL sync (wholesale upload/download of the collection is "
+        "refused, so this action cannot replace local data outright) and never a dialog.",
+    "ankihubSuggestNoteUpdate": _ANKIHUB_SUGGEST_PRESERVES,
+    "ankihubSuggestNewNote": _ANKIHUB_SUGGEST_PRESERVES,
 }
 
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
@@ -642,7 +806,11 @@ PLUS_RECIPES = [
                         "buried. Set either param explicitly to override the config for "
                         "one call: suspend=false / preserveSuspended=false restore stock "
                         "Anki behavior. Preview either with dryRun=true "
-                        "('wouldSuspend' / 'wouldResuspend')."),
+                        "('wouldSuspend' / 'wouldResuspend'), and read plusInfo's "
+                        "effectiveConfig first to learn THIS install's resolved values of "
+                        "'suspendNewCards' / 'preserveSuspendedOnReschedule' — with the source "
+                        "('user_config' vs 'shipped_default') of each — before assuming the "
+                        "shipped defaults apply."),
         'example': {'action': 'bulkAddNotes',
                     'params': {'notes': [{'deckName': 'Draft', 'modelName': 'Basic',
                                           'fields': {'Front': 'q', 'Back': 'a'}}],
@@ -1041,6 +1209,47 @@ def canonify_tags(tags, registry):
 # Bulk actions
 #
 
+def _preservation_post_check(col, snapshot):
+    """(suspensionPreserved, schedulingPreserved) — SPEC 31.2.
+
+    snapshot is {cardId: (queue, due, ivl)} captured immediately before the
+    notes carrying those cards were written. Re-read the same cards and
+    compare: a VERIFIED fact, not a promise (the renameDeck configPreserved
+    pattern). suspensionPreserved covers the suspension facet alone — queue
+    -1 membership unchanged in either direction; schedulingPreserved covers
+    the whole (queue, due, ivl) triple, so a suspension flip trips both. A
+    card that vanished mid-call fails both (a field write must never do
+    that). Cards BORN during the call (a new cloze number generating its
+    card) are absent from the snapshot by construction: new cards are not
+    "moved" state. Both True on an empty snapshot — zero writes moved zero
+    cards. Report false HONESTLY: it should never happen, and that is the
+    alarm's point.
+    """
+    suspension_preserved = True
+    scheduling_preserved = True
+    if not snapshot:
+        return suspension_preserved, scheduling_preserved
+    after = {}
+    ids = sorted(snapshot)
+    for start in range(0, len(ids), SQL_IN_CHUNK):
+        chunk = ids[start:start + SQL_IN_CHUNK]
+        for cid, queue, due, ivl in col.db.all(
+                'select id, queue, due, ivl from cards where id in ({})'.format(
+                    ','.join(str(int(c)) for c in chunk))):
+            after[cid] = (queue, due, ivl)
+    for cid, before in snapshot.items():
+        now = after.get(cid)
+        if now is None:
+            suspension_preserved = False
+            scheduling_preserved = False
+            continue
+        if (before[0] == QUEUE_SUSPENDED) != (now[0] == QUEUE_SUSPENDED):
+            suspension_preserved = False
+        if before != now:
+            scheduling_preserved = False
+    return suspension_preserved, scheduling_preserved
+
+
 def bulk_add_notes(col, notes, atomic=True, allow_duplicates=False, dry_run=False,
                    suspend=None, undo_label=None):
     undo_name = sanitize_undo_label(undo_label) or UNDO_BULK_ADD
@@ -1266,6 +1475,7 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
     skipped = []
     preview = []       # dryRun+diff only: [{noteId, field, before, after}], capped
     diffTotal = 0      # changed-field entries found, INCLUDING those past the cap
+    snapshot = {}      # SPEC 31.2: {cardId: (queue, due, ivl)} of notes actually written
     target = None
     tagRegistry = None  # lazy: one col.tags.all() read, only if some entry has tags
     for i, entry in enumerate(notes):
@@ -1360,6 +1570,14 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
                                         'after': ' '.join(canonTags)})
             continue
 
+        # preservation snapshot (SPEC 31.2): this note is about to be written,
+        # so capture its EXISTING cards' (queue, due, ivl) first — one query
+        # per written note, nothing for unchanged/skipped ones. setdefault: a
+        # repeated note id keeps the FIRST pre-write state, so the post-check
+        # compares against what the CALL found, not an intermediate.
+        for cid, cardQueue, cardDue, cardIvl in col.db.all(
+                'select id, queue, due, ivl from cards where nid = ?', nid):
+            snapshot.setdefault(cid, (cardQueue, cardDue, cardIvl))
         try:
             if fields is not None:
                 for name, value in fields.items():
@@ -1386,7 +1604,12 @@ def bulk_update_note_fields(col, notes, atomic=True, dry_run=False, diff=False,
             result['previewTruncated'] = diffTotal > len(preview)
         return result
     _pop_empty_undo(col, target, updated, undo_name)
+    # SPEC 31.2: additive, ALWAYS present on the real response — verified
+    # facts about the written notes' cards, never a promise
+    suspensionPreserved, schedulingPreserved = _preservation_post_check(col, snapshot)
     return {'updated': updated, 'unchanged': unchanged, 'skipped': skipped,
+            'suspensionPreserved': suspensionPreserved,
+            'schedulingPreserved': schedulingPreserved,
             'undoEntry': undo_name if updated else None}
 
 
@@ -3048,7 +3271,13 @@ def bulk_replace_in_fields(col, query=None, note_ids=None, field=None,
                 'previewTruncated': len(changed_ids) > len(preview),
                 'undoEntry': None}
 
-    # write pass
+    # write pass. Preservation snapshot first (SPEC 31.2): only the cards of
+    # the notes about to be written — `pending` is already deduplicated.
+    snapshot = {}
+    for pendingNote, _newValue in pending:
+        for cid, cardQueue, cardDue, cardIvl in col.db.all(
+                'select id, queue, due, ivl from cards where nid = ?', pendingNote.id):
+            snapshot.setdefault(cid, (cardQueue, cardDue, cardIvl))
     changed = []
     target = None
     for ankiNote, after in pending:
@@ -3069,8 +3298,12 @@ def bulk_replace_in_fields(col, query=None, note_ids=None, field=None,
             skipped.append({'noteId': ankiNote.id, 'reason': str(e)})
 
     _pop_empty_undo(col, target, changed, undo_name)
+    # SPEC 31.2: additive, ALWAYS present on the real response
+    suspensionPreserved, schedulingPreserved = _preservation_post_check(col, snapshot)
     return {'changed': changed, 'matchesTotal': matchesTotal,
             'unchanged': unchanged, 'skipped': skipped,
+            'suspensionPreserved': suspensionPreserved,
+            'schedulingPreserved': schedulingPreserved,
             'undoEntry': undo_name if changed else None}
 
 
@@ -3175,7 +3408,8 @@ def rename_deck(col, old_name, new_name, dry_run=False, undo_label=None):
         # byte-identical rename: data no-op — nothing written, undo untouched
         # (a case-only respelling is NOT this: it is a real rename)
         if dry_run:
-            return {'wouldRename': [], 'cardsAffected': 0, 'undoEntry': None}
+            return {'wouldRename': [], 'configWillBePreserved': True,
+                    'cardsAffected': 0, 'undoEntry': None}
         return {'renamed': [], 'configPreserved': True, 'cardsAffected': 0,
                 'undoEntry': None}
 
@@ -3202,8 +3436,13 @@ def rename_deck(col, old_name, new_name, dry_run=False, undo_label=None):
     cards_affected = col.decks.card_count(did, include_subdecks=True)
 
     if dry_run:
-        return {'wouldRename': predicted, 'cardsAffected': cards_affected,
-                'undoEntry': None}
+        # configWillBePreserved (SPEC 31.4): a STATIC contract statement,
+        # always true — preset/description/collapse survival is a property of
+        # the in-place rename path itself (deck ids are stable across it),
+        # NOT a post-check. The real run's configPreserved is the post-check;
+        # this key exists so the dry response states the same decision.
+        return {'wouldRename': predicted, 'configWillBePreserved': True,
+                'cardsAffected': cards_affected, 'undoEntry': None}
 
     pre_conf = {}
     for _name, deck_id in subtree:
@@ -3387,7 +3626,8 @@ def rename_tag(col, old_tag, new_tag, dry_run=False, undo_label=None):
         # byte-identical: data no-op — nothing written, undo untouched
         # (a case-only respelling is NOT this: it is a real rename)
         if dry_run:
-            return {'wouldRewrite': [], 'merged': [], 'undoEntry': None}
+            return {'notesUpdated': 0, 'wouldRewrite': [], 'merged': [],
+                    'undoEntry': None}
         return {'notesUpdated': 0, 'tagsRewritten': [], 'merged': [],
                 'undoEntry': None}
 
@@ -3400,15 +3640,24 @@ def rename_tag(col, old_tag, new_tag, dry_run=False, undo_label=None):
     # popping an empty custom entry afterwards would push a phantom Redo
     # item (the §16.2 hazard). Applied to the dry path too, so dry and real
     # agree that nothing would be rewritten.
-    if not col.find_notes(col.build_search_string(
-            anki.collection.SearchNode(tag=old_tag))):
+    carrying = col.find_notes(col.build_search_string(
+            anki.collection.SearchNode(tag=old_tag)))
+    if not carrying:
         if dry_run:
-            return {'wouldRewrite': [], 'merged': merged, 'undoEntry': None}
+            return {'notesUpdated': 0, 'wouldRewrite': [], 'merged': merged,
+                    'undoEntry': None}
         return {'notesUpdated': 0, 'tagsRewritten': [], 'merged': merged,
                 'undoEntry': None}
 
     if dry_run:
-        return {'wouldRewrite': pairs, 'merged': merged, 'undoEntry': None}
+        # dry notesUpdated (SPEC 31.4): countable WITHOUT writing — the count
+        # of notes carrying the affected tags, from the same anki-native tag
+        # search the ghost gate just ran ('tag:X' matches X and X::*). A
+        # prediction of the real run's backend changed-note count; unicase vs
+        # casefold drift is the only way they can differ (the same documented
+        # approximation wouldRewrite already carries).
+        return {'notesUpdated': len(carrying), 'wouldRewrite': pairs,
+                'merged': merged, 'undoEntry': None}
 
     target = col.add_custom_undo_entry(undo_name)
     try:

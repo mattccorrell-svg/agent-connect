@@ -712,7 +712,11 @@ def test12_plusinfo_returns_and_error_codes():
     assert len(pkg_core.PLUS_ACTIONS) == 34, len(pkg_core.PLUS_ACTIONS)
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
-        assert set(entry) == {"summary", "params", "returns"}, (name, sorted(entry))
+        # revision 18: side-effectful actions carry a fourth key, 'preserves'
+        want = {"summary", "params", "returns"}
+        if name in pkg_core.PLUS_ACTION_PRESERVES:
+            want.add("preserves")
+        assert set(entry) == want, (name, sorted(entry))
         assert entry["returns"].strip(), name
         assert entry["returns"].startswith("{"), (name, entry["returns"][:40])
 

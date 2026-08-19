@@ -160,6 +160,7 @@ def test2_rename_deck_dry_run():
     assert undo_snap() == before, "dry run touched the undo stack"
     assert dry == {"wouldRename": [{"from": "R2A", "to": "R2B"},
                                    {"from": "R2A::Sub", "to": "R2B::Sub"}],
+                   "configWillBePreserved": True,
                    "cardsAffected": 0, "undoEntry": None}, dry
     assert col.decks.id_for_name("R2B") is None, "dry run renamed the deck"
 
@@ -329,7 +330,8 @@ def test7_rename_tag_prefix_safety():
     before = undo_snap()
     dry = core.rename_tag(col, "x::lab1", "x::lab01", dry_run=True)
     # the preview lists the exact pairs — and NOT lab10 (the whole point)
-    assert dry == {"wouldRewrite": [{"from": "x::lab1", "to": "x::lab01"},
+    assert dry == {"notesUpdated": 3,
+                   "wouldRewrite": [{"from": "x::lab1", "to": "x::lab01"},
                                     {"from": "x::lab1::sub", "to": "x::lab01::sub"}],
                    "merged": [], "undoEntry": None}, dry
     assert not any("lab10" in p["from"] for p in dry["wouldRewrite"])
@@ -401,7 +403,8 @@ def test8_rename_tag_edges():
     assert undo_snap() == before, "ghost rename left an undo artifact"
     assert "ghost::one" in col.tags.all()
     dry = core.rename_tag(col, "ghost", "spirit", dry_run=True)
-    assert dry == {"wouldRewrite": [], "merged": [], "undoEntry": None}, dry
+    assert dry == {"notesUpdated": 0, "wouldRewrite": [], "merged": [],
+                   "undoEntry": None}, dry
 
 
 # ============================================================================

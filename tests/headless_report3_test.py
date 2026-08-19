@@ -1280,7 +1280,11 @@ def test_ask1_plus_info_surface():
     assert len(info["actionDocs"]) == 34
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
-        assert set(entry) == {"summary", "params", "returns"}, (name, sorted(entry))
+        # revision 18: side-effectful actions carry a fourth key, 'preserves'
+        want = {"summary", "params", "returns"}
+        if name in pkg_core.PLUS_ACTION_PRESERVES:
+            want.add("preserves")
+        assert set(entry) == want, (name, sorted(entry))
         assert entry["summary"].strip(), name
         assert entry["returns"].strip(), name
         assert entry["returns"].startswith("{"), (name, entry["returns"][:60])

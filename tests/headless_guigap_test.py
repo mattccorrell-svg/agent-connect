@@ -847,8 +847,8 @@ def test11_plusinfo_and_doc_lockstep():
         assert name in core.PLUS_ACTIONS, name
     assert set(core.PLUS_ACTION_SUMMARIES) == set(core.PLUS_ACTIONS)
     assert set(core.PLUS_ACTION_RETURNS) == set(core.PLUS_ACTIONS)
-    assert core.PLUS_VERSION == "1.3.0", core.PLUS_VERSION
-    assert core.PLUS_SPEC_REVISION == 17, core.PLUS_SPEC_REVISION
+    assert core.PLUS_VERSION == "1.3.1", core.PLUS_VERSION
+    assert core.PLUS_SPEC_REVISION == 18, core.PLUS_SPEC_REVISION
     assert "%d Plus actions" % len(core.PLUS_ACTIONS) in core.PLUS_ERROR_PREFIX_NOTE
 
     # ---- SPEC.md header lockstep
@@ -884,8 +884,8 @@ def test11_plusinfo_and_doc_lockstep():
     finally:
         util_mod.setting = orig_setting
 
-    assert info["version"] == core.PLUS_VERSION == "1.3.0", info["version"]
-    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 17
+    assert info["version"] == core.PLUS_VERSION == "1.3.1", info["version"]
+    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 18
     assert info["actions"] == list(core.PLUS_ACTIONS)
     assert len(info["actions"]) == 34
 
