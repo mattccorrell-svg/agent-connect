@@ -839,27 +839,30 @@ def test11_plusinfo_and_doc_lockstep():
     assert "aqt" not in sys.modules, "a core-path test pulled in aqt"
 
     # ---- code-level registry truth. The verification briefing said "32
-    # actions"; the code says 36 (27 at v1.2.0 + 3 slice-1 + 4 slice-2 +
-    # 2 revision-19 filtered-deck build), and
-    # SPEC.md's own revision entries say 27 -> 30 -> 34 -> 36. Lock the internally
+    # actions"; the code says 37 (27 at v1.2.0 + 3 slice-1 + 4 slice-2 +
+    # 2 revision-19 filtered-deck build + 1 revision-20 SPEC 33 staged
+    # optional-tag action), and
+    # SPEC.md's own revision entries say 27 -> 30 -> 34 -> 36 -> 37. Lock the internally
     # consistent truth; the briefing's number is reported as stale.
-    assert len(core.PLUS_ACTIONS) == 36, len(core.PLUS_ACTIONS)
-    assert len(set(core.PLUS_ACTIONS)) == 36, "duplicate action names"
+    assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
+    assert len(set(core.PLUS_ACTIONS)) == 37, "duplicate action names"
     for name in NEW_ACTIONS:
         assert name in core.PLUS_ACTIONS, name
     assert set(core.PLUS_ACTION_SUMMARIES) == set(core.PLUS_ACTIONS)
     assert set(core.PLUS_ACTION_RETURNS) == set(core.PLUS_ACTIONS)
-    assert core.PLUS_VERSION == "1.4.0", core.PLUS_VERSION
-    assert core.PLUS_SPEC_REVISION == 19, core.PLUS_SPEC_REVISION
+    assert core.PLUS_VERSION == "1.5.0", core.PLUS_VERSION
+    assert core.PLUS_SPEC_REVISION == 20, core.PLUS_SPEC_REVISION
     assert "%d Plus actions" % len(core.PLUS_ACTIONS) in core.PLUS_ERROR_PREFIX_NOTE
 
     # ---- SPEC.md header lockstep
     with open(os.path.join(REPO, "SPEC.md"), encoding="utf-8") as fh:
-        spec_head = fh.read(20000)
+        # the whole revision-history header line (revision 20 pushed it past
+        # 20 KB, and the newest count lives at its END)
+        spec_head = fh.read(80000)
     want = "Version: %s (spec revision %d," % (core.PLUS_VERSION,
                                                core.PLUS_SPEC_REVISION)
     assert want in spec_head, "SPEC.md header does not carry %r" % want
-    assert "**36**" in spec_head, "SPEC.md header lost the 36-action count"
+    assert "**37**" in spec_head, "SPEC.md header lost the 37-action count"
 
     # ---- README lockstep: every new action has a table row; the export
     # escape hatch is documented
@@ -886,10 +889,10 @@ def test11_plusinfo_and_doc_lockstep():
     finally:
         util_mod.setting = orig_setting
 
-    assert info["version"] == core.PLUS_VERSION == "1.4.0", info["version"]
-    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 19
+    assert info["version"] == core.PLUS_VERSION == "1.5.0", info["version"]
+    assert info["specRevision"] == core.PLUS_SPEC_REVISION == 20
     assert info["actions"] == list(core.PLUS_ACTIONS)
-    assert len(info["actions"]) == 36
+    assert len(info["actions"]) == 37
 
     # every action documented, returns non-empty, params never hidden
     for name in core.PLUS_ACTIONS:
@@ -999,7 +1002,7 @@ def main():
         ("emptyFilteredDeck: dry/real/undo/no-op/refusals + clean export", test08_empty_filtered_deck_then_clean_export),
         ("empty cards: report + integrity cross-check", test09_empty_cards_report_and_integrity_crosscheck),
         ("deleteEmptyCards: orphan, protection, sweep, skipped", test10_delete_empty_cards),
-        ("plusInfo: 36 actions, returns truth, codes, SPEC/README lockstep", test11_plusinfo_and_doc_lockstep),
+        ("plusInfo: 37 actions, returns truth, codes, SPEC/README lockstep", test11_plusinfo_and_doc_lockstep),
     ]
     for name, fn in tests:
         run(name, fn)

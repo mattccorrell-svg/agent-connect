@@ -1239,9 +1239,14 @@ def _raisable_codes():
     SOURCE (not from the docs it is being checked against).
 
     Literal `PlusError('code', ...)` sites are read straight out of the AST.
-    The one dynamic site is `core.PlusError(core.ANKIHUB_CODE_TO_PLUS_CODE[..],
-    ..)`, resolved through that table; any OTHER non-literal first argument is
-    a failure here, so a new unresolvable raise site cannot slip past.
+    ONE dynamic site is allowed, resolving through
+    core.ANKIHUB_CODE_TO_PLUS_CODE: `core.PlusError(
+    core.ANKIHUB_CODE_TO_PLUS_CODE[..], ..)` in _plusAnkiHubHttpError.
+    (The revision-20 dialog-era second site — `mapped.code` in the staged
+    optional-tag action's construction-failure re-raise — was removed by the
+    revision-20 trim: the action now stops at the Browser and has no
+    AnkiHub-error path at all.) Any OTHER non-literal first argument is a
+    failure here, so a new unresolvable raise site cannot slip past.
     """
     codes = set()
     dynamic = []
@@ -1261,7 +1266,7 @@ def _raisable_codes():
                 codes.add(first.value)
             else:
                 dynamic.append(ast.unparse(first))
-    assert dynamic == ["core.ANKIHUB_CODE_TO_PLUS_CODE[code]"], dynamic
+    assert sorted(dynamic) == ["core.ANKIHUB_CODE_TO_PLUS_CODE[code]"], dynamic
     codes.update(core.ANKIHUB_CODE_TO_PLUS_CODE.values())
     return codes
 
@@ -1271,13 +1276,14 @@ def test_ask1_plus_info_surface():
     pkg_core = sys.modules[PLUS_PKG + ".core"]
     info = _with_default_settings(PLUS_PKG, plus.PlusMixin().plusInfo)
 
-    # --- 36 actions, each documented with a NON-EMPTY 'returns'
-    assert len(pkg_core.PLUS_ACTIONS) == 36, len(pkg_core.PLUS_ACTIONS)
-    assert len(set(pkg_core.PLUS_ACTIONS)) == 36, "duplicate action name"
+    # --- 37 actions (36 -> 37: revision-20 SPEC 33 adds
+    # ankihubStageOptionalTagSuggestion), each with a NON-EMPTY 'returns'
+    assert len(pkg_core.PLUS_ACTIONS) == 37, len(pkg_core.PLUS_ACTIONS)
+    assert len(set(pkg_core.PLUS_ACTIONS)) == 37, "duplicate action name"
     assert info["actions"] == list(pkg_core.PLUS_ACTIONS)
     assert set(info["actionDocs"]) == set(pkg_core.PLUS_ACTIONS), \
         sorted(set(info["actionDocs"]) ^ set(pkg_core.PLUS_ACTIONS))
-    assert len(info["actionDocs"]) == 36
+    assert len(info["actionDocs"]) == 37
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
         # revision 18: side-effectful actions carry a fourth key, 'preserves'

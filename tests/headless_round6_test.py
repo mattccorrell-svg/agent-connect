@@ -526,12 +526,13 @@ def test10_lockstep_and_wrappers():
         assert core.PLUS_ACTION_SUMMARIES[name].strip(), name
         assert core.PLUS_ACTION_RETURNS[name].startswith("{"), name
         assert core.PLUS_ACTION_PRESERVES[name].strip(), name
-    assert len(core.PLUS_ACTIONS) == 36, len(core.PLUS_ACTIONS)
+    # 36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion
+    assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
     assert core.UNDO_CREATE_FILTERED == "AnkiConnect Plus: Create Filtered Deck"
     assert core.UNDO_REBUILD_FILTERED == "AnkiConnect Plus: Rebuild Filtered Deck"
-    assert "36 Plus actions" in core.PLUS_ERROR_PREFIX_NOTE
-    assert core.PLUS_VERSION == "1.4.0" and core.PLUS_SPEC_REVISION == 19
+    assert "37 Plus actions" in core.PLUS_ERROR_PREFIX_NOTE
+    assert core.PLUS_VERSION == "1.5.0" and core.PLUS_SPEC_REVISION == 20
     # order vocabulary is the probe-pinned label list, index == enum
     assert core.FILTERED_DECK_ORDERS == {
         "oldestReviewedFirst": 0, "random": 1, "intervalsAscending": 2,
@@ -587,17 +588,17 @@ def test10_lockstep_and_wrappers():
         readme = fh.read()
     for name in ("createFilteredDeck", "rebuildFilteredDeck"):
         assert "`%s`" % name in readme, name
-    assert "**36 new actions**" in readme
+    assert "**37 new actions**" in readme
     with open(os.path.join(REPO, "SPEC.md"), encoding="utf-8") as fh:
         spec_text = fh.read()
-    assert "Version: 1.4.0 (spec revision 19" in spec_text[:4000]
+    assert "Version: 1.5.0 (spec revision 20" in spec_text[:4000]
     assert "## 32. Filtered-deck build" in spec_text
     with open(os.path.join(REPO, "skills", "anki-bulk-cards", "SKILL.md"),
               encoding="utf-8") as fh:
         skill_text = fh.read()
-    assert "36 Plus actions" in skill_text, \
+    assert "37 Plus actions" in skill_text, \
         "SKILL.md action count drifted from the code"
-    assert "34 Plus actions" not in skill_text
+    assert "36 Plus actions" not in skill_text
 
 
 run("1 create: dry/real parity, exclusions, undo round trip",

@@ -5,7 +5,7 @@ description: Build, edit, audit, or repair Anki cards at scale through the AnkiC
 
 # Bulk Anki work via AnkiConnect Plus
 
-AnkiConnect Plus is a fork of AnkiConnect that makes large Anki jobs fast, atomic, and reviewable. It serves **everything on port 8766** — the 36 Plus actions *and* the full upstream AnkiConnect surface (decks, models, GUI, `findNotes`, `storeMediaFile`), since it is a fork of the whole codebase. (On Matt's machine stock AnkiConnect is disabled; if a stock install is active elsewhere it answers on 8765.) Anki must be open. Protocol:
+AnkiConnect Plus is a fork of AnkiConnect that makes large Anki jobs fast, atomic, and reviewable. It serves **everything on port 8766** — the 37 Plus actions *and* the full upstream AnkiConnect surface (decks, models, GUI, `findNotes`, `storeMediaFile`), since it is a fork of the whole codebase. (On Matt's machine stock AnkiConnect is disabled; if a stock install is active elsewhere it answers on 8765.) Anki must be open. Protocol:
 
 ```
 POST http://localhost:8766   {"action": "...", "version": 6, "params": {...}}
@@ -65,5 +65,6 @@ Read `~/Documents/anki-backups/BSOM_card_build_spec.md` and `card_style_spec.md`
 
 - **Decks must already exist.** A missing deck comes back as a skipped note, not an auto-created deck — call stock `createDeck` first.
 - **Never call `ankihubSuggest*` without explicit per-suggestion approval.** Those submit to real human maintainers under the user's name. One at a time, always after showing the exact diff. For AnKing content changes a `source` is required and gets folded into the rationale in their format.
+- **Optional-tag publication is staged, never auto-submitted.** `ankihubStageOptionalTagSuggestion` tags the notes locally (one undo entry), opens the Browser on exactly those notes, and stops — the human right-clicks the selection → AnkiHub → "Suggest Optional Tags" and presses Submit in AnkiHub's own dialog. AnkiHub's ToS forbids scripted posting, so the action touches none of AnkiHub's code or servers; there is deliberately no auto-submit action.
 - **Errors carry codes.** Branch on `errorCode` and honor `retryable`; do not parse English. Per-item skip reasons inside a successful result are plain text by design and are not errors.
 - **Report what happened, not what was requested.** Every action distinguishes `updated` from `unchanged`, `changed` from `unsuspended`, `total` from `missing`. Pass those distinctions through to the user verbatim — a batch that "succeeded" while skipping 40 notes is not a success.

@@ -42,7 +42,7 @@ from anki.errors import (FilteredDeckError, Interrupted, InvalidInput,
                          NetworkError, NotFoundError, SearchError, SyncError,
                          SyncErrorKind)
 
-PLUS_VERSION = "1.4.0"
+PLUS_VERSION = "1.5.0"
 # The SPEC revision this code implements, kept in lockstep with SPEC.md's
 # "Version: <PLUS_VERSION> (spec revision <PLUS_SPEC_REVISION>" header (test-
 # locked). Revision 15 is the first revision that changed what two actions DO
@@ -57,7 +57,15 @@ PLUS_VERSION = "1.4.0"
 # semver), and the guarantee the caching client relies on still holds in
 # the direction that matters — a default-behavior change always moves the
 # minor, so an unmoved minor still proves no default changed underneath it.
-PLUS_SPEC_REVISION = 19
+# Revision 20 adds ONE action (SPEC 33, ankihubStageOptionalTagSuggestion —
+# staged, HUMAN-submitted optional-tag suggestions: validate locally, tag as
+# one undoable batch, open the Browser on exactly those notes, then STOP;
+# the human right-clicks -> AnkiHub -> Suggest Optional Tags and presses
+# Submit. Deliberately no auto-submit variant and ZERO AnkiHub code/network
+# touched by this action, per AnkiHub's ToS automated-use clause and the
+# project's written-permission constraint) and again changes NO existing
+# action's defaults: same rule, minor moves (1.4.0 -> 1.5.0).
+PLUS_SPEC_REVISION = 20
 PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "addImageOcclusionNote", "getImageOcclusionNote",
                 "updateImageOcclusionNote", "queryRevlog", "createBackup",
@@ -91,6 +99,8 @@ PLUS_ACTIONS = ["bulkAddNotes", "bulkUpdateNoteFields", "bulkAddTags",
                 "ankihubSuggestNoteUpdate",
                 # submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion
                 "ankihubSuggestNewNote",
+                # stage an optional-tag suggestion: tag locally (one undoable batch), open the Browser on exactly those notes, STOP — a HUMAN right-clicks -> AnkiHub -> Suggest Optional Tags and submits (zero AnkiHub calls here)
+                "ankihubStageOptionalTagSuggestion",
                 # READ-ONLY deck audit: missing media, malformed clozes, cloze/card drift, optional orphan-media scan
                 "checkDeckIntegrity",
                 # find/replace (literal or regex) on ONE named field's raw HTML, one undoable batch, dryRun preview
@@ -143,6 +153,7 @@ PLUS_ACTION_SUMMARIES = {
     "ankihubStatus": "AnkiHub bridge probe: install/enable/login/deck status + add-on compatibility (read-only, never network).",
     "ankihubSuggestNoteUpdate": "Submit ONE change suggestion for an existing AnkiHub note through the installed AnkiHub add-on.",
     "ankihubSuggestNewNote": "Submit ONE new-note suggestion; duplicate conflicts can auto-resubmit as a change suggestion.",
+    "ankihubStageOptionalTagSuggestion": "STAGE an AnkiHub optional-tag suggestion for a HUMAN to submit: after all-or-nothing local validation (tag must be 'AnkiHub_Optional::<TagGroup>::<Tag>', every note must exist, all notes on ONE AnkiHub deck, at most 500 notes/call), the tag is applied locally as ONE undoable batch, then the Browser opens on exactly those notes and the action STOPS — the human right-clicks the selection -> AnkiHub -> 'Suggest Optional Tags', reviews, and presses Submit in AnkiHub's own dialog. This action NEVER submits and makes ZERO AnkiHub calls — it touches none of the add-on's network code, not even to open their dialog (their ToS prohibits scripted posting; see the 'staged optional-tag publication' recipe); the only add-on reads are local (login flag, deck mapping). GUI-COUPLED: the real run needs the Anki window for the Browser; dryRun validates everything and predicts the tag write with nothing written and nothing opened. Requires the AnkiHub add-on installed, enabled, compatible and logged in.",
     "checkDeckIntegrity": "Read-only integrity audit of a deck and its subdecks: missing media per field, unbalanced cloze markers, cloze-vs-card ordinal drift, cloze notes with zero effective clozes, optional orphan-media scan. Every list is deck-scoped EXCEPT orphanMediaCollectionWide, which is COLLECTION-WIDE (capped by orphanMediaLimit, full size in orphanMediaCount).",
     "bulkReplaceInFields": "Find/replace (literal or python-regex) on ONE named field's raw HTML, as one undoable batch; field, find and replace are required, plus exactly one of query/noteIds. dryRun returns a capped before/after preview.",
     "undoStatus": "Read Anki's undo stack (read-only): what a single undo/redo would do right now, plus lastStep — the observed truth behind every action's undoEntry.",
@@ -293,6 +304,21 @@ PLUS_ACTION_RETURNS = {
         "{result: 'success'|'noChanges'|'emptyFirstField'|..., resubmittedAsChange: bool} — "
         "resubmittedAsChange true means the note already existed on AnkiHub and the call was "
         "automatically retried as a change suggestion.",
+    "ankihubStageOptionalTagSuggestion":
+        "{tagged: [noteId], alreadyTagged: [noteId], ankihubDeckId: str, browserOpened: bool, "
+        "nextStep: str, undoEntry: str|null} — 'tagged' lists the notes this call actually "
+        "wrote the tag onto (ONE undo entry, default 'AnkiConnect Plus: Stage Optional Tag'); "
+        "'alreadyTagged' the ones that carried it before, so re-staging the same set is a "
+        "reported no-op write (undoEntry null) that still reopens the Browser selection. "
+        "browserOpened true = the Browser now shows exactly the staged notes; nextStep spells "
+        "out the human's remaining move: 'right-click the selection -> AnkiHub -> Suggest "
+        "Optional Tags'. NOTHING has been sent to AnkiHub when this returns — and nothing "
+        "ever is by this action: submission (and even opening AnkiHub's dialog) is the "
+        "human's click. Re-running the identical call is always safe: already-tagged notes "
+        "are skipped. dryRun=true instead returns {wouldTag: [noteId], alreadyTagged, "
+        "ankihubDeckId, wouldOpenBrowser: true, undoEntry: null} — the full validation chain "
+        "runs (params, add-on compatibility, login, note existence, single-deck) but nothing "
+        "is written and nothing opens.",
     "checkDeckIntegrity":
         "{missingMedia: [{noteId, field, filename}], unbalancedCloze: [{noteId, field}], "
         "clozeCardMismatch: [{noteId, expectedOrds, actualOrds}], clozeNotesWithoutCloze: "
@@ -592,6 +618,15 @@ PLUS_ACTION_PRESERVES = {
         "refused, so this action cannot replace local data outright) and never a dialog.",
     "ankihubSuggestNoteUpdate": _ANKIHUB_SUGGEST_PRESERVES,
     "ankihubSuggestNewNote": _ANKIHUB_SUGGEST_PRESERVES,
+    "ankihubStageOptionalTagSuggestion":
+        "Everything except the staged notes' tag lists — the one optional tag is appended "
+        "through the bulkAddTags path, so fields, scheduling, suspension, flags, deck "
+        "assignment, note ids, GUIDs and the card set are all untouched (a tags-only update "
+        "generates no cards; probe-verified for bulkAddTags). AnkiHub is NOT touched at all: "
+        "no server write, no read, not even their dialog — this action makes zero AnkiHub "
+        "calls, and submission happens only when the human right-clicks the selection and "
+        "presses Submit in AnkiHub's own UI. GUI side effect, disclosed: the Browser opens "
+        "(or refocuses) on a 'nid:...' search — its previous search is replaced.",
 }
 
 DOCS_UPSTREAM = "https://foosoft.net/projects/anki-connect/"
@@ -726,7 +761,7 @@ PLUS_ERROR_CODE_DOCS = {
 # The one boundary rule a client cannot infer from a single response (SPEC 25,
 # revision 13): the '[code] ' prefix is NOT universal across this server.
 PLUS_ERROR_PREFIX_NOTE = (
-    "Prefixing boundary: errors from the 36 Plus actions AND the dispatcher's unknown-action "
+    "Prefixing boundary: errors from the 37 Plus actions AND the dispatcher's unknown-action "
     "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
     "EVERY OTHER error is passed through verbatim and UNPREFIXED, with errorCode: null and "
     "retryable: null — that is the ~90 UPSTREAM AnkiConnect actions, the dispatcher's api-key "
@@ -954,6 +989,39 @@ PLUS_RECIPES = [
         'example': {'action': 'filteredDeckReport', 'params': {'deckName': 'HA2'}},
     },
     {
+        'name': 'staged optional-tag publication',
+        'description': ("Publishing an AnkiHub Optional Tag group (tags like "
+                        "'AnkiHub_Optional::BSOM::MCQ_03::PI_027') stays HUMAN-SUBMITTED "
+                        "by design. The pipeline: pick the note ids -> "
+                        "ankihubStageOptionalTagSuggestion with dryRun=true to validate "
+                        "(canonical 'AnkiHub_Optional::<TagGroup>::<Tag>' shape, every "
+                        "note exists, all on ONE AnkiHub deck, at most 500 notes/call) -> "
+                        "the real call applies the tag locally as ONE undoable batch, "
+                        "opens the Browser on exactly those notes, and STOPS -> a HUMAN "
+                        "right-clicks the selection -> AnkiHub -> 'Suggest Optional "
+                        "Tags', reviews, and presses Submit in AnkiHub's own dialog. WHY "
+                        "the action stops at the Browser: AnkiHub's Terms of Service "
+                        "(effective 2025-01-14) prohibit 'any automated use of our "
+                        "resources, including... using scripts to create or post "
+                        "content', and even OPENING AnkiHub's dialog from code fires "
+                        "AnkiHub network calls (deck-extension fetch, tag-group "
+                        "prevalidation) with no human action taken — so this API's "
+                        "boundary is everything LOCAL plus the Browser selection, and "
+                        "every touch of AnkiHub's code and servers happens on the "
+                        "human's own clicks (the menu item, then Submit). Automating "
+                        "past that boundary would require WRITTEN permission from "
+                        "AnkiHub first (they recruit tagging contributors at "
+                        "ahmed@ankihub.net); until that permission exists, no Plus "
+                        "action calls AnkiHub's optional-tag endpoints or constructs "
+                        "their GUI. Re-running a staging is always safe: already-tagged "
+                        "notes are skipped (reported in alreadyTagged) and the Browser "
+                        "selection simply reopens."),
+        'example': {'action': 'ankihubStageOptionalTagSuggestion',
+                    'params': {'tag': 'AnkiHub_Optional::BSOM::MCQ_03::PI_027_Pancreas',
+                               'noteIds': [1483845152253, 1489115655836],
+                               'dryRun': True}},
+    },
+    {
         'name': 'empty-cards cleanup',
         'description': ("The audit -> remediate loop for empty cards (cloze rewrites leave "
                         "orphan cards behind; anki only offers the manual Tools > Empty "
@@ -984,6 +1052,7 @@ UNDO_EMPTY_FILTERED = 'AnkiConnect Plus: Empty Filtered Deck'
 UNDO_CREATE_FILTERED = 'AnkiConnect Plus: Create Filtered Deck'
 UNDO_REBUILD_FILTERED = 'AnkiConnect Plus: Rebuild Filtered Deck'
 UNDO_DELETE_EMPTY = 'AnkiConnect Plus: Delete Empty Cards'
+UNDO_STAGE_OPTIONAL_TAG = 'AnkiConnect Plus: Stage Optional Tag'
 
 # undoLabel (SPEC 24): every write action takes an optional undoLabel whose
 # sanitized form becomes the undo entry name 'AnkiConnect Plus: <label>', so
@@ -4570,6 +4639,29 @@ ANKIHUB_CHANGE_RESULTS = {'SUCCESS': 'success', 'NO_CHANGES': 'noChanges',
                           'ANKIHUB_NOT_FOUND': 'notFoundOnAnkiHub',
                           'EMPTY_FIRST_FIELD': 'emptyFirstField'}
 
+# Optional-tag staging (SPEC 33). TAG_FOR_OPTIONAL_TAGS in the add-on's
+# main/note_conversion.py:15 is 'AnkiHub_Optional'; its dialog only picks up
+# tags with at least three '::' segments ('AnkiHub_Optional::<TagGroup>::
+# <Tag>' — main/optional_tag_suggestions.py filters on
+# len(tag.split('::', maxsplit=2)) == 3), so both rules are enforced HERE,
+# before anything is written. The prefix is required in its canonical
+# spelling: the add-on's own regex is case-insensitive, but the tag-group
+# segment is matched verbatim and Anki preserves tag case — one canonical
+# spelling in the collection beats a case-variant mess.
+ANKIHUB_OPTIONAL_TAG_PREFIX = 'AnkiHub_Optional::'
+# Per-call ceiling on the staged note set: a runaway loop must fail, not
+# stage. Counted on the DEDUPLICATED note ids (the real workload).
+ANKIHUB_OPTIONAL_TAG_NOTE_CEILING = 500
+# Default undoLabel body for the staging tag write; sanitize_undo_label
+# turns it into UNDO_STAGE_OPTIONAL_TAG (lockstep test-locked).
+ANKIHUB_STAGE_TAG_LABEL = 'Stage Optional Tag'
+# The human's remaining move after a real staging, served verbatim in the
+# response's nextStep key: the action stops at the Browser selection, and
+# both AnkiHub-touching clicks (this menu item, then Submit in their dialog)
+# are the human's own.
+ANKIHUB_STAGE_NEXT_STEP = ('right-click the selection -> AnkiHub -> '
+                           'Suggest Optional Tags')
+
 # call-time feature detection: these functions must exist on the add-on's
 # main.suggestions module with AT LEAST these keyword parameters
 ANKIHUB_REQUIRED_SIGNATURES = {
@@ -4609,6 +4701,54 @@ def validate_ankihub_rationale(rationale):
                         'AnkiHub dialog caps it at {}'.format(
                             len(rationale), ANKIHUB_RATIONALE_MAX_LENGTH - 1))
     return rationale
+
+
+def validate_ankihub_optional_tag(tag):
+    """The staged optional tag (SPEC 33), validated before ANY write or UI.
+
+    Shape errors (wrong type, empty, embedded whitespace — bulk_add_tags
+    splits tag strings on whitespace, so a spaced 'tag' would silently
+    become several tags, only the first of them optional) are
+    [invalid_param]; a well-formed Anki tag that is not a suggestible
+    optional tag (wrong prefix, fewer than three '::' segments, an empty
+    segment) is refused on semantic grounds -> [validation_error], because
+    the AnkiHub dialog would silently ignore it.
+    """
+    if not isinstance(tag, str) or not tag.strip():
+        raise PlusError('invalid_param', 'invalid parameter: tag: non-empty string required')
+    if tag != ''.join(tag.split()):
+        raise PlusError('invalid_param', 'invalid parameter: tag: whitespace is not allowed '
+                        'in a tag (it would split into several tags)')
+    if not tag.startswith(ANKIHUB_OPTIONAL_TAG_PREFIX):
+        raise PlusError('validation_error',
+                        "VALIDATION_ERROR: tag must start with '{}' (canonical spelling) - "
+                        'this action only stages OPTIONAL tag suggestions'.format(
+                            ANKIHUB_OPTIONAL_TAG_PREFIX))
+    parts = tag.split('::')
+    if len(parts) < 3 or any(not part for part in parts):
+        raise PlusError('validation_error',
+                        "VALIDATION_ERROR: tag needs the shape '{}<TagGroup>::<Tag>' "
+                        '(at least three non-empty :: segments) - the AnkiHub dialog '
+                        'ignores optional tags with fewer'.format(ANKIHUB_OPTIONAL_TAG_PREFIX))
+    return tag
+
+
+def validate_ankihub_optional_tag_note_ids(note_ids):
+    """The staged note-id set (SPEC 33): a non-empty list of ints,
+    deduplicated preserving first occurrence, capped at
+    ANKIHUB_OPTIONAL_TAG_NOTE_CEILING unique notes (a runaway loop should
+    fail, not stage). Returns the deduplicated list."""
+    if not isinstance(note_ids, list) or not note_ids:
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: non-empty list required')
+    if not all(isinstance(nid, int) and not isinstance(nid, bool) for nid in note_ids):
+        raise PlusError('invalid_param', 'invalid parameter: noteIds: ints required')
+    deduped = list(dict.fromkeys(note_ids))
+    if len(deduped) > ANKIHUB_OPTIONAL_TAG_NOTE_CEILING:
+        raise PlusError('invalid_param',
+                        'invalid parameter: noteIds: at most {} notes per staging call '
+                        '(got {} unique ids) - split the set'.format(
+                            ANKIHUB_OPTIONAL_TAG_NOTE_CEILING, len(deduped)))
+    return deduped
 
 
 def _ankihub_source_parts(source, allowed_types):

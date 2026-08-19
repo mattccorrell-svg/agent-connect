@@ -522,15 +522,16 @@ def _arg_spec(fn_node):
 
 def test5_wrapper_static_checks():
     api_methods = _plus_mixin_api_methods()
-    # PLUS_ACTIONS lists exactly 36 actions == the api-decorated mixin methods
-    # (36 = 24 + round-2 SPEC 22/23: mediaExists, storeMediaFilesBulk
+    # PLUS_ACTIONS lists exactly 37 actions == the api-decorated mixin methods
+    # (37 = 24 + round-2 SPEC 22/23: mediaExists, storeMediaFilesBulk
     #         + round-3 SPEC 26: undoStatus
     #         + round-4 SPEC 28: renameDeck, bulkSetFlag, renameTag
     #         + round-4 SPEC 29/30: filteredDeckReport, emptyFilteredDeck,
     #           getEmptyCards, deleteEmptyCards
-    #         + revision-19 SPEC 32: createFilteredDeck, rebuildFilteredDeck)
-    assert len(core.PLUS_ACTIONS) == 36, core.PLUS_ACTIONS
-    assert len(set(core.PLUS_ACTIONS)) == 36, "duplicate action names"
+    #         + revision-19 SPEC 32: createFilteredDeck, rebuildFilteredDeck
+    #         + revision-20 SPEC 33: ankihubStageOptionalTagSuggestion)
+    assert len(core.PLUS_ACTIONS) == 37, core.PLUS_ACTIONS
+    assert len(set(core.PLUS_ACTIONS)) == 37, "duplicate action names"
     assert set(api_methods) == set(core.PLUS_ACTIONS), (
         "PLUS_ACTIONS vs @util.api methods mismatch: only-in-actions=%s "
         "only-in-mixin=%s" % (sorted(set(core.PLUS_ACTIONS) - set(api_methods)),

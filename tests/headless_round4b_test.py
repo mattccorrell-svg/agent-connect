@@ -567,7 +567,8 @@ def test6_lockstep_and_wrappers():
         assert name in core.PLUS_ACTIONS, name
         assert core.PLUS_ACTION_SUMMARIES[name].strip(), name
         assert core.PLUS_ACTION_RETURNS[name].startswith("{"), name
-    assert len(core.PLUS_ACTIONS) == 36, len(core.PLUS_ACTIONS)
+    # 36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion
+    assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
     assert core.UNDO_EMPTY_FILTERED == "AnkiConnect Plus: Empty Filtered Deck"
     assert core.UNDO_DELETE_EMPTY == "AnkiConnect Plus: Delete Empty Cards"
@@ -579,7 +580,7 @@ def test6_lockstep_and_wrappers():
     assert core.PLUS_ERROR_CODE_DOCS["cards_in_filtered_decks"]["reachable"] is True
     assert "emptyFilteredDeck" in \
         core.PLUS_ERROR_CODE_DOCS["cards_in_filtered_decks"]["meaning"]
-    assert "36 Plus actions" in core.PLUS_ERROR_PREFIX_NOTE
+    assert "37 Plus actions" in core.PLUS_ERROR_PREFIX_NOTE
     # recipes: the export-safety story and the audit->remediate loop
     names = [r["name"] for r in core.PLUS_RECIPES]
     assert "safe deck export" in names and "empty-cards cleanup" in names, names

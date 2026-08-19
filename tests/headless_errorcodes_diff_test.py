@@ -706,10 +706,11 @@ def test12_plusinfo_returns_and_error_codes():
     finally:
         util_mod.setting = orig
 
-    # (i) 'returns' for all 36 actions, no strays, none empty
+    # (i) 'returns' for all 37 actions, no strays, none empty
+    # (36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion)
     assert set(pkg_core.PLUS_ACTION_RETURNS) == set(pkg_core.PLUS_ACTIONS), \
         sorted(set(pkg_core.PLUS_ACTION_RETURNS) ^ set(pkg_core.PLUS_ACTIONS))
-    assert len(pkg_core.PLUS_ACTIONS) == 36, len(pkg_core.PLUS_ACTIONS)
+    assert len(pkg_core.PLUS_ACTIONS) == 37, len(pkg_core.PLUS_ACTIONS)
     for name in pkg_core.PLUS_ACTIONS:
         entry = info["actionDocs"][name]
         # revision 18: side-effectful actions carry a fourth key, 'preserves'

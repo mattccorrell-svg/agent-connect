@@ -936,11 +936,13 @@ class PlusMixin:
                         core.ANKIHUB_TESTED_ADDON_VERSION, '; '.join(problems)))
 
 
-    def _plusAnkiHubImport(self):
+    def _plusAnkiHubImport(self, gui=True):
         # Access the add-on modules Anki has ALREADY loaded. When the package
         # is in sys.modules, import_module is a cached no-op; when it is not
         # (add-on enabled without a restart), importing it ourselves would run
         # its entry_point (real AnkiHub sync machinery) — never attempted.
+        # gui=False (SPEC 33): the staging action deliberately imports NOTHING
+        # from the add-on's gui/ package — its boundary is "everything local".
         pkg = core.ANKIHUB_ADDON_PACKAGE
         manager = self.window().addonManager
         if pkg not in manager.allAddons():
@@ -956,14 +958,16 @@ class PlusMixin:
                                  'ANKIHUB_ADDON_DISABLED: the AnkiHub add-on is '
                                  'enabled but was not loaded this session - '
                                  'restart Anki')
+        imports = [('suggestions', '.main.suggestions'),
+                   ('models', '.ankihub_client.models'),
+                   ('client', '.ankihub_client.ankihub_client'),
+                   ('settings', '.settings'),
+                   ('db', '.db')]
+        if gui:
+            imports.append(('media_sync', '.gui.media_sync'))
         modules = {}
         try:
-            for alias, name in (('suggestions', '.main.suggestions'),
-                                ('models', '.ankihub_client.models'),
-                                ('client', '.ankihub_client.ankihub_client'),
-                                ('settings', '.settings'),
-                                ('db', '.db'),
-                                ('media_sync', '.gui.media_sync')):
+            for alias, name in imports:
                 modules[alias] = importlib.import_module(pkg + name)
         except Exception as err:
             self._plusAnkiHubIncompatible(['import failed: {}'.format(err)])
@@ -1014,9 +1018,12 @@ class PlusMixin:
         for attr in ('AnkiHubHTTPError', 'AnkiHubRequestException'):
             if getattr(modules['client'], attr, None) is None:
                 problems.append('ankihub_client.{} is missing'.format(attr))
-        mediaSync = getattr(modules['media_sync'], 'media_sync', None)
-        if mediaSync is None or not callable(getattr(mediaSync, 'start_media_upload', None)):
-            problems.append('gui.media_sync.media_sync.start_media_upload is missing')
+        if 'media_sync' in modules:
+            # only imported on the gui=True path (the suggest actions); the
+            # SPEC 33 staging action never imports the add-on's gui/ package
+            mediaSync = getattr(modules['media_sync'], 'media_sync', None)
+            if mediaSync is None or not callable(getattr(mediaSync, 'start_media_upload', None)):
+                problems.append('gui.media_sync.media_sync.start_media_upload is missing')
         config = getattr(modules['settings'], 'config', None)
         if config is None or not callable(getattr(config, 'is_logged_in', None)):
             problems.append('settings.config.is_logged_in is missing')
@@ -1027,14 +1034,16 @@ class PlusMixin:
             problems.append('settings.config.anking_deck_id is missing')
         database = getattr(modules['db'], 'ankihub_db', None)
         for name in ('ankihub_nid_for_anki_nid', 'ankihub_did_for_anki_nid',
-                     'ankihub_did_for_note_type'):
+                     'ankihub_did_for_note_type',
+                     # SPEC 33: the staging flow's single-deck validation
+                     'ankihub_dids_for_anki_nids'):
             if database is None or not callable(getattr(database, name, None)):
                 problems.append('db.ankihub_db.{} is missing'.format(name))
         return problems
 
 
-    def _plusAnkiHubModules(self):
-        modules = self._plusAnkiHubImport()
+    def _plusAnkiHubModules(self, gui=True):
+        modules = self._plusAnkiHubImport(gui=gui)
         problems = self._plusAnkiHubProblems(modules)
         if problems:
             self._plusAnkiHubIncompatible(problems)
@@ -1275,6 +1284,104 @@ class PlusMixin:
             raise core.PlusError('network_error', 'NETWORK_ERROR: {}'.format(err))
         return {'result': 'success' if submitted else 'noChanges',
                 'resubmittedAsChange': False}
+
+
+    # Staged optional-tag suggestion (SPEC 33). DELIBERATELY STAGED, NEVER
+    # SUBMITTED — AND NEVER TOUCHING ANKIHUB'S CODE OR SERVERS: AnkiHub's ToS
+    # (effective 2025-01-14) prohibits scripted posting, and this project's
+    # own constraints require written permission for ANY programmatic AnkiHub
+    # access. So the action's boundary is "everything local": validate, tag
+    # (one undoable batch), open Anki's Browser on exactly the staged notes,
+    # then STOP. The human right-clicks the selection -> AnkiHub -> "Suggest
+    # Optional Tags" and presses Submit — every touch of AnkiHub's code and
+    # servers (even opening their dialog, whose __init__ fetches deck
+    # extensions and fires a prevalidation op) happens on a human's click.
+    # No module from the add-on's gui/ package is imported here, and no call
+    # made here can reach the network; the add-on reads used (config login
+    # flag, ankihub_db deck mapping) are local file reads.
+    @plus_api()
+    def ankihubStageOptionalTagSuggestion(self, tag, noteIds, dryRun=False,
+                                          undoLabel=None):
+        # Guard order per the family rule (SPEC 19/33): cheap param
+        # validation -> add-on presence + feature detection -> login check ->
+        # local db checks -> dryRun exit -> tag write -> Browser. The login
+        # check runs even though nothing here talks to AnkiHub: a logged-out
+        # human could not submit the staged suggestion, so failing fast here
+        # beats a dead-end Browser handoff.
+        if not isinstance(dryRun, bool):
+            raise core.PlusError('invalid_param', 'invalid parameter: dryRun: boolean required')
+        core.sanitize_undo_label(undoLabel)  # early shape check; None passes
+        tag = core.validate_ankihub_optional_tag(tag)
+        noteIds = core.validate_ankihub_optional_tag_note_ids(noteIds)
+        modules = self._plusAnkiHubModules(gui=False)
+        self._plusAnkiHubLoginCheck(modules)
+
+        # all-or-nothing (SPEC 33): one missing note refuses the WHOLE
+        # request before anything is tagged or opened — staging a partial
+        # set is worse than staging nothing
+        collection = self.collection()
+        for nid in noteIds:
+            try:
+                collection.get_note(anki.notes.NoteId(nid))
+            except anki.errors.NotFoundError:
+                raise core.PlusError('not_found',
+                                     'note was not found: {}'.format(nid))
+        # every note must sit on exactly ONE AnkiHub deck — AnkiHub's own
+        # dialog enforces the same rule, but only after the human opens it;
+        # checking the same add-on db mapping here (a local read of the
+        # add-on's database file) refuses a doomed staging before any write
+        database = modules['db'].ankihub_db
+        ankihubDeckIds = list(database.ankihub_dids_for_anki_nids(noteIds))
+        if not ankihubDeckIds:
+            raise core.PlusError('not_found',
+                                 'NOT_AN_ANKIHUB_NOTE: none of these notes is on '
+                                 'AnkiHub (or they were deleted there) - optional '
+                                 'tags can only be suggested for AnkiHub notes')
+        if len(ankihubDeckIds) > 1:
+            raise core.PlusError('validation_error',
+                                 'VALIDATION_ERROR: the notes span {} AnkiHub '
+                                 "decks; AnkiHub's dialog accepts one deck per "
+                                 'suggestion - split the call per '
+                                 'deck'.format(len(ankihubDeckIds)))
+        ankihubDeckId = str(ankihubDeckIds[0])
+
+        # the tag write reuses core.bulk_add_tags: same single-undo-entry,
+        # dryRun and idempotence (already-tagged notes skipped) contracts as
+        # bulkAddTags, under this action's own default entry name
+        label = undoLabel if undoLabel is not None else core.ANKIHUB_STAGE_TAG_LABEL
+        tagReport = core.bulk_add_tags(collection, noteIds, [tag], atomic=True,
+                                       dry_run=dryRun, undo_label=label)
+        if dryRun:
+            wouldTag = tagReport['wouldUpdate']
+            written = set(wouldTag)
+            return {'wouldTag': wouldTag,
+                    'alreadyTagged': [nid for nid in noteIds if nid not in written],
+                    'ankihubDeckId': ankihubDeckId,
+                    'wouldOpenBrowser': True,
+                    'undoEntry': None}
+
+        tagged = tagReport['updated']
+        written = set(tagged)
+        alreadyTagged = [nid for nid in noteIds if nid not in written]
+
+        # tag -> Browser -> STOP (SPEC 33). The Browser is opened on exactly
+        # the staged notes, in request order; search takes a 1-TUPLE — a bare
+        # string would splat character-by-character into garbage terms
+        # (aqt 25.09.4 Browser.__init__/reopen both call
+        # search_for_terms(*search)). Everything past this point is the
+        # human's: right-click the selection -> AnkiHub -> "Suggest Optional
+        # Tags", review, Submit. Should the Browser open fail after the tag
+        # write, the write is kept (one undo entry) and a re-run is safe:
+        # bulk_add_tags skips already-tagged notes.
+        aqt.dialogs.open(
+            'Browser', self.window(),
+            search=('nid:' + ','.join(str(nid) for nid in noteIds),))
+        return {'tagged': tagged,
+                'alreadyTagged': alreadyTagged,
+                'ankihubDeckId': ankihubDeckId,
+                'browserOpened': True,
+                'nextStep': core.ANKIHUB_STAGE_NEXT_STEP,
+                'undoEntry': tagReport['undoEntry']}
 
 
     # guard_sync=False: pure reflection over module constants and the wrapper
