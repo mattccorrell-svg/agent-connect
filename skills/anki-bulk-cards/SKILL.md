@@ -5,7 +5,7 @@ description: Build, edit, audit, or repair Anki cards at scale through the AnkiC
 
 # Bulk Anki work via AnkiConnect Plus
 
-AnkiConnect Plus is a fork of AnkiConnect that makes large Anki jobs fast, atomic, and reviewable. Stock AnkiConnect runs on **8765** (decks, models, GUI, `findNotes`, `storeMediaFile`); the Plus actions run on **8766**. Anki must be open. Same protocol on both:
+AnkiConnect Plus is a fork of AnkiConnect that makes large Anki jobs fast, atomic, and reviewable. It serves **everything on port 8766** — the 34 Plus actions *and* the full upstream AnkiConnect surface (decks, models, GUI, `findNotes`, `storeMediaFile`), since it is a fork of the whole codebase. (On Matt's machine stock AnkiConnect is disabled; if a stock install is active elsewhere it answers on 8765.) Anki must be open. Protocol:
 
 ```
 POST http://localhost:8766   {"action": "...", "version": 6, "params": {...}}
