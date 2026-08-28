@@ -15,7 +15,7 @@
 #   * deleteEmptyCards   (30.2) — the dialog's deletion incl. its keep-notes
 #                                 last-card protection, one undoable batch
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_round4b_test.py
+# Run with: <anki-venv>/bin/python headless_round4b_test.py
 #
 # Uses FRESH scratch collections; never touches ~/Library/Application Support/Anki2/.
 

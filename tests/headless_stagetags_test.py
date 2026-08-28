@@ -9,7 +9,7 @@
 # same seams (they are the implementation's seams), independent scenarios
 # and instrumentation.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_stagetags_test.py
+# Run with: <anki-venv>/bin/python headless_stagetags_test.py
 #
 # ZERO NETWORK — by construction AND by enforcement. This action's whole
 # premise is that nothing talks to AnkiHub, so a process-wide socket
@@ -45,8 +45,7 @@ import uuid as uuid_mod
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
 
-_PREFERRED_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                      "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_st_v1")
+_PREFERRED_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_st_v1")
 
 
 def _pick_scratch():

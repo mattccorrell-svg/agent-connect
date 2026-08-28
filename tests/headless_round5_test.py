@@ -19,7 +19,7 @@
 #      headless/no-mw, VIRGIN-install, user-config, partial, absent-key and
 #      non-boolean-typo paths.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_round5_test.py
+# Run with: <anki-venv>/bin/python headless_round5_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

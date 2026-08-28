@@ -1,6 +1,6 @@
 # Headless verification for the SPEC 18 sync helpers (syncStatus / syncNow).
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_sync_test.py
+# Run with: <anki-venv>/bin/python headless_sync_test.py
 #
 # ZERO NETWORK by construction: only the pure core.py helpers are exercised
 # (enum maps, bounded auth copy, local dirtiness select, error classification).

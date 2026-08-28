@@ -8,7 +8,7 @@
 # documented as monotonic that silently reset, and a retryable error code that
 # could never become satisfiable.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_round3review_test.py
+# Run with: <anki-venv>/bin/python headless_round3review_test.py
 #
 # FRESH scratch collections only; never touches ~/Library/Application
 # Support/Anki2/. Zero network by construction and by enforcement.

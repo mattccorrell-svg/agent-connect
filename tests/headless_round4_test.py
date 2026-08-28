@@ -12,7 +12,7 @@
 # All three: one merged undo entry, undoLabel, dryRun with a bit-identical
 # undo snapshot, house '[code] ' errors.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_round4_test.py
+# Run with: <anki-venv>/bin/python headless_round4_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

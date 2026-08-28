@@ -3,7 +3,7 @@
 
 Discovers tests/headless_*.py, runs each as a subprocess of the CURRENT
 interpreter (so invoke this with the Anki venv python:
-"/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python"
+<anki-venv>/bin/python
 tests/run_all.py), prints per-file pass/fail, and exits nonzero if any
 suite fails. Intended for the weekly health check.
 """

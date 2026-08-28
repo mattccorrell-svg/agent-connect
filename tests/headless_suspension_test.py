@@ -10,7 +10,7 @@
 # lands inside the SAME undo entry (one Ctrl+Z, no half-reverted state), and
 # the response says what actually happened rather than what was requested.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_suspension_test.py
+# Run with: <anki-venv>/bin/python headless_suspension_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

@@ -3,7 +3,7 @@
 # add-on (read-only import with SKIP_INIT=1, entry point never run) and the
 # aqt-side attributes plus.py relies on.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_sync_ankihub_test.py
+# Run with: <anki-venv>/bin/python headless_sync_ankihub_test.py
 #
 # ZERO NETWORK by construction AND by enforcement: a process-wide socket guard
 # is installed before anything heavy loads; any connection attempt raises and
@@ -36,8 +36,7 @@ ADDONS21 = os.path.expanduser("~/Library/Application Support/Anki2/addons21")
 ADDON_PKG = "1322529746"
 ADDON_DIR = os.path.join(ADDONS21, ADDON_PKG)
 
-_PREFERRED_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                      "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_sa_r1")
+_PREFERRED_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_sa_r1")
 
 
 def _pick_scratch():

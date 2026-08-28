@@ -4,7 +4,7 @@
 # and the discoverability lock (SPEC 4.9 recipes + the SPEC 13
 # raw-fidelity-field-projection naming).
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_errorcodes_diff_test.py
+# Run with: <anki-venv>/bin/python headless_errorcodes_diff_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application
 # Support/Anki2/. ZERO NETWORK by construction AND by enforcement (socket
@@ -25,8 +25,7 @@ import types
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
 
-_PREFERRED_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                      "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_r2_cef")
+_PREFERRED_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_r2_cef")
 
 
 def _pick_scratch():

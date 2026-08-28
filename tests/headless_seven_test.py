@@ -1,7 +1,7 @@
 # Headless verification for the two field-feedback actions (SPEC 20-21):
 # checkDeckIntegrity and bulkReplaceInFields.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_seven_test.py
+# Run with: <anki-venv>/bin/python headless_seven_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

@@ -33,7 +33,7 @@
 #                      errorCodes coverage, PLUS_VERSION/PLUS_SPEC_REVISION
 #                      lockstep with the SPEC.md header.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_guigap_test.py
+# Run with: <anki-venv>/bin/python headless_guigap_test.py
 #
 # FRESH scratch collections; never touches ~/Library/Application Support/Anki2/.
 # ZERO NETWORK by construction AND enforcement (socket deny-guard below).
@@ -51,8 +51,7 @@ import types
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
 
-_PREFERRED_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                      "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_r4_v1")
+_PREFERRED_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_r4_v1")
 
 
 def _pick_scratch():

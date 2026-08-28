@@ -7,7 +7,7 @@
 # true without a documented trigger") the invariant itself is asserted, not a
 # single happy-path sample.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_report3_test.py
+# Run with: <anki-venv>/bin/python headless_report3_test.py
 #
 # FRESH scratch collections only; never touches ~/Library/Application
 # Support/Anki2/. ZERO NETWORK by construction AND by enforcement (socket
@@ -33,8 +33,7 @@ CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
 PLUS_PATH = os.path.join(REPO, "connect_plus", "plus.py")
 INIT_PATH = os.path.join(REPO, "connect_plus", "__init__.py")
 
-_PREFERRED_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                      "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_r3_v2")
+_PREFERRED_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_r3_v2")
 
 
 def _pick_scratch():

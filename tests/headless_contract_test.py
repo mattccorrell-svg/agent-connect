@@ -38,7 +38,7 @@
 #   6. Lockstep: PLUS_VERSION 1.5.0, PLUS_SPEC_REVISION 20, the SPEC.md
 #      header agrees, 37 actions, and plusInfo serves the same three.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_contract_test.py
+# Run with: <anki-venv>/bin/python headless_contract_test.py
 #
 # Scratch collection under the session scratchpad (ancp_r5_v1), overridable
 # via ANCP_CONTRACT_SCRATCH, tempfile fallback if unwritable. NEVER touches
@@ -76,8 +76,7 @@ socket.getaddrinfo = _deny("socket.getaddrinfo")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
-_DEFAULT_SCRATCH = ("/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-                    "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_r5_v1")
+_DEFAULT_SCRATCH = os.path.join(tempfile.gettempdir(), "ancp_r5_v1")
 SCRATCH = os.environ.get("ANCP_CONTRACT_SCRATCH") or _DEFAULT_SCRATCH
 
 assert not SCRATCH.startswith(os.path.expanduser("~/Library")), \

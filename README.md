@@ -11,7 +11,7 @@ Derived from **AnkiConnect** by **Alex Yatskov (FooSoft Productions)** — <http
 Copy or symlink the `connect_plus/` folder into Anki's add-on directory as exactly `connect_plus` (the folder name is load-bearing — config is keyed to it):
 
 ```bash
-ln -s /Users/mattyc/Downloads/anki-connect-plus/connect_plus "~/Library/Application Support/Anki2/addons21/connect_plus"
+ln -s <repo>/connect_plus "~/Library/Application Support/Anki2/addons21/connect_plus"
 ```
 
 (or copy `connect_plus/` there). Restart Anki.

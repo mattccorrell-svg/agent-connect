@@ -1,6 +1,6 @@
 # Headless verification for the SPEC 19 AnkiHub pure helpers.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_ankihub_test.py
+# Run with: <anki-venv>/bin/python headless_ankihub_test.py
 #
 # ZERO NETWORK and ZERO ADD-ON IMPORTS by construction: only the pure core.py
 # helpers are exercised (change-type/rationale validation, the dialog-exact

@@ -1,7 +1,7 @@
 # Headless verification for SPEC 33 — staged optional-tag suggestion
 # (spec revision 20, v1.5.0): ankihubStageOptionalTagSuggestion.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_optionaltag_test.py
+# Run with: <anki-venv>/bin/python headless_optionaltag_test.py
 #
 # ZERO NETWORK and ZERO REAL ADD-ON IMPORTS by construction: the AnkiHub
 # add-on package is FAKED in sys.modules (plus.py reaches add-on modules

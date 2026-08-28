@@ -2,7 +2,7 @@
 # core functions in AnkiConnect Plus.
 #
 # Run with:
-#   "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_crop_test.py
+#   <anki-venv>/bin/python headless_crop_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

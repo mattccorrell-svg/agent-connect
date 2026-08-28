@@ -2,7 +2,7 @@
 # renderCard, notesSlim, mediaThumbnails, dryRun on the bulk actions,
 # bulkSuspend + bulkSetDueDate, exportDeckApkg.
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_six_test.py
+# Run with: <anki-venv>/bin/python headless_six_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 

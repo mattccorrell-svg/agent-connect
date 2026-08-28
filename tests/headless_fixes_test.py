@@ -6,7 +6,7 @@
 #      in a path separator) instead of writing a surprise sibling file.
 #   3. exportDeckApkg must reject outPath="" (empty string).
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" headless_fixes_test.py
+# Run with: <anki-venv>/bin/python headless_fixes_test.py
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
 
 import importlib.util

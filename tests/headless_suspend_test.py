@@ -18,7 +18,7 @@
 #   7  regression: round-3 behaviors (unsuspended/changedIds, undoLabel
 #      readback via undoStatus, notesSlim total == found + missing)
 #
-# Run with: "/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/bin/python" tests/headless_suspend_test.py
+# Run with: <anki-venv>/bin/python tests/headless_suspend_test.py
 #
 # FRESH scratch collections only; never touches ~/Library/Application Support/Anki2/.
 # ZERO NETWORK by construction AND by enforcement (socket deny-guard below).
@@ -27,6 +27,7 @@ import importlib
 import importlib.util
 import json
 import os
+import tempfile
 import shutil
 import socket
 import sys
@@ -38,11 +39,10 @@ sys.dont_write_bytecode = True
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE_PATH = os.path.join(REPO, "connect_plus", "core.py")
 SCRATCH = (os.environ.get("ANCP_TEST_SCRATCH") or
-           "/private/tmp/claude-501/-Users-mattyc-Downloads-prite-daily-main/"
-           "6b24b91e-e4dc-4cbf-934f-6e83d3ff850a/scratchpad/ancp_susp_v1")
+           os.path.join(tempfile.gettempdir(), "ancp_susp_v1"))
 
 # ---------------------------------------------------------------- safety
-# Matt's real collection lives under ~/Library/Application Support/Anki2/.
+# The user's real collection lives under ~/Library/Application Support/Anki2/.
 # Refuse to run at all if the scratch path could possibly land there.
 assert os.path.isabs(SCRATCH), "scratch dir must be absolute"
 assert not SCRATCH.startswith(os.path.expanduser("~/Library")), \
