@@ -364,7 +364,7 @@ def test1_registry_lockstep():
     # constants + undo-entry lockstep
     assert core.ANKIHUB_OPTIONAL_TAG_PREFIX == "AnkiHub_Optional::"
     assert core.ANKIHUB_OPTIONAL_TAG_NOTE_CEILING == 500
-    assert core.UNDO_STAGE_OPTIONAL_TAG == "AnkiConnect Plus: Stage Optional Tag"
+    assert core.UNDO_STAGE_OPTIONAL_TAG == "Agent Connect: Stage Optional Tag"
     assert core.sanitize_undo_label(core.ANKIHUB_STAGE_TAG_LABEL) == \
         core.UNDO_STAGE_OPTIONAL_TAG
     assert core.ANKIHUB_STAGE_NEXT_STEP == \
@@ -678,8 +678,8 @@ def test8_real_path():
         n4 = add_note("real4")
         out4 = bridge.ankihubStageOptionalTagSuggestion(
             TAG, [n4], undoLabel="PI 27 staging")
-        assert out4["undoEntry"] == "AnkiConnect Plus: PI 27 staging"
-        assert undo_snapshot()["undo"] == "AnkiConnect Plus: PI 27 staging"
+        assert out4["undoEntry"] == "Agent Connect: PI 27 staging"
+        assert undo_snapshot()["undo"] == "Agent Connect: PI 27 staging"
 
         # a single undo reverts the last staging's tag write
         col.undo()

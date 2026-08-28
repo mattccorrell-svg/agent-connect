@@ -1,5 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
-# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+# Copyright (C) 2026 Matthew Correll (Agent Connect modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -273,7 +273,7 @@ def _reap_stale_sync_job(job):
 
 
 #
-# Plus actions
+# Agent Connect actions
 #
 
 class PlusMixin:
@@ -1423,7 +1423,7 @@ class PlusMixin:
                 'meaning': doc.get('meaning', ''),
             }
         return {
-            'name': 'AnkiConnect Plus',
+            'name': 'Agent Connect',
             'version': core.PLUS_VERSION,
             # the SPEC revision this build implements (revision 15+). Both
             # fields move whenever DEFAULT BEHAVIOR changes, so a client that

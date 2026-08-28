@@ -1,5 +1,5 @@
 # Independent verification (round 1) for the cropImage / cropImageOcclusionImage
-# core functions in AnkiConnect Plus.
+# core functions in Agent Connect.
 #
 # Run with:
 #   <anki-venv>/bin/python headless_crop_test.py
@@ -166,11 +166,11 @@ def test1_crop_image_pixels_and_notes():
         col.get_note(n2)["Front"]
 
     # undoable as ONE entry
-    assert col.undo_status().undo == "AnkiConnect Plus: Crop Image", col.undo_status().undo
+    assert col.undo_status().undo == "Agent Connect: Crop Image", col.undo_status().undo
     col.undo()
     assert col.get_note(n1)["Front"] == 'ref1 <img src="quadr1.png">', "undo did not restore n1"
     assert col.get_note(n2)["Front"] == 'ref2-not-in-noteids <img src="quadr1.png">'
-    assert col.undo_status().undo != "AnkiConnect Plus: Crop Image", \
+    assert col.undo_status().undo != "Agent Connect: Crop Image", \
         "crop entry still on stack after one undo (not a single merged entry)"
 
 
@@ -277,9 +277,9 @@ def test3_crop_io_remap():
     assert got["header"] == "RH" and got["backExtra"] == "RB" and got["tags"] == ["r1tag"], got
 
     # SINGLE undo entry reverts the whole operation
-    assert col.undo_status().undo == "AnkiConnect Plus: Crop IO Image", col.undo_status().undo
+    assert col.undo_status().undo == "Agent Connect: Crop IO Image", col.undo_status().undo
     col.undo()
-    assert col.undo_status().undo != "AnkiConnect Plus: Crop IO Image", \
+    assert col.undo_status().undo != "Agent Connect: Crop IO Image", \
         "crop-IO entry still on stack after one undo (not a single merged entry)"
     back = core.get_image_occlusion_note(col, nid)
     assert back["imageFilename"] == orig_filename, back

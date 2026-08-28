@@ -228,8 +228,8 @@ def plus_error(fn):
     raise AssertionError("expected a refusal, call succeeded")
 
 
-CREATE_LABEL = "AnkiConnect Plus: Create Filtered Deck"
-REBUILD_LABEL = "AnkiConnect Plus: Rebuild Filtered Deck"
+CREATE_LABEL = "Agent Connect: Create Filtered Deck"
+REBUILD_LABEL = "Agent Connect: Rebuild Filtered Deck"
 
 # real captured responses, locked against the served returns docs in test 7
 CAPTURED = {}

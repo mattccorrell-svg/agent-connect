@@ -1,5 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
-# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+# Copyright (C) 2026 Matthew Correll (Agent Connect modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -183,7 +183,7 @@ class WebServer:
         except (ValueError, jsonschema.ValidationError) as e:
             if allowed:
                 if len(req.body) == 0:
-                    body = json.dumps({"apiVersion": f"AnkiConnect Plus v.{util.setting('apiVersion')}"}).encode('utf-8')
+                    body = json.dumps({"apiVersion": f"Agent Connect v.{util.setting('apiVersion')}"}).encode('utf-8')
                 else:
                     reply = format_exception_reply(util.setting('apiVersion'), e)
                     body = json.dumps(reply).encode('utf-8')

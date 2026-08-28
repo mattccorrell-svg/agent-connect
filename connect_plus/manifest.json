@@ -1,0 +1,6 @@
+{
+  "package": "agent_connect",
+  "name": "Agent Connect",
+  "min_point_version": 250900,
+  "homepage": "https://github.com/mattccorrell-svg/anki-connect-plus"
+}

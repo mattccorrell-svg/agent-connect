@@ -233,9 +233,9 @@ def test4_rename_deck_case_move_label():
     col.decks.id("R4Parent")
     r = core.rename_deck(col, "R4CASE", "R4Parent::R4CASE",
                          undo_label="move under parent")
-    assert r["undoEntry"] == "AnkiConnect Plus: move under parent", r
+    assert r["undoEntry"] == "Agent Connect: move under parent", r
     assert deck_name(did) == "R4Parent::R4CASE"
-    assert col.undo_status().undo == "AnkiConnect Plus: move under parent"
+    assert col.undo_status().undo == "Agent Connect: move under parent"
     col.undo()
     assert deck_name(did) == "R4CASE"
 
@@ -416,12 +416,12 @@ def test9_undo_labels():
     cid = col.card_ids_of_note(n)[0]
 
     r = core.bulk_set_flag(col, [cid], 7, undo_label="clear the inbox")
-    assert r["undoEntry"] == "AnkiConnect Plus: clear the inbox", r
-    assert col.undo_status().undo == "AnkiConnect Plus: clear the inbox"
+    assert r["undoEntry"] == "Agent Connect: clear the inbox", r
+    assert col.undo_status().undo == "Agent Connect: clear the inbox"
 
     r = core.rename_tag(col, "r9::tag", "r9::done", undo_label="tag sweep")
-    assert r["undoEntry"] == "AnkiConnect Plus: tag sweep", r
-    assert col.undo_status().undo == "AnkiConnect Plus: tag sweep"
+    assert r["undoEntry"] == "Agent Connect: tag sweep", r
+    assert col.undo_status().undo == "Agent Connect: tag sweep"
 
     before = undo_snap()
     dry = core.bulk_set_flag(col, [cid], 3, dry_run=True, undo_label="dry label")
@@ -447,9 +447,9 @@ def test10_lockstep_and_wrappers():
     # 36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion
     assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
-    assert core.UNDO_RENAME_DECK == "AnkiConnect Plus: Rename Deck"
-    assert core.UNDO_BULK_FLAG == "AnkiConnect Plus: Bulk Flag"
-    assert core.UNDO_RENAME_TAG == "AnkiConnect Plus: Rename Tag"
+    assert core.UNDO_RENAME_DECK == "Agent Connect: Rename Deck"
+    assert core.UNDO_BULK_FLAG == "Agent Connect: Bulk Flag"
+    assert core.UNDO_RENAME_TAG == "Agent Connect: Rename Tag"
     # revision 17: the occupied-name refusal made 'duplicate' reachable
     assert core.PLUS_ERROR_CODE_DOCS["duplicate"]["reachable"] is True
     assert core.PLUS_ERROR_CODES["duplicate"] is False  # still not retryable

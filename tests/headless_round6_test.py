@@ -146,7 +146,7 @@ def test1_create_dry_real_parity_and_exclusions():
     assert real["cardsGathered"] == dry["wouldGather"] == 3, real
     assert real["name"] == "PI9 cram"
     assert real["terms"] == dry["terms"]
-    assert real["undoEntry"] == "AnkiConnect Plus: Create Filtered Deck"
+    assert real["undoEntry"] == "Agent Connect: Create Filtered Deck"
     did = real["deckId"]
     assert col.decks.is_filtered(did)
     # the exclusions were honored: suspended/buried/other-filter never gathered
@@ -158,7 +158,7 @@ def test1_create_dry_real_parity_and_exclusions():
         row = col.db.first("select did, odid from cards where id = ?", cid)
         assert row == [did, home_id], row
     # entry on top; ONE undo deletes the deck AND returns the cards
-    assert col.undo_status().undo == "AnkiConnect Plus: Create Filtered Deck"
+    assert col.undo_status().undo == "Agent Connect: Create Filtered Deck"
     col.undo()
     assert deck_names() == names_before
     for cid in gathered:
@@ -308,7 +308,7 @@ def test5_create_saved_config_and_parents():
     names_before = deck_names()
     real2 = core.create_filtered_deck(col, "NewParent::Cram", "tag:par",
                                       undo_label="parents probe")
-    assert real2["undoEntry"] == "AnkiConnect Plus: parents probe"
+    assert real2["undoEntry"] == "Agent Connect: parents probe"
     parent_id = col.decks.id_for_name("NewParent")
     assert parent_id is not None and not col.decks.is_filtered(parent_id)
     col.undo()
@@ -358,7 +358,7 @@ def test7_rebuild_honest_halves():
     rb = core.rebuild_filtered_deck(col, deck_name="RBCram",
                                     undo_label="rb probe")
     assert rb == {"cardsGathered": 4, "returnedFirst": 5,
-                  "undoEntry": "AnkiConnect Plus: rb probe"}, rb
+                  "undoEntry": "Agent Connect: rb probe"}, rb
     assert len(cards_in(did)) == 4
     col.undo()
     assert cards_in(did) == before_membership, \
@@ -380,7 +380,7 @@ def test8_rebuild_to_zero_and_noop_gate():
         col.update_note(n)
     rb = core.rebuild_filtered_deck(col, deck_id=did)
     assert rb["returnedFirst"] == 2 and rb["cardsGathered"] == 0, rb
-    assert rb["undoEntry"] == "AnkiConnect Plus: Rebuild Filtered Deck"
+    assert rb["undoEntry"] == "Agent Connect: Rebuild Filtered Deck"
     assert cards_in(did) == set()
     # now empty + saved terms gather 0: the gated no-op
     snap = undo_snap()
@@ -477,7 +477,7 @@ def test9b_rebuild_deck_named_filtered():
     assert dry["terms"][0]["eligible"] == 1, dry
     rb = core.rebuild_filtered_deck(col, deck_id=did)
     assert rb == {"cardsGathered": 1, "returnedFirst": 1,
-                  "undoEntry": "AnkiConnect Plus: Rebuild Filtered Deck"}, rb
+                  "undoEntry": "Agent Connect: Rebuild Filtered Deck"}, rb
 
     # phase 2 — own card stops matching: rebuild-to-zero, dry bounds hold
     # (pre-fix: wouldGather 1 via the tautology, real gathers 0)
@@ -529,8 +529,8 @@ def test10_lockstep_and_wrappers():
     # 36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion
     assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
-    assert core.UNDO_CREATE_FILTERED == "AnkiConnect Plus: Create Filtered Deck"
-    assert core.UNDO_REBUILD_FILTERED == "AnkiConnect Plus: Rebuild Filtered Deck"
+    assert core.UNDO_CREATE_FILTERED == "Agent Connect: Create Filtered Deck"
+    assert core.UNDO_REBUILD_FILTERED == "Agent Connect: Rebuild Filtered Deck"
     assert "37 Plus actions" in core.PLUS_ERROR_PREFIX_NOTE
     assert core.PLUS_VERSION == "1.5.0" and core.PLUS_SPEC_REVISION == 20
     # order vocabulary is the probe-pinned label list, index == enum

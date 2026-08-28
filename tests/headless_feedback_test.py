@@ -577,7 +577,7 @@ def test7_plus_info_action_docs():
     finally:
         util_mod.setting = orig_setting
 
-    assert info["name"] == "AnkiConnect Plus", info["name"]
+    assert info["name"] == "Agent Connect", info["name"]
     assert info["version"] == core.PLUS_VERSION
     assert info["actions"] == list(core.PLUS_ACTIONS)
 

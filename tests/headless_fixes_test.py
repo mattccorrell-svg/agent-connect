@@ -101,7 +101,7 @@ def test2_valid_days_grammar_still_accepted():
     for good in ("0", "5", "1-7", "3!", "1-7!"):
         result = core.bulk_set_due_date(col, [cid], good)
         assert result["changed"] == 1, (good, result)
-        assert result["undoEntry"] == "AnkiConnect Plus: Bulk Due Date", result
+        assert result["undoEntry"] == "Agent Connect: Bulk Due Date", result
         col.undo()  # keep the stack tidy between iterations
 
 

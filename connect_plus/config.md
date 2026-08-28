@@ -1,6 +1,6 @@
-# AnkiConnect Plus
+# Agent Connect
 
-A personal fork of [AnkiConnect](https://foosoft.net/projects/anki-connect/) by Alex Yatskov / FooSoft Productions. Default port is **8766**, so it can run alongside stock AnkiConnect (which uses 8765) in the same Anki install. See the repo README for documentation of the Plus actions.
+A personal fork of [AnkiConnect](https://foosoft.net/projects/anki-connect/) by Alex Yatskov / FooSoft Productions. Default port is **8766**, so it can run alongside stock AnkiConnect (which uses 8765) in the same Anki install. See the repo README for documentation of the Agent Connect actions.
 
 ### Configuration keys
 

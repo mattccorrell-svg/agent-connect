@@ -203,9 +203,9 @@ def test2_empty_filtered_deck():
 
     res = core.empty_filtered_deck(col, deck_name="R2F")
     assert res == {"returned": 2, "homeDecks": {"R2Home": 1, "R2Home::Sub": 1},
-                   "undoEntry": "AnkiConnect Plus: Empty Filtered Deck"}, res
+                   "undoEntry": "Agent Connect: Empty Filtered Deck"}, res
     status = col._backend.get_undo_status()
-    assert status.undo == "AnkiConnect Plus: Empty Filtered Deck", status.undo
+    assert status.undo == "Agent Connect: Empty Filtered Deck", status.undo
     # cards really home: did = old odid, odid = 0
     assert card_rows(n1.id) == [[card_rows(n1.id)[0][0], 0,
                                  col.decks.id_for_name("R2Home"), 0]]
@@ -218,8 +218,8 @@ def test2_empty_filtered_deck():
     # deckId path + undoLabel
     res2 = core.empty_filtered_deck(col, deck_id=fid, undo_label="send home")
     assert res2["returned"] == 2
-    assert res2["undoEntry"] == "AnkiConnect Plus: send home"
-    assert col._backend.get_undo_status().undo == "AnkiConnect Plus: send home"
+    assert res2["undoEntry"] == "Agent Connect: send home"
+    assert col._backend.get_undo_status().undo == "Agent Connect: send home"
 
     # already-empty: gated no-op, bit-identical undo status (the backend
     # WOULD write an entry here — probe-verified — so the gate is the test)
@@ -518,8 +518,8 @@ def test5_delete_empty_cards():
     assert res["notesAffected"] == 2
     assert {p["noteId"] for p in res["protected"]} == {single_id, double_id}
     assert res["notesPreserved"] is True and res["skipped"] == []
-    assert res["undoEntry"] == "AnkiConnect Plus: cloze sweep"
-    assert col._backend.get_undo_status().undo == "AnkiConnect Plus: cloze sweep"
+    assert res["undoEntry"] == "Agent Connect: cloze sweep"
+    assert col._backend.get_undo_status().undo == "Agent Connect: cloze sweep"
     assert col.db.scalar("select count() from notes") == notes_before
     for entry in res["protected"]:
         assert col.db.scalar("select count() from cards where id = ?",
@@ -570,8 +570,8 @@ def test6_lockstep_and_wrappers():
     # 36 -> 37: revision-20 SPEC 33 adds ankihubStageOptionalTagSuggestion
     assert len(core.PLUS_ACTIONS) == 37, len(core.PLUS_ACTIONS)
     assert core.PLUS_ACTIONS[-1] == "plusInfo"
-    assert core.UNDO_EMPTY_FILTERED == "AnkiConnect Plus: Empty Filtered Deck"
-    assert core.UNDO_DELETE_EMPTY == "AnkiConnect Plus: Delete Empty Cards"
+    assert core.UNDO_EMPTY_FILTERED == "Agent Connect: Empty Filtered Deck"
+    assert core.UNDO_DELETE_EMPTY == "Agent Connect: Delete Empty Cards"
     # the export summary/returns disclose the fail-closed default + warnings
     assert "FAIL-CLOSED" in core.PLUS_ACTION_SUMMARIES["exportDeckApkg"]
     assert "warnings" in core.PLUS_ACTION_RETURNS["exportDeckApkg"]

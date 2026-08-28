@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+# Copyright (C) 2026 Matthew Correll (Agent Connect modifications)
 
 import aqt
 import aqt.editor

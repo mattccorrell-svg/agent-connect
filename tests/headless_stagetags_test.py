@@ -609,7 +609,7 @@ def test6_real_staging_happy_path():
         assert result["nextStep"] == core.ANKIHUB_STAGE_NEXT_STEP, result
         assert result["nextStep"] == ("right-click the selection -> AnkiHub "
                                       "-> Suggest Optional Tags"), result
-        assert result["undoEntry"] == "AnkiConnect Plus: Stage Optional Tag", result
+        assert result["undoEntry"] == "Agent Connect: Stage Optional Tag", result
         assert set(result) == {"tagged", "alreadyTagged", "ankihubDeckId",
                                "browserOpened", "nextStep", "undoEntry"}, result
         REAL_RESULT.update(result)
@@ -620,7 +620,7 @@ def test6_real_staging_happy_path():
 
         # ONE undo entry, default label, exactly one step forward
         after = core.undo_status(col)
-        assert after["undo"] == "AnkiConnect Plus: Stage Optional Tag", after
+        assert after["undo"] == "Agent Connect: Stage Optional Tag", after
         assert after["lastStep"] == undo_before["lastStep"] + 1, \
             (undo_before, after)
 
@@ -659,9 +659,9 @@ def test7_rerun_split_undolabel_and_noop():
             TAG, [p, q, r], undoLabel="stage PI 27")
         assert result["tagged"] == [p, q], result
         assert result["alreadyTagged"] == [r], result
-        assert result["undoEntry"] == "AnkiConnect Plus: stage PI 27", result
+        assert result["undoEntry"] == "Agent Connect: stage PI 27", result
         assert result["browserOpened"] is True, result
-        assert core.undo_status(col)["undo"] == "AnkiConnect Plus: stage PI 27"
+        assert core.undo_status(col)["undo"] == "Agent Connect: stage PI 27"
         assert len(world.recorder.browser_opens) == 1
 
     # re-run of the identical call: reported no-op write, Browser still opens
@@ -756,7 +756,7 @@ def test9_lockstep_and_served_docs():
     assert "Version: 1.5.0 (spec revision 20" in head, head[:200]
 
     # undo-label + nextStep lockstep; dialog-era constants are gone
-    assert core.UNDO_STAGE_OPTIONAL_TAG == "AnkiConnect Plus: Stage Optional Tag"
+    assert core.UNDO_STAGE_OPTIONAL_TAG == "Agent Connect: Stage Optional Tag"
     assert core.sanitize_undo_label(core.ANKIHUB_STAGE_TAG_LABEL) == \
         core.UNDO_STAGE_OPTIONAL_TAG
     assert core.ANKIHUB_STAGE_NEXT_STEP == \
@@ -801,7 +801,7 @@ def test9_lockstep_and_served_docs():
     assert "dialogOpened" not in returns and "wouldOpenDialog" not in returns
     # and the dry caveat: nothing written, nothing opens
     assert "nothing is written and nothing opens" in returns, returns
-    assert "default 'AnkiConnect Plus: Stage Optional Tag'" in returns
+    assert "default 'Agent Connect: Stage Optional Tag'" in returns
 
     # preserves: honest, mentions the tag-list exception, the zero-AnkiHub
     # boundary, and the one GUI side effect (Browser search replaced)

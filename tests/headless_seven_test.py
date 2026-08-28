@@ -130,7 +130,7 @@ def test0_actions_registered():
         sorted(set(core.PLUS_ACTION_SUMMARIES) ^ set(core.PLUS_ACTIONS)))
     assert all(core.PLUS_ACTION_SUMMARIES[name].strip()
                for name in core.PLUS_ACTIONS), "empty summary"
-    assert core.UNDO_BULK_REPLACE == "AnkiConnect Plus: Replace in Fields"
+    assert core.UNDO_BULK_REPLACE == "Agent Connect: Replace in Fields"
 
 
 # ---------------------------------------------------------------- test 1
@@ -335,16 +335,16 @@ def test9_replace_literal():
     assert out["matchesTotal"] == 3, out
     assert out["unchanged"] == [n3], out
     assert out["skipped"] == [], out
-    assert out["undoEntry"] == "AnkiConnect Plus: Replace in Fields", out
+    assert out["undoEntry"] == "Agent Connect: Replace in Fields", out
     assert field_value(n1, "Front") == "gamma one"
     assert field_value(n2, "Front") == "two gamma gamma"
     assert field_value(n2, "Back") == "b", "other field touched"
     # ONE merged entry, single undo reverts both notes
-    assert col.undo_status().undo == "AnkiConnect Plus: Replace in Fields"
+    assert col.undo_status().undo == "Agent Connect: Replace in Fields"
     col.undo()
     assert field_value(n1, "Front") == "alpha one"
     assert field_value(n2, "Front") == "two alpha alpha"
-    assert col.undo_status().undo != "AnkiConnect Plus: Replace in Fields"
+    assert col.undo_status().undo != "Agent Connect: Replace in Fields"
 
 
 # ---------------------------------------------------------------- test 10
@@ -468,7 +468,7 @@ def test14_replace_atomic():
     assert "injected hard error" in report["error"], report
     assert field_value(n1, "Front") == "hit one", "atomic revert failed"
     assert field_value(n2, "Front") == "hit two"
-    assert col.undo_status().undo != "AnkiConnect Plus: Replace in Fields"
+    assert col.undo_status().undo != "Agent Connect: Replace in Fields"
 
     # atomic=false: continue past the injected failure
     state["n"] = 0
@@ -480,7 +480,7 @@ def test14_replace_atomic():
         del col.update_note
     assert out["changed"] == [n1], out
     assert out["skipped"] == [{"noteId": n2, "reason": "injected hard error"}], out
-    assert out["undoEntry"] == "AnkiConnect Plus: Replace in Fields", out
+    assert out["undoEntry"] == "Agent Connect: Replace in Fields", out
     assert field_value(n1, "Front") == "miss one"
     assert field_value(n2, "Front") == "hit two"
     col.undo()

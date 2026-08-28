@@ -204,8 +204,8 @@ def test6_add_suspend_respects_undo_label():
     col.decks.id("S6")
     r = core.bulk_add_notes(col, [note("S6", "s6-a")], undo_label="PI 7 draft",
                             suspend=True)
-    assert r["undoEntry"] == "AnkiConnect Plus: PI 7 draft", r
-    assert col.undo_status().undo == "AnkiConnect Plus: PI 7 draft"
+    assert r["undoEntry"] == "Agent Connect: PI 7 draft", r
+    assert col.undo_status().undo == "Agent Connect: PI 7 draft"
     assert queues(r["suspended"]) == [core.QUEUE_SUSPENDED]
     # the labelled entry still covers BOTH halves
     col.undo()

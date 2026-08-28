@@ -133,7 +133,7 @@ def make_png(w=16, h=16, rgb=b"\x80\x40\xc0"):
             + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
 
 
-LABEL = "AnkiConnect Plus: "
+LABEL = "Agent Connect: "
 
 
 # ---------------------------------------------------------------- mediaExists
@@ -278,8 +278,8 @@ def test4_undolabel_bulk_add():
 
     # default name unchanged when undoLabel is omitted
     r = core.bulk_add_notes(col, [basic_note("R2Label", "ul-add-def")])
-    assert r["undoEntry"] == "AnkiConnect Plus: Bulk Add", r
-    assert col.undo_status().undo == "AnkiConnect Plus: Bulk Add"
+    assert r["undoEntry"] == "Agent Connect: Bulk Add", r
+    assert col.undo_status().undo == "Agent Connect: Bulk Add"
 
     # sanitization: whitespace runs (newlines included) collapse; 80-char cap
     r = core.bulk_add_notes(col, [basic_note("R2Label", "ul-add-ws")],
@@ -355,7 +355,7 @@ def test6_undolabel_scheduler():
                  "undoEntry": LABEL + "bench the leeches"}, r
     assert col.undo_status().undo == LABEL + "bench the leeches"
     r = core.bulk_suspend(col, cids, suspend=False)
-    assert r["undoEntry"] == "AnkiConnect Plus: Bulk Suspend", r
+    assert r["undoEntry"] == "Agent Connect: Bulk Suspend", r
 
     r = core.bulk_set_due_date(col, cids, "0", undo_label="due today")
     # revision 15 (SPEC 27): additive 'resuspended' key
@@ -485,7 +485,7 @@ def test8_undolabel_crop():
     # default crop name unchanged
     r = core.crop_image_occlusion_image(
         col, io["noteId"], {"left": 0, "top": 0, "width": 0.6, "height": 0.6})
-    assert r["undoEntry"] == "AnkiConnect Plus: Crop IO Image", r
+    assert r["undoEntry"] == "Agent Connect: Crop IO Image", r
 
 
 # ---------------------------------------------------------------- undoStatus

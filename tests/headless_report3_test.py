@@ -590,7 +590,7 @@ def test_ask8_undo_status_self_verifying():
 
     # --- a labelled bulk write: undoEntry == what the stack reads back
     first = core.bulk_add_tags(col_undo, [n1], ["ask8a"], undo_label="R3 First Sweep")
-    assert first["undoEntry"] == "AnkiConnect Plus: R3 First Sweep", first
+    assert first["undoEntry"] == "Agent Connect: R3 First Sweep", first
     top = core.undo_status(col_undo)
     assert top["undo"] == first["undoEntry"], (top, first)
     assert top["redo"] is None, top
@@ -599,7 +599,7 @@ def test_ask8_undo_status_self_verifying():
 
     # a second labelled write lands on top of the first
     second = core.bulk_add_tags(col_undo, [n2], ["ask8b"], undo_label="R3 Second  Sweep")
-    assert second["undoEntry"] == "AnkiConnect Plus: R3 Second Sweep", second  # ws collapsed
+    assert second["undoEntry"] == "Agent Connect: R3 Second Sweep", second  # ws collapsed
     top2 = core.undo_status(col_undo)
     assert top2["undo"] == second["undoEntry"], top2
     assert top2["lastStep"] > step_after_first
@@ -659,14 +659,14 @@ def test_ask8_undo_status_self_verifying():
     upd = core.bulk_update_note_fields(
         col_undo, [{"id": n5, "fields": {"Front": "ask8-five-changed"}}],
         undo_label="R3 Update Sweep")
-    assert upd["undoEntry"] == "AnkiConnect Plus: R3 Update Sweep"
+    assert upd["undoEntry"] == "Agent Connect: R3 Update Sweep"
     assert core.undo_status(col_undo)["undo"] == upd["undoEntry"]
     c5 = card_ids(col_undo, n5)[0]
     susp = core.bulk_suspend(col_undo, [c5], undo_label="R3 Suspend Sweep")
-    assert susp["undoEntry"] == "AnkiConnect Plus: R3 Suspend Sweep"
+    assert susp["undoEntry"] == "Agent Connect: R3 Suspend Sweep"
     assert core.undo_status(col_undo)["undo"] == susp["undoEntry"]
     due = core.bulk_set_due_date(col_undo, [c5], "2", undo_label="R3 Due Sweep")
-    assert due["undoEntry"] == "AnkiConnect Plus: R3 Due Sweep"
+    assert due["undoEntry"] == "Agent Connect: R3 Due Sweep"
     assert core.undo_status(col_undo)["undo"] == due["undoEntry"]
 
 
@@ -1374,7 +1374,7 @@ def test_ask1_plus_info_surface():
     # single response cannot tell you
     note = info["errorPrefixNote"]
     assert "UPSTREAM" in note and "errorCode" in note, note
-    assert info["name"] == "AnkiConnect Plus"
+    assert info["name"] == "Agent Connect"
     assert info["version"] == pkg_core.PLUS_VERSION
     assert set(info["docs"]) == {"plus", "upstream", "upstreamSource"}
 

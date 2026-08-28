@@ -1,5 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
-# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+# Copyright (C) 2026 Matthew Correll (Agent Connect modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -86,7 +86,7 @@ class AnkiConnect(plus.PlusMixin):
         except:
             QMessageBox.critical(
                 self.window(),
-                'AnkiConnect Plus',
+                'Agent Connect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(util.setting('webBindPort'))
             )
 
@@ -434,7 +434,7 @@ class AnkiConnect(plus.PlusMixin):
         else:  # prompt the user
             msg = QMessageBox(None)
             msg.setWindowTitle("A website wants to access to Anki")
-            msg.setText('"{}" requests permission to use Anki through AnkiConnect Plus. Do you want to give it access?'.format(origin))
+            msg.setText('"{}" requests permission to use Anki through Agent Connect. Do you want to give it access?'.format(origin))
             msg.setInformativeText("By granting permission, you'll allow the website to modify your collection on your behalf, including the execution of destructive actions such as deck deletion.")
             msg.setWindowIcon(self.window().windowIcon())
             msg.setIcon(QMessageBox.Icon.Question)

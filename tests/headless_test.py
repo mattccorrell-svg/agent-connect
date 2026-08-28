@@ -1,4 +1,4 @@
-# Headless verification round 1 for AnkiConnect Plus core.py
+# Headless verification round 1 for Agent Connect core.py
 # Run with: <anki-venv>/bin/python headless_test.py
 #
 # Uses a FRESH scratch collection; never touches ~/Library/Application Support/Anki2/.
@@ -89,16 +89,16 @@ def test1_bulk500():
     assert elapsed < 10, "500-note bulk add took %.2fs (target < 10s)" % elapsed
     assert len(result["added"]) == 500, result
     assert result["skipped"] == [], result
-    assert result["undoEntry"] == "AnkiConnect Plus: Bulk Add", result
+    assert result["undoEntry"] == "Agent Connect: Bulk Add", result
     assert len(set(result["added"])) == 500, "note ids not unique"
     assert note_count() == before + 500, "note count mismatch after add"
     # ONE merged entry on top of the undo stack
     status = col.undo_status()
-    assert status.undo == "AnkiConnect Plus: Bulk Add", "undo top is %r" % status.undo
+    assert status.undo == "Agent Connect: Bulk Add", "undo top is %r" % status.undo
     # a single undo reverts all 500
     col.undo()
     assert note_count() == before, "undo did not revert all 500"
-    assert col.undo_status().undo != "AnkiConnect Plus: Bulk Add", \
+    assert col.undo_status().undo != "Agent Connect: Bulk Add", \
         "bulk entry still on undo stack after undo (was not a single merged entry)"
 
 
@@ -199,7 +199,7 @@ def test4_update_and_tags():
     ])
     assert r["updated"] == [n0, n1, n2], r
     assert r["skipped"] == [], r
-    assert r["undoEntry"] == "AnkiConnect Plus: Bulk Update", r
+    assert r["undoEntry"] == "Agent Connect: Bulk Update", r
     assert col.get_note(n0)["Back"] == "newback0"
     assert col.get_note(n1)["Back"] == "newback1"
     assert col.get_note(n1).tags == ["updtag"]
@@ -219,7 +219,7 @@ def test4_update_and_tags():
     r = core.bulk_add_tags(col, [n0, n1, n2], "bulkA bulkB")
     assert r["updated"] == [n0, n1, n2], r
     assert r["skipped"] == [], r
-    assert r["undoEntry"] == "AnkiConnect Plus: Bulk Tags", r
+    assert r["undoEntry"] == "Agent Connect: Bulk Tags", r
     for nid in (n0, n1, n2):
         note = col.get_note(nid)
         assert note.has_tag("bulkA") and note.has_tag("bulkB"), note.tags
@@ -351,7 +351,7 @@ def test8_crop_image():
     assert col.get_note(n_none)["Front"] == "no occurrence here"
 
     # single undo restores the field
-    assert col.undo_status().undo == "AnkiConnect Plus: Crop Image", col.undo_status().undo
+    assert col.undo_status().undo == "Agent Connect: Crop Image", col.undo_status().undo
     col.undo()
     assert col.get_note(n_ref)["Front"] == 'crop-ref <img src="ancp-crop-src.png">'
 
@@ -432,7 +432,7 @@ def test9_crop_io_image():
     assert abs((by_ord[2]["left"] + by_ord[2]["width"]) - 1.0) < 1e-4, by_ord[2]
 
     # single undo restores BOTH the image filename and the original rects
-    assert col.undo_status().undo == "AnkiConnect Plus: Crop IO Image", col.undo_status().undo
+    assert col.undo_status().undo == "Agent Connect: Crop IO Image", col.undo_status().undo
     col.undo()
     back = core.get_image_occlusion_note(col, nid)
     assert back["imageFilename"] == orig_filename, back

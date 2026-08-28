@@ -676,7 +676,7 @@ def test11_sync_guard_reachable():
     orig = util_mod.setting
     util_mod.setting = lambda key: util_mod.DEFAULT_CONFIG[key]
     try:
-        assert inst.plusInfo()["name"] == "AnkiConnect Plus"   # works mid-sync
+        assert inst.plusInfo()["name"] == "Agent Connect"   # works mid-sync
     finally:
         util_mod.setting = orig
 

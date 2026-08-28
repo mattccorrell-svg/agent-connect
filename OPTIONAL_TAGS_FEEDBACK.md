@@ -11,7 +11,7 @@ Everything up to publication is already scriptable:
 
 - selecting candidate notes  → `ankipool.py`
 - deciding which to include  → an LLM pass, then human review
-- applying the tag locally   → AnkiConnect Plus `addTags`
+- applying the tag locally   → Agent Connect `addTags`
 
 Publication is not. It is `Browser → select notes → right click → "Suggest
 Optional Tags"` — a Qt menu action. So an otherwise automated workflow ends with

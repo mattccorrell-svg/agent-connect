@@ -469,7 +469,7 @@ def test5_dry_run_add():
     real = core.bulk_add_notes(col, batch)
     assert len(real["added"]) == dry["wouldAdd"] == 2, real
     assert real["skipped"] == dry["skipped"], (real["skipped"], dry["skipped"])
-    assert real["undoEntry"] == "AnkiConnect Plus: Bulk Add", real
+    assert real["undoEntry"] == "Agent Connect: Bulk Add", real
     assert note_count() == notes_before + 2
     DRY_NOTE_IDS.extend(real["added"])
 
@@ -579,14 +579,14 @@ def test7_bulk_suspend():
     # deduplicated, bogus id dropped, precheck order)
     r = core.bulk_suspend(col, cids + [bogus, cids[0]])
     assert r == {"changed": 5, "changedIds": cids,
-                 "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
+                 "undoEntry": "Agent Connect: Bulk Suspend"}, r
     assert all(q == -1 for q in queues().values()), queues()
-    assert col.undo_status().undo == "AnkiConnect Plus: Bulk Suspend"
+    assert col.undo_status().undo == "Agent Connect: Bulk Suspend"
 
     # one undo reverts all 5 and pops the entry
     col.undo()
     assert all(q == 0 for q in queues().values()), queues()
-    assert col.undo_status().undo != "AnkiConnect Plus: Bulk Suspend"
+    assert col.undo_status().undo != "Agent Connect: Bulk Suspend"
 
     # re-suspend, then suspending already-suspended is a clean no-op
     r = core.bulk_suspend(col, cids)
@@ -599,7 +599,7 @@ def test7_bulk_suspend():
     # unsuspend restores the queues
     r = core.bulk_suspend(col, cids, suspend=False)
     assert r == {"changed": 5, "changedIds": cids,
-                 "undoEntry": "AnkiConnect Plus: Bulk Suspend"}, r
+                 "undoEntry": "Agent Connect: Bulk Suspend"}, r
     assert all(q == 0 for q in queues().values()), queues()
 
     # unsuspend with nothing suspended -> no-op, stack untouched
@@ -636,11 +636,11 @@ def test8_bulk_set_due_date():
     # revived (this card was never suspended)
     assert r == {"changed": 1, "changedIds": [c0], "unsuspended": [],
                  "unburied": [], "resuspended": [],
-                 "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+                 "undoEntry": "Agent Connect: Bulk Due Date"}, r
     card = col.get_card(c0)
     assert card.type == 2 and card.queue == 2, (card.type, card.queue)
     assert card.due == today, (card.due, today)
-    assert col.undo_status().undo == "AnkiConnect Plus: Bulk Due Date"
+    assert col.undo_status().undo == "Agent Connect: Bulk Due Date"
     col.undo()
     card = col.get_card(c0)
     assert (card.type, card.queue, card.due, card.ivl) == orig_state, \
@@ -650,7 +650,7 @@ def test8_bulk_set_due_date():
     r = core.bulk_set_due_date(col, [c1, c2, c3, c1], "1-3")
     assert r == {"changed": 3, "changedIds": [c1, c2, c3], "unsuspended": [],
                  "unburied": [], "resuspended": [],
-                 "undoEntry": "AnkiConnect Plus: Bulk Due Date"}, r
+                 "undoEntry": "Agent Connect: Bulk Due Date"}, r
     for cid in (c1, c2, c3):
         card = col.get_card(cid)
         assert card.type == 2 and card.queue == 2, (cid, card.type, card.queue)

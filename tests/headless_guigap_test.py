@@ -258,7 +258,7 @@ def test01_rename_deck_dry_then_real():
     assert resp["renamed"] == EXPECT_PAIRS, resp
     assert resp["configPreserved"] is True, resp
     assert resp["cardsAffected"] == 14, resp
-    assert resp["undoEntry"] == "AnkiConnect Plus: zero pad sweep", resp
+    assert resp["undoEntry"] == "Agent Connect: zero pad sweep", resp
 
     # do NOT trust configPreserved: re-read every deck by id ourselves
     for old_name, (did, cfg, desc) in P1_CFG.items():
@@ -274,7 +274,7 @@ def test01_rename_deck_dry_then_real():
     # ONE undo entry: it is on top under the custom label, and a SINGLE undo
     # restores every name
     status = col_main._backend.get_undo_status()
-    assert status.undo == "AnkiConnect Plus: zero pad sweep", status.undo
+    assert status.undo == "Agent Connect: zero pad sweep", status.undo
     assert status.last_step == pre_step + 1, \
         "expected exactly one new undo step, got %d -> %d" % (pre_step,
                                                              status.last_step)
@@ -285,8 +285,8 @@ def test01_rename_deck_dry_then_real():
         assert deck["conf"] == cfg
         assert deck["desc"] == desc
     status = col_main._backend.get_undo_status()
-    assert status.redo == "AnkiConnect Plus: zero pad sweep", status.redo
-    assert status.undo != "AnkiConnect Plus: zero pad sweep"
+    assert status.redo == "Agent Connect: zero pad sweep", status.redo
+    assert status.undo != "Agent Connect: zero pad sweep"
 
     # capture a dry response too, for the plusInfo returns check
     capture("renameDeck", core.rename_deck(col_main, "P1", "Q1", dry_run=True))
@@ -412,14 +412,14 @@ def test04_bulk_set_flag():
                                       [c1, c2, c3, c4, c5, c3, 99999999999], 1,
                                       undo_label="flag sweep"))
     assert resp == {"updated": [c3, c4, c5], "unchanged": [c1, c2],
-                    "undoEntry": "AnkiConnect Plus: flag sweep"}, resp
+                    "undoEntry": "Agent Connect: flag sweep"}, resp
     assert flags() == [1, 1, 1, 1, 1]
-    assert col_main._backend.get_undo_status().undo == "AnkiConnect Plus: flag sweep"
+    assert col_main._backend.get_undo_status().undo == "Agent Connect: flag sweep"
 
     # ONE undo reverts exactly the three writes
     col_main.undo()
     assert flags() == [1, 1, 0, 0, 0]
-    assert col_main._backend.get_undo_status().redo == "AnkiConnect Plus: flag sweep"
+    assert col_main._backend.get_undo_status().redo == "Agent Connect: flag sweep"
 
     # flag 0 clears (only the two flagged cards are writes)
     resp0 = core.bulk_set_flag(col_main, FLAG_CIDS, 0)
@@ -618,12 +618,12 @@ def test08_empty_filtered_deck_then_clean_export():
                    core.empty_filtered_deck(col_filt, deck_name="FiltR4",
                                             undo_label="send home"))
     assert resp == {"returned": 6, "homeDecks": {"HomeR4": 6},
-                    "undoEntry": "AnkiConnect Plus: send home"}, resp
+                    "undoEntry": "Agent Connect: send home"}, resp
     assert col_filt.db.scalar("select count() from cards where did = ?", fid) == 0
     assert col_filt.db.scalar(
         "select count() from cards where did = ? and odid = 0", home_did) == 20, \
         "cards did not all land home with odid cleared"
-    assert col_filt._backend.get_undo_status().undo == "AnkiConnect Plus: send home"
+    assert col_filt._backend.get_undo_status().undo == "Agent Connect: send home"
 
     # single undo restores the filter's residents
     col_filt.undo()
@@ -756,14 +756,14 @@ def test10_delete_empty_cards():
                                            undo_label="empty sweep A"))
     assert resp == {"cardsDeleted": 1, "deletedCardIds": [a1],
                     "notesAffected": 1, "protected": [], "notesPreserved": True,
-                    "skipped": [], "undoEntry": "AnkiConnect Plus: empty sweep A"}, resp
+                    "skipped": [], "undoEntry": "Agent Connect: empty sweep A"}, resp
     assert note_exists(a), "the note itself was deleted"
     assert [(cid, ord_) for cid, ord_, _d, _o in card_rows(col_empty, a)] == \
         [(a0, 0)], "surviving cards wrong"
     assert len(card_rows(col_empty, b)) == 2, "note B was touched"
 
     # one undo entry restores the deleted card
-    assert col_empty._backend.get_undo_status().undo == "AnkiConnect Plus: empty sweep A"
+    assert col_empty._backend.get_undo_status().undo == "Agent Connect: empty sweep A"
     col_empty.undo()
     assert {cid for cid, _o, _d, _od in card_rows(col_empty, a)} == {a0, a1}, \
         "undo did not restore the orphan card"

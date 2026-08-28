@@ -1,5 +1,5 @@
 # Copyright 2016-2021 Alex Yatskov
-# Copyright (C) 2026 Matthew Correll (AnkiConnect Plus modifications)
+# Copyright (C) 2026 Matthew Correll (Agent Connect modifications)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,9 +14,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-"""Business logic for the AnkiConnect Plus actions.
+"""Business logic for the Agent Connect actions.
 
-Part of AnkiConnect Plus, a fork of AnkiConnect by Alex Yatskov (FooSoft
+Part of Agent Connect, a fork of AnkiConnect by Alex Yatskov (FooSoft
 Productions) — https://foosoft.net/projects/anki-connect/
 
 Every public function is a pure function over anki.collection.Collection;
@@ -307,7 +307,7 @@ PLUS_ACTION_RETURNS = {
     "ankihubStageOptionalTagSuggestion":
         "{tagged: [noteId], alreadyTagged: [noteId], ankihubDeckId: str, browserOpened: bool, "
         "nextStep: str, undoEntry: str|null} — 'tagged' lists the notes this call actually "
-        "wrote the tag onto (ONE undo entry, default 'AnkiConnect Plus: Stage Optional Tag'); "
+        "wrote the tag onto (ONE undo entry, default 'Agent Connect: Stage Optional Tag'); "
         "'alreadyTagged' the ones that carried it before, so re-staging the same set is a "
         "reported no-op write (undoEntry null) that still reopens the Browser selection. "
         "browserOpened true = the Browser now shows exactly the staged notes; nextStep spells "
@@ -634,7 +634,7 @@ DOCS_UPSTREAM_SOURCE = "https://git.sr.ht/~foosoft/anki-connect"
 DOCS_PLUS = "https://github.com/mattccorrell-svg/anki-connect-plus#readme"
 
 #
-# Stable error codes (SPEC 25). Every error RAISED by a Plus action carries a
+# Stable error codes (SPEC 25). Every error RAISED by an Agent Connect action carries a
 # machine-parseable '[code] ' prefix before the unchanged message body; the
 # code is one of this closed vocabulary. Per-item error strings embedded in
 # results (skipped[].reason, thumbnails[].error, stored[].error, ...) are NOT
@@ -761,7 +761,7 @@ PLUS_ERROR_CODE_DOCS = {
 # The one boundary rule a client cannot infer from a single response (SPEC 25,
 # revision 13): the '[code] ' prefix is NOT universal across this server.
 PLUS_ERROR_PREFIX_NOTE = (
-    "Prefixing boundary: errors from the 37 Plus actions AND the dispatcher's unknown-action "
+    "Prefixing boundary: errors from the 37 Agent Connect actions AND the dispatcher's unknown-action "
     "error carry a '[code] ' prefix and populate the response's errorCode/retryable fields. "
     "EVERY OTHER error is passed through verbatim and UNPREFIXED, with errorCode: null and "
     "retryable: null — that is the ~90 UPSTREAM AnkiConnect actions, the dispatcher's api-key "
@@ -880,7 +880,7 @@ PLUS_RECIPES = [
     {
         'name': 'undo-label convention',
         'description': ("Pass undoLabel on any write action to name its undo entry "
-                        "'AnkiConnect Plus: <label>' (whitespace collapsed, 80-char cap) so "
+                        "'Agent Connect: <label>' (whitespace collapsed, 80-char cap) so "
                         "multiple batches stay distinguishable in Anki's Undo menu; the "
                         "response's undoEntry always reports the ACTUAL final entry name "
                         "(null when nothing undoable was written)."),
@@ -1037,27 +1037,27 @@ PLUS_RECIPES = [
     },
 ]
 
-UNDO_BULK_ADD = 'AnkiConnect Plus: Bulk Add'
-UNDO_BULK_UPDATE = 'AnkiConnect Plus: Bulk Update'
-UNDO_BULK_TAGS = 'AnkiConnect Plus: Bulk Tags'
-UNDO_CROP_IMAGE = 'AnkiConnect Plus: Crop Image'
-UNDO_CROP_IO = 'AnkiConnect Plus: Crop IO Image'
-UNDO_BULK_SUSPEND = 'AnkiConnect Plus: Bulk Suspend'
-UNDO_BULK_DUE = 'AnkiConnect Plus: Bulk Due Date'
-UNDO_BULK_REPLACE = 'AnkiConnect Plus: Replace in Fields'
-UNDO_RENAME_DECK = 'AnkiConnect Plus: Rename Deck'
-UNDO_BULK_FLAG = 'AnkiConnect Plus: Bulk Flag'
-UNDO_RENAME_TAG = 'AnkiConnect Plus: Rename Tag'
-UNDO_EMPTY_FILTERED = 'AnkiConnect Plus: Empty Filtered Deck'
-UNDO_CREATE_FILTERED = 'AnkiConnect Plus: Create Filtered Deck'
-UNDO_REBUILD_FILTERED = 'AnkiConnect Plus: Rebuild Filtered Deck'
-UNDO_DELETE_EMPTY = 'AnkiConnect Plus: Delete Empty Cards'
-UNDO_STAGE_OPTIONAL_TAG = 'AnkiConnect Plus: Stage Optional Tag'
+UNDO_BULK_ADD = 'Agent Connect: Bulk Add'
+UNDO_BULK_UPDATE = 'Agent Connect: Bulk Update'
+UNDO_BULK_TAGS = 'Agent Connect: Bulk Tags'
+UNDO_CROP_IMAGE = 'Agent Connect: Crop Image'
+UNDO_CROP_IO = 'Agent Connect: Crop IO Image'
+UNDO_BULK_SUSPEND = 'Agent Connect: Bulk Suspend'
+UNDO_BULK_DUE = 'Agent Connect: Bulk Due Date'
+UNDO_BULK_REPLACE = 'Agent Connect: Replace in Fields'
+UNDO_RENAME_DECK = 'Agent Connect: Rename Deck'
+UNDO_BULK_FLAG = 'Agent Connect: Bulk Flag'
+UNDO_RENAME_TAG = 'Agent Connect: Rename Tag'
+UNDO_EMPTY_FILTERED = 'Agent Connect: Empty Filtered Deck'
+UNDO_CREATE_FILTERED = 'Agent Connect: Create Filtered Deck'
+UNDO_REBUILD_FILTERED = 'Agent Connect: Rebuild Filtered Deck'
+UNDO_DELETE_EMPTY = 'Agent Connect: Delete Empty Cards'
+UNDO_STAGE_OPTIONAL_TAG = 'Agent Connect: Stage Optional Tag'
 
 # undoLabel (SPEC 24): every write action takes an optional undoLabel whose
-# sanitized form becomes the undo entry name 'AnkiConnect Plus: <label>', so
+# sanitized form becomes the undo entry name 'Agent Connect: <label>', so
 # the Undo menu can distinguish same-action batches. sanitize_undo_label().
-UNDO_LABEL_PREFIX = 'AnkiConnect Plus: '
+UNDO_LABEL_PREFIX = 'Agent Connect: '
 UNDO_LABEL_MAX_CHARS = 80
 
 # cards.queue: -1 = suspended; any negative queue (-1 suspended, -2 sibling-
@@ -1215,7 +1215,7 @@ def find_io_notetype_id(col):
 
 def sanitize_undo_label(label):
     """None -> None (the action keeps its default undo entry name). A string
-    -> 'AnkiConnect Plus: <label>' with whitespace runs (newlines included)
+    -> 'Agent Connect: <label>' with whitespace runs (newlines included)
     collapsed to single spaces, ends stripped, and the label capped at 80
     characters (SPEC 24). Anything else — or a label that sanitizes to
     nothing — is a parameter error, raised before any write."""
