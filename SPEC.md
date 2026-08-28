@@ -4,7 +4,7 @@ Version: 1.5.0 (spec revision 20, 2026-08-19 — revision 7 field-feedback amend
 Target Anki: 25.09.4 (Qt6, python 3.13). Fork of AnkiConnect (GPLv3) by Alex Yatskov / FooSoft.
 Working copy: `<repo>/connect_plus/`
 Venv python for all headless execution/tests: `<anki-venv>/bin/python`
-Anki packages: `/Users/mattyc/Library/Application Support/AnkiProgramFiles/.venv/lib/python3.13/site-packages` (referred to below as `SP`).
+Anki packages: `<anki-venv>/lib/python3.13/site-packages` (referred to below as `SP`).
 
 HARD RULES (repeated from project charter, enforced by this spec):
 - Never modify anything under `~/Library/Application Support/Anki2/` and never write to the user's real collection during development/testing. All tests run against scratch `.anki2` collections.
